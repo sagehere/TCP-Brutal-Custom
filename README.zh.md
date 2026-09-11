@@ -62,6 +62,13 @@ brutalctl flush
 
 规则在重启后不会保留。如果需要持久化，请将相应的 `add` 命令加入启动脚本。
 
+在规则末尾添加 `perip`，可让每个对端 IP 各自拥有一份共享速率：同一 IP 的多条连接仍合计共享，不同 IP 不再相互抢占。`perip` 只能使用默认锁定规则，IPv4 和 IPv6 分别计组：
+
+```bash
+brutalctl add 0.0.0.0/0 80 noroute perip
+brutalctl add ::/0 80 noroute perip
+```
+
 ### 检查是否正常工作
 
 可以从服务器下载文件并观察速率，也可以使用 [example](example) 中的测速程序。客户端会同时建立多条连接，并让它们作为一个连接组共享同一速率。
@@ -241,18 +248,18 @@ setsockopt(TCP_CONGESTION, "brutal")
 每条规则占一行，以 `key=value` 形式显示，同时包含实时统计信息：
 
 ```text
-dst=203.0.113.5/32 rate=12500000 gain=20 lock=1 id=1 members=3 sent=1834021376
+dst=203.0.113.5/32 rate=12500000 gain=20 lock=1 group=perip id=1 members=3 ips=2 sent=1834021376
 ```
 
 写入时，每次 write 接受一条命令，其中速率单位为 bytes/s：
 
 ```text
-add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock]
+add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock] [perip]
 del <prefix>[/<len>]
 flush
 ```
 
-如果对已有前缀再次执行 `add`，会直接更新原规则。
+`perip` 只能用于锁定规则。如果对已有前缀再次执行 `add`，会直接更新原规则；但在普通共享规则与 `perip` 规则之间切换时，必须先删除再重新创建规则。
 
 需要注意的是，路由配置是独立的一步。`brutalctl` 除了管理这里的规则文件之外，还会自动负责添加对应路由。
 

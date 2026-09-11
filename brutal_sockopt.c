@@ -1,5 +1,6 @@
 // Groups and the application interface: TCP_BRUTAL_PARAMS / TCP_BRUTAL_VERSION
 #include <linux/hashtable.h>
+#include <linux/jhash.h>
 #include <linux/slab.h>
 #include "brutal.h"
 
@@ -12,15 +13,17 @@
 
 static DEFINE_HASHTABLE(brutal_groups, 8);
 static DEFINE_SPINLOCK(brutal_groups_lock);
+static DEFINE_HASHTABLE(brutal_perip_groups, 8);
+static DEFINE_SPINLOCK(brutal_perip_groups_lock);
 
 static struct proto tcp_prot_override __ro_after_init;
 #ifdef _TRANSP_V6_H
 static struct proto tcpv6_prot_override __ro_after_init;
 #endif
 
-struct brutal_group *brutal_group_alloc(u64 id)
+struct brutal_group *brutal_group_alloc(u64 id, gfp_t gfp)
 {
-    struct brutal_group *g = kzalloc(sizeof(*g), GFP_KERNEL);
+    struct brutal_group *g = kzalloc(sizeof(*g), gfp);
 
     if (!g)
         return NULL;
@@ -32,10 +35,30 @@ struct brutal_group *brutal_group_alloc(u64 id)
     return g;
 }
 
+static const struct brutal_group *brutal_group_parent(const struct brutal_group *g)
+{
+    return g->parent ? g->parent : g;
+}
+
+u64 brutal_group_rate(const struct brutal_group *g)
+{
+    return READ_ONCE(brutal_group_parent(g)->rate);
+}
+
+u32 brutal_group_cwnd_gain(const struct brutal_group *g)
+{
+    return READ_ONCE(brutal_group_parent(g)->cwnd_gain);
+}
+
+bool brutal_group_locked(const struct brutal_group *g)
+{
+    return READ_ONCE(brutal_group_parent(g)->locked);
+}
+
 // Application group keyed by id, uid and netns; created if missing
 static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
 {
-    struct brutal_group *g, *ng = brutal_group_alloc(id);
+    struct brutal_group *g, *ng = brutal_group_alloc(id, GFP_KERNEL);
 
     spin_lock_bh(&brutal_groups_lock);
     hash_for_each_possible(brutal_groups, g, node, id)
@@ -58,8 +81,104 @@ static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
     return ng;
 }
 
+static u32 brutal_perip_hash(const struct sock *sk, u8 *family)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+    if (sk->sk_family == AF_INET6 && !ipv6_addr_v4mapped(&sk->sk_v6_daddr))
+    {
+        *family = AF_INET6;
+        return jhash2((const u32 *)&sk->sk_v6_daddr, 4, 0);
+    }
+#endif
+    *family = AF_INET;
+    return (__force u32)sk->sk_daddr;
+}
+
+static bool brutal_perip_match(const struct brutal_group *g, const struct sock *sk, u8 family)
+{
+    if (g->parent == NULL || g->net != sock_net(sk) || g->perip_family != family)
+        return false;
+    if (family == AF_INET)
+        return g->perip_v4 == sk->sk_daddr;
+#if IS_ENABLED(CONFIG_IPV6)
+    return ipv6_addr_equal(&g->perip_v6, &sk->sk_v6_daddr);
+#else
+    return false;
+#endif
+}
+
+// Takes the caller's parent reference on success or allocation failure.
+struct brutal_group *brutal_perip_group_get(struct sock *sk, struct brutal_group *parent)
+{
+    struct brutal_group *g, *ng;
+    u8 family;
+    u32 hash = brutal_perip_hash(sk, &family);
+
+    spin_lock_bh(&brutal_perip_groups_lock);
+    hash_for_each_possible(brutal_perip_groups, g, perip_node, hash)
+    {
+        if (g->parent == parent && brutal_perip_match(g, sk, family) && refcount_inc_not_zero(&g->refcnt))
+        {
+            spin_unlock_bh(&brutal_perip_groups_lock);
+            brutal_group_put(parent);
+            return g;
+        }
+    }
+    spin_unlock_bh(&brutal_perip_groups_lock);
+
+    ng = brutal_group_alloc(parent->id, GFP_ATOMIC);
+    if (!ng)
+        return NULL;
+    ng->parent = parent;
+    ng->net = sock_net(sk);
+    ng->perip_family = family;
+    if (family == AF_INET)
+        ng->perip_v4 = sk->sk_daddr;
+#if IS_ENABLED(CONFIG_IPV6)
+    else
+        ng->perip_v6 = sk->sk_v6_daddr;
+#endif
+
+    spin_lock_bh(&brutal_perip_groups_lock);
+    hash_for_each_possible(brutal_perip_groups, g, perip_node, hash)
+    {
+        if (g->parent == parent && brutal_perip_match(g, sk, family) && refcount_inc_not_zero(&g->refcnt))
+        {
+            spin_unlock_bh(&brutal_perip_groups_lock);
+            brutal_group_put(parent);
+            kfree(ng);
+            return g;
+        }
+    }
+    hash_add(brutal_perip_groups, &ng->perip_node, hash);
+    spin_lock(&parent->lock);
+    parent->ip_groups++;
+    spin_unlock(&parent->lock);
+    spin_unlock_bh(&brutal_perip_groups_lock);
+    return ng;
+}
+
 void brutal_group_put(struct brutal_group *g)
 {
+    if (g->parent)
+    {
+        struct brutal_group *parent = g->parent;
+
+        spin_lock_bh(&brutal_perip_groups_lock);
+        if (!refcount_dec_and_test(&g->refcnt))
+        {
+            spin_unlock_bh(&brutal_perip_groups_lock);
+            return;
+        }
+        hash_del(&g->perip_node);
+        spin_lock(&parent->lock);
+        parent->ip_groups--;
+        spin_unlock(&parent->lock);
+        spin_unlock_bh(&brutal_perip_groups_lock);
+        brutal_group_put(parent);
+        kfree(g);
+        return;
+    }
     if (!refcount_dec_and_test(&g->refcnt))
         return;
     spin_lock_bh(&brutal_groups_lock);
@@ -75,6 +194,12 @@ void brutal_group_join(struct brutal *brutal, struct brutal_group *g)
     spin_lock_bh(&g->lock);
     g->members++;
     spin_unlock_bh(&g->lock);
+    if (g->parent)
+    {
+        spin_lock_bh(&g->parent->lock);
+        g->parent->members++;
+        spin_unlock_bh(&g->parent->lock);
+    }
 }
 
 void brutal_group_leave(struct brutal *brutal)
@@ -88,6 +213,12 @@ void brutal_group_leave(struct brutal *brutal)
     spin_lock_bh(&g->lock);
     g->members--;
     spin_unlock_bh(&g->lock);
+    if (g->parent)
+    {
+        spin_lock_bh(&g->parent->lock);
+        g->parent->members--;
+        spin_unlock_bh(&g->parent->lock);
+    }
     brutal_group_put(g);
 }
 
@@ -117,7 +248,7 @@ static int brutal_set_params(struct sock *sk, sockptr_t optval, unsigned int opt
         release_sock(sk); // the socket has been switched to another algorithm
         return -ENOPROTOOPT;
     }
-    if (brutal->group && READ_ONCE(brutal->group->locked))
+    if (brutal->group && brutal_group_locked(brutal->group))
     {
         release_sock(sk);
         return -EPERM; // governed by a locked destination rule
@@ -137,8 +268,8 @@ static int brutal_set_params(struct sock *sk, sockptr_t optval, unsigned int opt
     }
     if (brutal->group)
     {
-        WRITE_ONCE(brutal->group->rate, params.rate);
-        WRITE_ONCE(brutal->group->cwnd_gain, params.cwnd_gain);
+        WRITE_ONCE(brutal_group_parent(brutal->group)->rate, params.rate);
+        WRITE_ONCE(brutal_group_parent(brutal->group)->cwnd_gain, params.cwnd_gain);
     }
     brutal->rate = params.rate;
     brutal->cwnd_gain = params.cwnd_gain;
@@ -171,8 +302,8 @@ static int brutal_get_params(struct sock *sk, char __user *optval, int __user *o
     }
     if (brutal->group)
     {
-        params.rate = READ_ONCE(brutal->group->rate);
-        params.cwnd_gain = READ_ONCE(brutal->group->cwnd_gain);
+        params.rate = brutal_group_rate(brutal->group);
+        params.cwnd_gain = brutal_group_cwnd_gain(brutal->group);
         params.group_id = brutal->group->id;
     }
     else

@@ -14,7 +14,7 @@
 // Configured rate compensated for this socket's loss
 static u64 brutal_effective_rate(const struct brutal *brutal)
 {
-    u64 rate = brutal->group ? READ_ONCE(brutal->group->rate) : brutal->rate;
+    u64 rate = brutal->group ? brutal_group_rate(brutal->group) : brutal->rate;
 
     return div_u64(rate * 100, brutal->ack_rate);
 }
@@ -50,7 +50,7 @@ void brutal_update_rate(struct sock *sk)
     brutal->ack_rate = ack_rate;
 
     rate = brutal_effective_rate(brutal);
-    cwnd_gain = brutal->group ? READ_ONCE(brutal->group->cwnd_gain) : brutal->cwnd_gain;
+    cwnd_gain = brutal->group ? brutal_group_cwnd_gain(brutal->group) : brutal->cwnd_gain;
 
     // Packets in flight over one RTT at this rate, times the gain. Done in u64
     // with a microsecond RTT (floored at 1 ms) so short RTTs keep precision
@@ -122,6 +122,12 @@ static u32 brutal_min_tso_segs(struct sock *sk)
             g->next_ns -= div64_u64((u64)(-delta) * NSEC_PER_SEC, rate);
         g->sent_bytes += sent;
         spin_unlock_bh(&g->lock);
+        if (g->parent)
+        {
+            spin_lock_bh(&g->parent->lock);
+            g->parent->sent_bytes += sent;
+            spin_unlock_bh(&g->parent->lock);
+        }
         brutal->resv_bytes = 0;
     }
 

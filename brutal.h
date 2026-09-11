@@ -2,6 +2,7 @@
 #define BRUTAL_H
 
 #include <linux/version.h>
+#include <linux/gfp.h>
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
 #include <net/tcp.h>
@@ -11,7 +12,7 @@
 #endif
 
 #define BRUTAL_VERSION_MAJOR 2
-#define BRUTAL_VERSION_MINOR 0
+#define BRUTAL_VERSION_MINOR 1
 #define BRUTAL_VERSION_PATCH 0
 #define BRUTAL_VERSION ((BRUTAL_VERSION_MAJOR << 16) | (BRUTAL_VERSION_MINOR << 8) | BRUTAL_VERSION_PATCH)
 
@@ -55,6 +56,18 @@ struct brutal_group
     u32 members;
     u64 sent_bytes;
     u64 next_ns;
+
+    // A per-IP child owns a reference to its rule group. It has its own clock,
+    // but inherits rate, gain, and lock from that parent.
+    struct brutal_group *parent;
+    struct hlist_node perip_node;
+    u8 perip_family;
+    union
+    {
+        __be32 perip_v4;
+        struct in6_addr perip_v6;
+    };
+    u32 ip_groups;
 };
 
 // Per-socket state, lives in icsk_ca_priv
@@ -86,10 +99,14 @@ extern struct tcp_congestion_ops tcp_brutal_ops;
 void brutal_update_rate(struct sock *sk);
 
 // brutal_sockopt.c: groups and the application interface
-struct brutal_group *brutal_group_alloc(u64 id);
+struct brutal_group *brutal_group_alloc(u64 id, gfp_t gfp);
 void brutal_group_put(struct brutal_group *g);
 void brutal_group_join(struct brutal *brutal, struct brutal_group *g);
 void brutal_group_leave(struct brutal *brutal);
+struct brutal_group *brutal_perip_group_get(struct sock *sk, struct brutal_group *parent);
+u64 brutal_group_rate(const struct brutal_group *g);
+u32 brutal_group_cwnd_gain(const struct brutal_group *g);
+bool brutal_group_locked(const struct brutal_group *g);
 void brutal_sockopt_init(void);
 void brutal_sockopt_install(struct sock *sk);
 void brutal_sockopt_uninstall(struct sock *sk);

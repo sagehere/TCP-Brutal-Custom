@@ -27,13 +27,14 @@
 static int usage(void)
 {
     fputs("usage: brutalctl list\n"
-          "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute]\n"
+          "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute] [perip]\n"
           "       brutalctl del <prefix>[/<len>]\n"
           "       brutalctl flush\n"
           "\n"
           "All connections to the prefix share the rate as one group. add also installs\n"
           "the route that makes the kernel use brutal for the prefix (ip route replace\n"
           "<prefix> ... congctl lock brutal proto " ROUTE_PROTO "); del and flush remove it.\n"
+          "perip gives each peer IP its own shared rate (and requires the default lock).\n"
           "nolock lets applications set their own params on these connections.\n",
           stderr);
     return 2;
@@ -250,7 +251,7 @@ static char *field(const char *line, const char *key, char *out, size_t size)
 
 static int list_rules(void)
 {
-    char line[512], dst[64], rate[32], gain[16], lock[8], id[24], members[16], sent[32];
+    char line[512], dst[64], rate[32], gain[16], lock[8], group[16], id[24], members[16], ips[16], sent[32];
     char routes[8192], routes6[4096];
     char *v4[] = {"ip", "-4", "route", "show", "proto", ROUTE_PROTO, NULL};
     char *v6[] = {"ip", "-6", "route", "show", "proto", ROUTE_PROTO, NULL};
@@ -263,8 +264,8 @@ static int list_rules(void)
     run(v4, routes, sizeof(routes) - sizeof(routes6), 1);
     run(v6, routes6, sizeof(routes6), 1);
     strcat(routes, routes6);
-    printf("%-30s %11s %5s %5s %6s %4s %8s %10s\n",
-           "DESTINATION", "RATE(Mbps)", "GAIN", "LOCK", "ROUTE", "ID", "MEMBERS", "SENT(MB)");
+    printf("%-30s %11s %5s %5s %7s %6s %4s %8s %5s %10s\n",
+           "DESTINATION", "RATE(Mbps)", "GAIN", "LOCK", "GROUP", "ROUTE", "ID", "MEMBERS", "IPS", "SENT(MB)");
     while (fgets(line, sizeof(line), f))
     {
         char copy[sizeof(routes)];
@@ -273,14 +274,17 @@ static int list_rules(void)
         field(line, "rate", rate, sizeof(rate));
         field(line, "gain", gain, sizeof(gain));
         field(line, "lock", lock, sizeof(lock));
+        field(line, "group", group, sizeof(group));
         field(line, "id", id, sizeof(id));
         field(line, "members", members, sizeof(members));
+        field(line, "ips", ips, sizeof(ips));
         field(line, "sent", sent, sizeof(sent));
         memcpy(copy, routes, sizeof(copy));
-        printf("%-30s %11.2f %5s %5s %6s %4s %8s %10.1f\n",
+        printf("%-30s %11.2f %5s %5s %7s %6s %4s %8s %5s %10.1f\n",
                dst, strtoull(rate, NULL, 10) * 8 / 1e6, gain,
-               strcmp(lock, "1") ? "no" : "yes", route_present(dst, copy) ? "yes" : "no",
-               id, members, strtoull(sent, NULL, 10) / 1e6);
+               strcmp(lock, "1") ? "no" : "yes", group[0] ? group : "shared",
+               route_present(dst, copy) ? "yes" : "no", id, members,
+               ips[0] ? ips : "0", strtoull(sent, NULL, 10) / 1e6);
     }
     fclose(f);
     return 0;
@@ -312,6 +316,11 @@ static int add_rule(int argc, char **argv)
         }
         if (!strcmp(argv[i], "nolock"))
             lock = 0;
+        else if (!strcmp(argv[i], "perip"))
+        {
+            if (!lock)
+                return usage();
+        }
         else if (!strcmp(argv[i], "lock"))
             lock = 1;
         else if (strncmp(argv[i], "gain=", 5))
@@ -319,6 +328,8 @@ static int add_rule(int argc, char **argv)
         n += snprintf(cmd + n, sizeof(cmd) - n, " %s", argv[i]);
     }
     if (i < argc)
+        return usage();
+    if (!lock && strstr(cmd, " perip"))
         return usage();
     strcat(cmd, "\n");
     ret = send_cmd(cmd);

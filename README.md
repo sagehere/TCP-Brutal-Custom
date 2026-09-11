@@ -59,6 +59,11 @@ brutalctl flush
 
 Rules do not survive a reboot; put the `add` commands in a boot script if needed.
 
+Add `perip` to give each peer IP its own shared rate. Connections from one IP still share the rate, while different IPs do not. `perip` requires the default locked rule:
+
+    brutalctl add 0.0.0.0/0 80 noroute perip
+    brutalctl add ::/0 80 noroute perip
+
 ### Check that it works
 
 Download something from the server and watch the rate, or use the speed test in [example](example): the client opens several connections that share one rate as a group.
@@ -148,10 +153,10 @@ On a connection covered by a locked rule, `TCP_BRUTAL_PARAMS` returns `EPERM`, a
 Tools can use the rules file directly instead of `brutalctl`. Reading `/proc/net/tcp_brutal/rules` gives one rule per line as `key=value` pairs with live counters:
 
 ```
-dst=203.0.113.5/32 rate=12500000 gain=20 lock=1 id=1 members=3 sent=1834021376
+dst=203.0.113.5/32 rate=12500000 gain=20 lock=1 group=perip id=1 members=3 ips=2 sent=1834021376
 ```
 
-Writing accepts one command per write, with the rate in bytes per second: `add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock]`, `del <prefix>[/<len>]` and `flush`. `add` on an existing prefix updates it in place. The route is a separate step, which is what `brutalctl` adds on top.
+Writing accepts one command per write, with the rate in bytes per second: `add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock] [perip]`, `del <prefix>[/<len>]` and `flush`. `perip` requires a locked rule. `add` on an existing prefix updates it in place, except that changing between shared and `perip` requires deleting and recreating the rule. The route is a separate step, which is what `brutalctl` adds on top.
 
 ### Exchanging bandwidth in a proxy protocol
 

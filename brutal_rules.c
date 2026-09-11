@@ -5,8 +5,8 @@
 // ("ip route ... congctl lock brutal"); brutalctl in tools/ does both.
 //
 // Read:  one rule per line, "dst=<prefix>/<len> rate=<bytes/s> gain=<tenths>
-//        lock=<0|1> id=<n> members=<n> sent=<bytes>"
-// Write: "add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock]"
+//        lock=<0|1> group=<shared|perip> id=<n> members=<n> ips=<n> sent=<bytes>"
+// Write: "add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock] [perip]"
 //        (replaces an existing rule for the same prefix, keeping its group)
 //        "del <prefix>[/<len>]"   "flush"
 #include <linux/inet.h>
@@ -32,6 +32,7 @@ struct brutal_rule
         struct in6_addr v6;
     };
     struct brutal_group *group;
+    bool perip;
 };
 
 static LIST_HEAD(brutal_rules); // readers use RCU
@@ -62,7 +63,20 @@ void brutal_apply_rule(struct sock *sk, struct brutal *brutal)
     if (best)
     {
         refcount_inc(&best->group->refcnt);
-        brutal_group_join(brutal, best->group);
+        if (best->perip)
+        {
+            struct brutal_group *g = brutal_perip_group_get(sk, best->group);
+
+            if (g)
+                brutal_group_join(brutal, g);
+            else
+            {
+                pr_warn_ratelimited("tcp_brutal: per-IP group allocation failed; using shared rule group\n");
+                brutal_group_join(brutal, best->group);
+            }
+        }
+        else
+            brutal_group_join(brutal, best->group);
     }
     rcu_read_unlock();
 }
@@ -123,6 +137,7 @@ static int brutal_rule_add(char *args)
     u64 rate = 0;
     u32 gain = INIT_CWND_GAIN;
     bool lock = true;
+    bool perip = false;
     char *tok = strsep(&args, " ");
     int ret;
 
@@ -140,6 +155,8 @@ static int brutal_rule_add(char *args)
             lock = false;
         else if (!strcmp(tok, "lock"))
             lock = true;
+        else if (!strcmp(tok, "perip"))
+            perip = true;
         else
             ret = -EINVAL;
         if (ret)
@@ -147,13 +164,15 @@ static int brutal_rule_add(char *args)
     }
     if (rate < MIN_PACING_RATE || rate > MAX_PACING_RATE || gain < MIN_CWND_GAIN || gain > MAX_CWND_GAIN)
         return -EINVAL;
+    if (perip && !lock)
+        return -EINVAL;
 
     mutex_lock(&brutal_rules_mutex);
     r = brutal_rule_find(&key);
     if (!r)
     {
         r = kmemdup(&key, sizeof(key), GFP_KERNEL);
-        g = r ? brutal_group_alloc(++brutal_rule_next_id) : NULL;
+        g = r ? brutal_group_alloc(++brutal_rule_next_id, GFP_KERNEL) : NULL;
         if (!g)
         {
             mutex_unlock(&brutal_rules_mutex);
@@ -163,10 +182,16 @@ static int brutal_rule_add(char *args)
         r->group = g;
         list_add_tail_rcu(&r->list, &brutal_rules);
     }
+    else if (r->perip != perip)
+    {
+        mutex_unlock(&brutal_rules_mutex);
+        return -EINVAL;
+    }
     g = r->group;
     WRITE_ONCE(g->rate, rate);
     WRITE_ONCE(g->cwnd_gain, gain);
     WRITE_ONCE(g->locked, lock);
+    r->perip = perip;
     mutex_unlock(&brutal_rules_mutex);
     return 0;
 }
@@ -221,9 +246,10 @@ static int brutal_rules_show(struct seq_file *m, void *v)
             seq_printf(m, "dst=%pI4/%u", &r->v4, r->plen);
         else
             seq_printf(m, "dst=%pI6c/%u", &r->v6, r->plen);
-        seq_printf(m, " rate=%llu gain=%u lock=%u id=%llu members=%u sent=%llu\n",
+        seq_printf(m, " rate=%llu gain=%u lock=%u group=%s id=%llu members=%u ips=%u sent=%llu\n",
                    READ_ONCE(g->rate), READ_ONCE(g->cwnd_gain), READ_ONCE(g->locked),
-                   g->id, READ_ONCE(g->members), READ_ONCE(g->sent_bytes));
+                   r->perip ? "perip" : "shared", g->id, READ_ONCE(g->members),
+                   READ_ONCE(g->ip_groups), READ_ONCE(g->sent_bytes));
     }
     rcu_read_unlock();
     return 0;
