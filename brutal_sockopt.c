@@ -35,22 +35,22 @@ struct brutal_group *brutal_group_alloc(u64 id, gfp_t gfp)
     return g;
 }
 
-static const struct brutal_group *brutal_group_parent(const struct brutal_group *g)
+static struct brutal_group *brutal_group_parent(struct brutal_group *g)
 {
     return g->parent ? g->parent : g;
 }
 
-u64 brutal_group_rate(const struct brutal_group *g)
+u64 brutal_group_rate(struct brutal_group *g)
 {
     return READ_ONCE(brutal_group_parent(g)->rate);
 }
 
-u32 brutal_group_cwnd_gain(const struct brutal_group *g)
+u32 brutal_group_cwnd_gain(struct brutal_group *g)
 {
     return READ_ONCE(brutal_group_parent(g)->cwnd_gain);
 }
 
-bool brutal_group_locked(const struct brutal_group *g)
+bool brutal_group_locked(struct brutal_group *g)
 {
     return READ_ONCE(brutal_group_parent(g)->locked);
 }

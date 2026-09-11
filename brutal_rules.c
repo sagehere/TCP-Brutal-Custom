@@ -137,7 +137,7 @@ static int brutal_rule_add(char *args)
     u64 rate = 0;
     u32 gain = INIT_CWND_GAIN;
     bool lock = true;
-    bool perip = false;
+    bool perip = false, created = false;
     char *tok = strsep(&args, " ");
     int ret;
 
@@ -180,7 +180,12 @@ static int brutal_rule_add(char *args)
             return -ENOMEM;
         }
         r->group = g;
+        WRITE_ONCE(g->rate, rate);
+        WRITE_ONCE(g->cwnd_gain, gain);
+        WRITE_ONCE(g->locked, lock);
+        r->perip = perip;
         list_add_tail_rcu(&r->list, &brutal_rules);
+        created = true;
     }
     else if (r->perip != perip)
     {
@@ -188,10 +193,12 @@ static int brutal_rule_add(char *args)
         return -EINVAL;
     }
     g = r->group;
-    WRITE_ONCE(g->rate, rate);
-    WRITE_ONCE(g->cwnd_gain, gain);
-    WRITE_ONCE(g->locked, lock);
-    r->perip = perip;
+    if (!created)
+    {
+        WRITE_ONCE(g->rate, rate);
+        WRITE_ONCE(g->cwnd_gain, gain);
+        WRITE_ONCE(g->locked, lock);
+    }
     mutex_unlock(&brutal_rules_mutex);
     return 0;
 }

@@ -124,3 +124,32 @@ brutalctl list
 这是非官方自定义分支。核心算法、安装方式和应用 socket API 均源自上游 TCP Brutal；本项目的额外功能是规则级 `perip` 自动分组。详细的通用 API 与上游说明可参考 [HyNetworks/tcp-brutal](https://github.com/HyNetworks/tcp-brutal)。
 
 本项目沿用上游的 GPL-3.0 许可证。
+
+## 一键安装与管理
+
+仅支持 Debian/Ubuntu、systemd、Linux 5.10+ 的 x86_64/ARM64 服务器。以下命令会下载当前 `master` 提交、通过 DKMS 构建模块、设置每 IP 速率并启用开机恢复：
+
+```bash
+sudo -E bash <(curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh)
+```
+
+安装后使用交互菜单：
+
+```bash
+sudo brutal-manager
+```
+
+也可以直接执行：
+
+```bash
+sudo brutal-manager install
+sudo brutal-manager rate
+sudo brutal-manager enable
+sudo brutal-manager disable
+sudo brutal-manager status
+sudo brutal-manager uninstall
+```
+
+安装和改速时可分别设置 IPv4、IPv6 的每 IP 速率，并选择 `auto`、`ipv4`、`ipv6` 或 `dual` 地址族模式。`auto` 只会为同时具备全局地址和默认路由的地址族应用规则；暂时不可用的地址族会保留配置，待下次可用时由 systemd 服务恢复。
+
+卸载前必须先在 3x-ui/Xray 中移除 Custom Sockopt 的 `brutal`。管理器会提示确认、暂停已运行的 `x-ui.service` 或 `xray.service`、移除本项目管理的规则和模块，再尝试恢复先前运行的代理服务。
