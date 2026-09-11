@@ -12,6 +12,8 @@ BRUTALCTL="/usr/local/bin/brutalctl"
 SERVICE="/etc/systemd/system/tcp-brutal-custom.service"
 MODULES_LOAD="/etc/modules-load.d/brutal.conf"
 STATE_DIR="/var/lib/tcp-brutal-custom"
+PENDING_REBOOT="$STATE_DIR/reboot-required"
+PEERS_PROC="/proc/net/tcp_brutal/peers"
 
 IPV4_RATE=80
 IPV6_RATE=80
@@ -187,6 +189,19 @@ install_dependencies() {
 }
 
 module_loaded() { lsmod | awk '$1 == "brutal" { found=1 } END { exit !found }'; }
+module_supports_peers() { [[ -r $PEERS_PROC ]]; }
+
+mark_pending_reboot() {
+  install -d -m 0755 "$STATE_DIR"
+  printf '%s\n' "$VERSION" >"$PENDING_REBOOT.tmp"
+  mv "$PENDING_REBOOT.tmp" "$PENDING_REBOOT"
+}
+
+pending_reboot_message() {
+  local pending
+  pending=$(cat "$PENDING_REBOOT" 2>/dev/null || true)
+  printf '更新已暂存%s，请重启服务器以加载新模块。\n' "${pending:+（$pending）}"
+}
 
 download_source() {
   local temp=$1 sha archive metadata
@@ -277,9 +292,9 @@ apply_family() {
       echo "错误: 检测到 $prefix 的非受管规则；拒绝覆盖。" >&2
       return 1
     fi
-    brutalctl del "$prefix"
+    "$BRUTALCTL" del "$prefix"
   fi
-  brutalctl add "$prefix" "$rate" noroute perip
+  "$BRUTALCTL" add "$prefix" "$rate" noroute perip
 }
 
 apply_configured_rules() {
@@ -298,10 +313,10 @@ apply_configured_rules() {
     return 1
   fi
   if ! family_enabled 4 && [[ $(rule_line 0.0.0.0/0) == *"group=perip"* ]]; then
-    brutalctl del 0.0.0.0/0 || return 1
+    "$BRUTALCTL" del 0.0.0.0/0 || return 1
   fi
   if ! family_enabled 6 && [[ $(rule_line ::/0) == *"group=perip"* ]]; then
-    brutalctl del ::/0 || return 1
+    "$BRUTALCTL" del ::/0 || return 1
   fi
 }
 
@@ -309,6 +324,8 @@ apply_rules() {
   load_config
   [[ $MANAGED == 1 ]] || die "尚未完成安装。"
   apply_configured_rules || die "恢复规则失败。"
+  module_supports_peers || die "当前加载的模块不支持活跃 IP 视图；请重启服务器完成更新。"
+  rm -f "$PENDING_REBOOT"
 }
 
 write_service() {
@@ -334,9 +351,19 @@ enable_boot() {
   load_config
   [[ $MANAGED == 1 && -x $BRUTALCTL && -x $MANAGER ]] || die "安装不完整，请先执行安装 / 更新。"
   custom_version_installed "$VERSION" || die "当前内核缺少已安装的 Custom DKMS 模块，请先执行安装 / 更新。"
+  if [[ -f $PENDING_REBOOT ]] && ! module_supports_peers; then
+    pending_reboot_message >&2
+    return 1
+  fi
   [[ -f $SERVICE ]] || write_service
   printf 'brutal\n' >"$MODULES_LOAD"
   systemctl enable --now tcp-brutal-custom.service
+}
+
+enable_boot_deferred() {
+  [[ -f $SERVICE ]] || write_service
+  printf 'brutal\n' >"$MODULES_LOAD"
+  systemctl enable tcp-brutal-custom.service
 }
 
 disable_boot() {
@@ -350,6 +377,7 @@ install_or_update() (
   need_root; check_platform; load_config
   local old_version=$VERSION old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE old_managed=$MANAGED
   local temp="" sha source has_upstream=0 needs_migration=0 needs_install=0 switch_needed=0 switch_complete=0
+  local disk_module_changed=0 artifacts_changed=0
   local had_config=0 had_manager=0 had_brutalctl=0 had_service=0 had_modules_load=0 was_boot_enabled=0
   local upstream_versions=()
   cleanup_install() {
@@ -376,6 +404,18 @@ install_or_update() (
       if (( old_managed )) && ! apply_configured_rules >/dev/null 2>&1; then
         echo "警告: 无法恢复原 TCP Brutal 规则。" >&2
       fi
+    elif (( disk_module_changed && ! switch_complete )); then
+      if [[ -n $old_version ]] && custom_version_installed "$old_version"; then
+        dkms install -m "$PACKAGE" -v "$old_version" -k "$(uname -r)" --force >/dev/null 2>&1 || echo "警告: 无法恢复磁盘上的 DKMS $PACKAGE/$old_version。" >&2
+      else
+        local version
+        for version in "${upstream_versions[@]}"; do
+          dkms install -m tcp-brutal -v "$version" -k "$(uname -r)" --force >/dev/null 2>&1 || echo "警告: 无法恢复磁盘上的 DKMS tcp-brutal/$version。" >&2
+        done
+      fi
+      depmod -a >/dev/null 2>&1 || true
+    fi
+    if (( artifacts_changed && ! switch_complete )); then
       if (( had_config )); then cp -a "$temp/old-config" "$CONFIG" || echo "警告: 无法恢复原配置文件。" >&2; else rm -f "$CONFIG"; fi
       if (( had_manager )); then cp -a "$temp/old-manager" "$MANAGER" || echo "警告: 无法恢复原管理器。" >&2; else rm -f "$MANAGER"; fi
       if (( had_brutalctl )); then cp -a "$temp/old-brutalctl" "$BRUTALCTL" || echo "警告: 无法恢复原 brutalctl。" >&2; else rm -f "$BRUTALCTL"; fi
@@ -425,27 +465,46 @@ install_or_update() (
     IPV4_RATE=$(ask_rate IPv4 "$IPV4_RATE")
     IPV6_RATE=$(ask_rate IPv6 "$IPV6_RATE")
   fi
-  if module_loaded && { (( needs_migration )) || [[ $VERSION != "$old_version" ]]; }; then
-    rmmod brutal || die "Brutal 模块正在使用，无法安全替换；请结束使用该模块的连接后重试。"
-    switch_needed=1
-  elif ! module_loaded; then
-    switch_needed=1
-  fi
-  if (( has_upstream )) && ! remove_upstream_dkms; then
-    die "上游 DKMS 仍无法移除；新构建已保留，未替换规则。"
-  fi
   if (( needs_install )); then
+    disk_module_changed=1
     dkms install -m "$PACKAGE" -v "$VERSION"
   fi
   depmod -a
+  artifacts_changed=1
   install_manager "$source"
   write_service
+  if (( needs_migration )); then
+    if module_loaded; then
+      rmmod brutal || die "上游 Brutal 模块正在使用，无法安全迁移；请结束使用该模块的连接后重试。"
+    fi
+    switch_needed=1
+    if (( has_upstream )) && ! remove_upstream_dkms; then
+      die "上游 DKMS 仍无法移除；新构建已保留，未替换规则。"
+    fi
+  fi
+  if (( ! needs_migration )); then
+    if module_loaded && { [[ $VERSION != "$old_version" ]] || [[ -f $PENDING_REBOOT ]]; }; then
+      if ! rmmod brutal; then
+        save_config
+        enable_boot_deferred
+        mark_pending_reboot
+        switch_complete=1
+        note "更新已暂存，现有连接继续使用旧模块；请重启服务器完成更新。"
+        return 0
+      fi
+      switch_needed=1
+    elif ! module_loaded; then
+      switch_needed=1
+    fi
+  fi
   if (( needs_migration )); then ALLOW_RULE_REPLACE=1; fi
   if ! apply_configured_rules; then
     die "新规则应用失败；已保留 DKMS 构建。"
   fi
+  module_supports_peers || die "新模块缺少活跃 IP 视图接口。"
   save_config
   enable_boot
+  rm -f "$PENDING_REBOOT"
   switch_complete=1
   remove_old_custom_dkms "$VERSION" || echo "警告: 旧版 Custom DKMS 清理失败，可稍后重新执行更新。" >&2
   note "TCP Brutal Custom 安装完成。"
@@ -478,18 +537,33 @@ status() {
   show_stack
   systemctl is-enabled --quiet tcp-brutal-custom.service && echo "开机启动: 已启用" || echo "开机启动: 未启用"
   module_loaded && echo "模块: 已加载" || echo "模块: 未加载"
-  [[ -r /proc/net/tcp_brutal/rules ]] && brutalctl list || true
+  if [[ -f $PENDING_REBOOT ]]; then
+    printf '更新状态: '
+    pending_reboot_message
+  else
+    echo "更新状态: 已生效"
+  fi
+  [[ -r /proc/net/tcp_brutal/rules && -x $BRUTALCTL ]] && "$BRUTALCTL" list || true
+}
+
+show_peers() {
+  [[ -x $BRUTALCTL ]] || die "未找到 $BRUTALCTL，请先执行安装 / 更新。"
+  if [[ -f $PENDING_REBOOT ]] && ! module_supports_peers; then
+    pending_reboot_message >&2
+    return 1
+  fi
+  "$BRUTALCTL" peers
 }
 
 view() {
   need_root
   case ${1:-} in
-    "") brutalctl peers ;;
+    "") show_peers ;;
     --watch)
       while :; do
         printf '\033[H\033[2J'
         printf 'TCP Brutal Custom 活跃 IP  %s\n\n' "$(date '+%F %T')"
-        brutalctl peers || return
+        show_peers || return
         sleep 2
       done
       ;;

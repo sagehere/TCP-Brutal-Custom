@@ -22,7 +22,7 @@ bash <(curl -fsSL https://tcp.hy2.sh/)
 curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh | sudo -E bash
 ```
 
-脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo brutal-manager` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status`、`view [--watch]` 和 `uninstall` 子命令。菜单输入 `0` 退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块与规则。若模块正被连接使用，更新或卸载会安全退出。
+脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo brutal-manager` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status`、`view [--watch]` 和 `uninstall` 子命令。菜单输入 `0` 退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块与规则。普通 Custom 更新遇到模块被连接占用时，会保留现有连接并暂存新版，随后提示重启；`status` 会显示待启用版本，重启并成功恢复规则后自动清除该状态。迁移上游 TCP Brutal 时仍会安全退出，不进入暂存流程。
 
 该脚本会通过 DKMS 安装内核模块，并将 `brutalctl` 工具安装到 `/usr/local/bin`。需要 Linux 5.10 或更高版本。
 
@@ -86,6 +86,8 @@ sudo brutal-manager view --watch  # 每两秒刷新，Ctrl+C 退出
 ```
 
 所有连接关闭后，对应 IP 行立即消失；这里不保存历史统计。
+
+如果更新已暂存且内存中的旧模块尚无 `peers` 接口，`view` 会明确提示重启，不会调用 `PATH` 中可能残留的旧版 `brutalctl`。重启后 systemd 会加载新版模块、恢复规则，并启用活跃 IP 视图。
 
 ### 检查是否正常工作
 

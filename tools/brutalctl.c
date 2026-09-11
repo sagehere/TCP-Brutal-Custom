@@ -199,7 +199,9 @@ static int open_proc(const char *path, int flags)
         if (errno == ENOENT)
         {
             if (!strcmp(path, PEERS_PATH) && access(RULES_PATH, F_OK) == 0)
-                fprintf(stderr, "brutalctl: loaded module does not provide the peers view; update TCP Brutal Custom\n");
+                fprintf(stderr,
+                        "brutalctl: loaded module is too old for the peers view; "
+                        "update TCP Brutal Custom or reboot to finish a staged update\n");
             else
                 fprintf(stderr, "brutalctl: TCP Brutal Custom is not loaded\n");
         }

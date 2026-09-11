@@ -17,6 +17,16 @@ esac
 EOF
 chmod +x "$tmp/bin/ip"
 
+cat >"$tmp/bin/brutalctl" <<'EOF'
+#!/usr/bin/env bash
+echo old-path-tool
+EOF
+cat >"$tmp/fixed-brutalctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*"
+EOF
+chmod +x "$tmp/bin/brutalctl" "$tmp/fixed-brutalctl"
+
 export PATH="$tmp/bin:$PATH"
 export BRUTAL_MANAGER_LIB=1
 # shellcheck disable=SC1090
@@ -26,8 +36,15 @@ source "$repo/install.sh"
 
 (
   need_root() { return 0; }
-  brutalctl() { printf '%s\n' "$*"; }
+  BRUTALCTL="$tmp/fixed-brutalctl"
+  PEERS_PROC="$tmp/peers"
+  PENDING_REBOOT="$tmp/no-pending-reboot"
   [[ $(view) == peers ]]
+  mkdir -p "$tmp/view-state"
+  printf '%s\n' 2.1.0.custom.2222222 >"$tmp/view-state/reboot-required"
+  PENDING_REBOOT="$tmp/view-state/reboot-required"
+  ! view >"$tmp/view-output" 2>"$tmp/view-error"
+  grep -q '更新已暂存.*2.1.0.custom.2222222.*请重启服务器' "$tmp/view-error"
   set +e
   (view unexpected >/dev/null 2>&1)
   rc=$?
@@ -139,6 +156,7 @@ modprobe() { return 0; }
 family_enabled() { [[ $1 == 4 && $enabled4 == 1 || $1 == 6 && $enabled6 == 1 ]]; }
 rule_line() { [[ $1 == ::/0 ]] && echo 'dst=::/0 rate=1 group=perip'; return 0; }
 brutalctl() { commands+=("$*"); }
+BRUTALCTL=brutalctl
 MANAGED=1
 IPV4_RATE=80
 IPV6_RATE=60
@@ -164,6 +182,7 @@ removed_paths=()
 rm() { removed_paths+=("$*"); }
 PACKAGE=tcp-brutal-custom
 STATE_DIR="$tmp/state"
+PENDING_REBOOT="$STATE_DIR/reboot-required"
 VERSION=2.1.0.custom.2222222
 remove_custom_dkms
 [[ ${dkms_calls[0]} == 'remove -m tcp-brutal-custom -v 2.1.0.custom.1111111 --all' ]]
@@ -177,6 +196,8 @@ BRUTALCTL="$tmp/brutalctl"
 SERVICE="$tmp/tcp-brutal-custom.service"
 MODULES_LOAD="$tmp/modules-load.conf"
 STATE_DIR="$tmp/state"
+PENDING_REBOOT="$STATE_DIR/reboot-required"
+PEERS_PROC="$tmp/peers-proc"
 load_config() {
   IPV4_RATE=80; IPV6_RATE=80; MODE=auto
   COMMIT=1111111111111111111111111111111111111111
@@ -196,20 +217,33 @@ download_source() {
 }
 source_version() { echo 2.1.0.custom.2222222; }
 custom_version_installed() { [[ $1 == 2.1.0.custom.1111111 ]]; }
-dkms() { echo "dkms $*" >>"$failure_log"; return 0; }
+dkms() {
+  if [[ $1 == status && ${UPSTREAM_PRESENT:-0} == 1 ]]; then
+    echo 'tcp-brutal/1.2.0, 6.1.0, x86_64: installed'
+  fi
+  echo "dkms $*" >>"$failure_log"
+  return 0
+}
 module_loaded() { return 0; }
 rmmod() { echo rmmod >>"$failure_log"; return "${RMMOD_FAILURE:-0}"; }
 depmod() { return 0; }
 modprobe() { return 0; }
-install_manager() { return 0; }
-write_service() { return 0; }
+install_manager() { echo install-manager >>"$failure_log"; }
+write_service() { echo write-service >>"$failure_log"; }
 enable_boot() { echo enable >>"$failure_log"; return "${ENABLE_FAILURE:-0}"; }
+enable_boot_deferred() { echo enable-deferred >>"$failure_log"; return "${DEFER_FAILURE:-0}"; }
+mark_pending_reboot() {
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$VERSION" >"$PENDING_REBOOT"
+  echo mark-pending >>"$failure_log"
+}
+module_supports_peers() { [[ ${SUPPORTS_PEERS:-1} == 1 ]]; }
 remove_old_custom_dkms() { return 0; }
 save_config() { echo save >>"$failure_log"; }
 build_dkms() { echo build >>"$failure_log"; return "${BUILD_FAILURE:-0}"; }
 apply_configured_rules() { echo apply >>"$failure_log"; return "${APPLY_FAILURE:-0}"; }
 
-DOWNLOAD_FAILURE=12 BUILD_FAILURE=0 RMMOD_FAILURE=0 APPLY_FAILURE=0 ENABLE_FAILURE=0
+DOWNLOAD_FAILURE=12 BUILD_FAILURE=0 RMMOD_FAILURE=0 APPLY_FAILURE=0 ENABLE_FAILURE=0 DEFER_FAILURE=0 UPSTREAM_PRESENT=0 SUPPORTS_PEERS=1
 set +e
 install_or_update
 rc=$?
@@ -231,13 +265,44 @@ grep -q '^build$' "$failure_log"
 
 : >"$failure_log"
 BUILD_FAILURE=0 RMMOD_FAILURE=15
+DEFER_FAILURE=19
+set +e
+install_or_update
+rc=$?
+set -e
+[[ $rc == 19 ]]
+grep -q '^enable-deferred$' "$failure_log"
+grep -q '^dkms install -m tcp-brutal-custom -v 2.1.0.custom.1111111 .* --force$' "$failure_log"
+! grep -q '^mark-pending$' "$failure_log"
+[[ ! -e $PENDING_REBOOT ]]
+
+: >"$failure_log"
+DEFER_FAILURE=0
+set +e
+install_or_update
+rc=$?
+set -e
+[[ $rc == 0 ]]
+[[ $(grep -c '^rmmod$' "$failure_log") == 1 ]]
+[[ $(grep -E '^(build|dkms install|install-manager|write-service|rmmod|save|mark-pending|enable-deferred)' "$failure_log" | paste -sd' ') == 'build dkms install -m tcp-brutal-custom -v 2.1.0.custom.2222222 install-manager write-service rmmod save enable-deferred mark-pending' ]]
+[[ $(cat "$PENDING_REBOOT") == 2.1.0.custom.2222222 ]]
+grep -q '^dkms install -m tcp-brutal-custom -v 2.1.0.custom.2222222$' "$failure_log"
+! grep -q '^apply$' "$failure_log"
+! grep -q '^enable$' "$failure_log"
+
+: >"$failure_log"
+rm -f "$PENDING_REBOOT"
+UPSTREAM_PRESENT=1
 set +e
 install_or_update
 rc=$?
 set -e
 [[ $rc == 1 ]]
 [[ $(grep -c '^rmmod$' "$failure_log") == 1 ]]
-! grep -q '^save$' "$failure_log"
+! grep -q '^mark-pending$' "$failure_log"
+! grep -q '^enable-deferred$' "$failure_log"
+[[ ! -e $PENDING_REBOOT ]]
+UPSTREAM_PRESENT=0
 
 : >"$failure_log"
 RMMOD_FAILURE=0 APPLY_FAILURE=23
@@ -267,6 +332,12 @@ install_or_update
 ! grep -q '^rmmod$' "$failure_log"
 grep -q '^save$' "$failure_log"
 
+mkdir -p "$STATE_DIR"
+printf '%s\n' 2.1.0.custom.2222222 >"$PENDING_REBOOT"
+CONFIG="$tmp/live-config"
+apply_rules
+[[ ! -e $PENDING_REBOOT ]]
+
 if command -v cc >/dev/null; then
   peers_file="$tmp/peers"
   rules_file="$tmp/rules"
@@ -288,7 +359,7 @@ if command -v cc >/dev/null; then
   grep -q 'invalid peers data' "$tmp/peers-error"
   rm "$peers_file"
   ! "$tmp/brutalctl-test" peers >/dev/null 2>"$tmp/peers-error"
-  grep -q 'does not provide the peers view' "$tmp/peers-error"
+  grep -q 'too old for the peers view.*reboot to finish a staged update' "$tmp/peers-error"
   rm "$rules_file"
   ! "$tmp/brutalctl-test" peers >/dev/null 2>"$tmp/peers-error"
   grep -q 'TCP Brutal Custom is not loaded' "$tmp/peers-error"
