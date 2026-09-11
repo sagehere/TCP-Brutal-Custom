@@ -22,7 +22,7 @@ bash <(curl -fsSL https://tcp.hy2.sh/)
 curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh | sudo -E bash
 ```
 
-脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo brutal-manager` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status` 和 `uninstall` 子命令。菜单中的 `0` 和 `7` 均可退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块、规则以及本次暂停的代理服务。
+脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo brutal-manager` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status`、`view [--watch]` 和 `uninstall` 子命令。菜单输入 `0` 退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块与规则。若模块正被连接使用，更新或卸载会安全退出。
 
 该脚本会通过 DKMS 安装内核模块，并将 `brutalctl` 工具安装到 `/usr/local/bin`。需要 Linux 5.10 或更高版本。
 
@@ -76,6 +76,16 @@ brutalctl flush
 brutalctl add 0.0.0.0/0 80 noroute perip
 brutalctl add ::/0 80 noroute perip
 ```
+
+查看当前使用 `perip` 规则的对端 IP、配置速率、连接数和累计发送量：
+
+```bash
+brutalctl peers
+sudo brutal-manager view
+sudo brutal-manager view --watch  # 每两秒刷新，Ctrl+C 退出
+```
+
+所有连接关闭后，对应 IP 行立即消失；这里不保存历史统计。
 
 ### 检查是否正常工作
 
@@ -258,6 +268,15 @@ setsockopt(TCP_CONGESTION, "brutal")
 ```text
 dst=203.0.113.5/32 rate=12500000 gain=20 lock=1 group=perip id=1 members=3 ips=2 sent=1834021376
 ```
+
+`perip` 连接的逐 IP 快照位于只读文件：
+
+```text
+/proc/net/tcp_brutal/peers
+ip=203.0.113.5 family=4 rule=1 rate=12500000 gain=20 members=3 sent=1834021376
+```
+
+这里只显示当前 network namespace 中仍有连接的 IP 分组；`rate` 和 `sent` 的单位分别为 bytes/s 和 bytes。
 
 写入时，每次 write 接受一条命令，其中速率单位为 bytes/s：
 

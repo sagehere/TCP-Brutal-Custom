@@ -12,7 +12,6 @@ BRUTALCTL="/usr/local/bin/brutalctl"
 SERVICE="/etc/systemd/system/tcp-brutal-custom.service"
 MODULES_LOAD="/etc/modules-load.d/brutal.conf"
 STATE_DIR="/var/lib/tcp-brutal-custom"
-LEGACY_SERVICE="/etc/systemd/system/tcp-brutal-xray.service"
 
 IPV4_RATE=80
 IPV6_RATE=80
@@ -20,7 +19,6 @@ MODE=auto
 COMMIT=""
 VERSION=""
 MANAGED=0
-STOPPED_SERVICES=()
 ALLOW_RULE_REPLACE=0
 
 die() { echo "错误: $*" >&2; exit 1; }
@@ -124,44 +122,68 @@ show_stack() {
     "$(family_enabled 6 && echo 可用 || echo 不可用)"
 }
 
+kernel_headers_installed() { [[ -d /lib/modules/"$(uname -r)"/build ]]; }
+ca_certificates_installed() { [[ -r /etc/ssl/certs/ca-certificates.crt ]]; }
+
+clang_kernel() {
+  local config
+  for config in /lib/modules/"$(uname -r)"/build/include/config/auto.conf \
+                /lib/modules/"$(uname -r)"/build/.config /boot/config-"$(uname -r)"; do
+    [[ -r $config ]] || continue
+    grep -q '^CONFIG_CC_IS_CLANG=y' "$config"
+    return
+  done
+  return 1
+}
+
+libc_headers_installed() {
+  local compiler
+  compiler=$(command -v cc || command -v gcc || command -v clang || true)
+  [[ -n $compiler ]] && printf '#include <errno.h>\n' | "$compiler" -E -x c - >/dev/null 2>&1
+}
+
 install_dependencies() {
-  note "安装 DKMS、编译工具、内核 headers 和网络工具"
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    dkms build-essential curl ca-certificates iproute2 "linux-headers-$(uname -r)"
-  [[ -d /lib/modules/"$(uname -r)"/build ]] || die "当前内核缺少 headers；请安装匹配 $(uname -r) 的 headers 后重试。"
-}
+  local packages=() package
+  declare -A missing=()
 
-active_proxy_services() {
-  local service
-  for service in x-ui.service xray.service; do
-    systemctl is-active --quiet "$service" && printf '%s\n' "$service"
-  done
-}
+  have dkms || packages+=(dkms)
+  have curl || packages+=(curl)
+  ca_certificates_installed || packages+=(ca-certificates)
+  have ip || packages+=(iproute2)
+  have make || packages+=(make)
+  have tar || packages+=(tar)
+  if clang_kernel; then
+    have clang || packages+=(clang)
+    have ld.lld || packages+=(lld)
+    have llvm-objcopy || packages+=(llvm)
+  else
+    have cc || have gcc || packages+=(gcc)
+  fi
+  libc_headers_installed || packages+=(libc6-dev)
+  kernel_headers_installed || packages+=("linux-headers-$(uname -r)")
 
-stop_proxy_services() {
-  STOPPED_SERVICES=()
-  local service
-  while IFS= read -r service; do
-    [[ -n $service ]] || continue
-    note "暂停 $service"
-    systemctl stop "$service"
-    STOPPED_SERVICES+=("$service")
-  done < <(active_proxy_services)
-}
+  if ((${#packages[@]})); then
+    local unique=()
+    for package in "${packages[@]}"; do
+      [[ ${missing[$package]+yes} ]] && continue
+      missing[$package]=1
+      unique+=("$package")
+    done
+    note "安装缺失依赖：${unique[*]}"
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${unique[@]}"
+  else
+    note "所需依赖已安装，跳过软件包安装"
+  fi
 
-restore_proxy_services() {
-  local service failed=0
-  local remaining=()
-  for service in "${STOPPED_SERVICES[@]}"; do
-    if ! systemctl start "$service" || ! systemctl is-active --quiet "$service"; then
-      echo "警告: 无法恢复 $service，请执行 systemctl status $service" >&2
-      remaining+=("$service")
-      failed=1
-    fi
-  done
-  STOPPED_SERVICES=("${remaining[@]}")
-  return "$failed"
+  have dkms && have curl && have ip && have make && have tar || die "必要工具安装不完整。"
+  if clang_kernel; then
+    have clang && have ld.lld && have llvm-objcopy || die "当前内核需要完整的 LLVM 工具链。"
+  else
+    have cc || have gcc || die "缺少 C 编译器。"
+  fi
+  libc_headers_installed || die "缺少 C 标准库头文件。"
+  kernel_headers_installed || die "当前内核缺少 headers；请安装匹配 $(uname -r) 的 headers 后重试。"
 }
 
 module_loaded() { lsmod | awk '$1 == "brutal" { found=1 } END { exit !found }'; }
@@ -204,14 +226,6 @@ build_dkms() {
   dkms build -m "$PACKAGE" -v "$VERSION"
 }
 
-backup_upstream() {
-  install -d -m 0700 "$STATE_DIR/backup"
-  rm -f "$STATE_DIR/backup/upstream-dkms-status" "$STATE_DIR/backup/brutalctl" "$STATE_DIR/backup/tcp-brutal-xray.service"
-  dkms status -m tcp-brutal >"$STATE_DIR/backup/upstream-dkms-status" 2>/dev/null || true
-  [[ -x $BRUTALCTL ]] && cp -a "$BRUTALCTL" "$STATE_DIR/backup/brutalctl"
-  [[ -f $LEGACY_SERVICE ]] && cp -a "$LEGACY_SERVICE" "$STATE_DIR/backup/tcp-brutal-xray.service"
-}
-
 remove_upstream_dkms() {
   local version
   while IFS= read -r version; do
@@ -219,14 +233,6 @@ remove_upstream_dkms() {
     note "移除已迁移的上游 DKMS tcp-brutal/$version"
     dkms remove -m tcp-brutal -v "$version" --all || return 1
   done < <(dkms status -m tcp-brutal 2>/dev/null | sed -nE 's#^tcp-brutal/([^,]+),.*#\1#p' | sort -u)
-}
-
-retire_legacy_service() {
-  [[ -f $LEGACY_SERVICE ]] || return 0
-  note "停用已迁移的 tcp-brutal-xray.service"
-  systemctl disable --now tcp-brutal-xray.service || return 1
-  rm -f "$LEGACY_SERVICE"
-  systemctl daemon-reload
 }
 
 remove_custom_dkms() {
@@ -311,7 +317,6 @@ write_service() {
 Description=TCP Brutal Custom per-IP rules
 Wants=network-online.target
 After=network-online.target
-Before=x-ui.service xray.service
 
 [Service]
 Type=oneshot
@@ -362,11 +367,6 @@ install_or_update() (
           dkms install -m tcp-brutal -v "$version" -k "$(uname -r)" --force >/dev/null 2>&1 || echo "警告: 无法恢复 DKMS tcp-brutal/$version。" >&2
         done
       fi
-      if [[ -f $STATE_DIR/backup/tcp-brutal-xray.service ]]; then
-        cp -a "$STATE_DIR/backup/tcp-brutal-xray.service" "$LEGACY_SERVICE"
-        systemctl daemon-reload
-        systemctl enable --now tcp-brutal-xray.service >/dev/null 2>&1 || echo "警告: 无法恢复 tcp-brutal-xray.service。" >&2
-      fi
       depmod -a >/dev/null 2>&1 || true
       if [[ -n $old_version || ${#upstream_versions[@]} -gt 0 ]]; then
         modprobe brutal >/dev/null 2>&1 || echo "警告: 无法重新加载原 brutal 模块。" >&2
@@ -388,7 +388,6 @@ install_or_update() (
         systemctl disable --now tcp-brutal-custom.service >/dev/null 2>&1 || true
       fi
     fi
-    restore_proxy_services || true
     [[ -z $temp ]] || rm -rf "$temp"
     exit "$rc"
   }
@@ -399,10 +398,8 @@ install_or_update() (
     needs_migration=1
     mapfile -t upstream_versions < <(dkms status -m tcp-brutal 2>/dev/null | sed -nE 's#^tcp-brutal/([^,]+),.*#\1#p' | sort -u)
   fi
-  [[ -f $LEGACY_SERVICE ]] && needs_migration=1
   if (( needs_migration )); then
     confirm "检测到旧 TCP Brutal 安装，将在新模块构建成功后迁移，是否继续？" || return 0
-    backup_upstream
   fi
   install_dependencies
   temp=$(mktemp -d)
@@ -429,18 +426,13 @@ install_or_update() (
     IPV6_RATE=$(ask_rate IPv6 "$IPV6_RATE")
   fi
   if module_loaded && { (( needs_migration )) || [[ $VERSION != "$old_version" ]]; }; then
-    confirm "检测到正在运行的 Brutal。将暂停 x-ui/xray 并替换模块，是否继续？" || return 0
+    rmmod brutal || die "Brutal 模块正在使用，无法安全替换；请结束使用该模块的连接后重试。"
     switch_needed=1
-    stop_proxy_services
-    rmmod brutal || die "模块仍被其他进程占用，未执行迁移。"
   elif ! module_loaded; then
     switch_needed=1
   fi
   if (( has_upstream )) && ! remove_upstream_dkms; then
     die "上游 DKMS 仍无法移除；新构建已保留，未替换规则。"
-  fi
-  if (( needs_migration )) && ! retire_legacy_service; then
-    die "旧 tcp-brutal-xray.service 无法停用；新构建已保留，未替换规则。"
   fi
   if (( needs_install )); then
     dkms install -m "$PACKAGE" -v "$VERSION"
@@ -450,14 +442,13 @@ install_or_update() (
   write_service
   if (( needs_migration )); then ALLOW_RULE_REPLACE=1; fi
   if ! apply_configured_rules; then
-    die "新规则应用失败；已保留 DKMS 构建和旧代理服务。"
+    die "新规则应用失败；已保留 DKMS 构建。"
   fi
   save_config
   enable_boot
   switch_complete=1
   remove_old_custom_dkms "$VERSION" || echo "警告: 旧版 Custom DKMS 清理失败，可稍后重新执行更新。" >&2
-  restore_proxy_services || die "安装已完成，但部分代理服务无法恢复。"
-  note "安装完成。3x-ui 的 Custom Sockopt 需设置 TCP_CONGESTION=brutal。"
+  note "TCP Brutal Custom 安装完成。"
 )
 
 set_rate() {
@@ -475,7 +466,7 @@ set_rate() {
     die "应用新速率失败，已尝试恢复原规则。"
   fi
   save_config
-  note "速率已更新，无需重启 Xray。"
+  note "速率已更新。"
 }
 
 status() {
@@ -488,6 +479,22 @@ status() {
   systemctl is-enabled --quiet tcp-brutal-custom.service && echo "开机启动: 已启用" || echo "开机启动: 未启用"
   module_loaded && echo "模块: 已加载" || echo "模块: 未加载"
   [[ -r /proc/net/tcp_brutal/rules ]] && brutalctl list || true
+}
+
+view() {
+  need_root
+  case ${1:-} in
+    "") brutalctl peers ;;
+    --watch)
+      while :; do
+        printf '\033[H\033[2J'
+        printf 'TCP Brutal Custom 活跃 IP  %s\n\n' "$(date '+%F %T')"
+        brutalctl peers || return
+        sleep 2
+      done
+      ;;
+    *) die "用法: brutal-manager view [--watch]" ;;
+  esac
 }
 
 uninstall() (
@@ -503,23 +510,15 @@ uninstall() (
       modprobe brutal >/dev/null 2>&1 || echo "警告: 无法重新加载 brutal 模块。" >&2
       apply_configured_rules >/dev/null 2>&1 || echo "警告: 无法恢复卸载前的规则。" >&2
     fi
-    restore_proxy_services || true
     exit "$rc"
   }
   trap cleanup_uninstall EXIT
   trap 'exit 130' INT TERM
-  echo "请先在 3x-ui/Xray 移除 Custom Sockopt 中的 brutal，然后再卸载。"
-  confirm "确认已移除且继续卸载？" || return 0
-  if module_loaded; then
-    confirm "将暂停正在运行的 x-ui/xray，是否继续？" || return 0
-    stop_proxy_services
+  confirm "确认卸载 TCP Brutal Custom？" || return 0
+  if module_loaded && ! rmmod brutal; then
+    die "Brutal 模块正在使用，无法安全卸载；请结束使用该模块的连接后重试。"
   fi
   changed=1
-  [[ $(rule_line 0.0.0.0/0) == *"group=perip"* ]] && brutalctl del 0.0.0.0/0 2>/dev/null || true
-  [[ $(rule_line ::/0) == *"group=perip"* ]] && brutalctl del ::/0 2>/dev/null || true
-  if module_loaded && ! rmmod brutal; then
-    die "模块仍被占用，已保留安装和配置。"
-  fi
   remove_custom_dkms || die "DKMS 移除失败，已保留安装记录。"
   disable_boot
   rm -f "$SERVICE" "$MODULES_LOAD" "$BRUTALCTL"
@@ -527,8 +526,7 @@ uninstall() (
   systemctl daemon-reload
   rm -f "$MANAGER"
   complete=1
-  restore_proxy_services || die "卸载已完成，但部分代理服务无法恢复。"
-  note "卸载完成。系统编译依赖和第三方 Brutal 安装未删除。"
+  note "卸载完成。系统编译依赖和上游 TCP Brutal 安装未删除。"
 )
 
 run_menu_action() {
@@ -552,7 +550,9 @@ TCP Brutal Custom 管理器
 3. 开启开机启动
 4. 关闭开机启动
 5. 查看状态
-6. 卸载
+6. 查看活跃 IP
+7. 实时查看活跃 IP
+8. 卸载
 0. 退出
 EOF
     local choice
@@ -563,8 +563,10 @@ EOF
       3) run_menu_action enable_boot ;;
       4) run_menu_action disable_boot ;;
       5) run_menu_action status ;;
-      6) run_menu_action uninstall ;;
-      0|7) return ;;
+      6) run_menu_action view ;;
+      7) run_menu_action view --watch ;;
+      8) run_menu_action uninstall ;;
+      0) return ;;
       *) echo "无效选择。" ;;
     esac
   done
@@ -582,6 +584,7 @@ case ${1:-menu} in
   enable) enable_boot ;;
   disable) disable_boot ;;
   status) status ;;
+  view) shift; view "$@" ;;
   uninstall) uninstall ;;
-  *) echo "用法: $0 {install|update|rate|apply|enable|disable|status|uninstall}" >&2; exit 2 ;;
+  *) echo "用法: $0 {install|update|rate|apply|enable|disable|status|view [--watch]|uninstall}" >&2; exit 2 ;;
 esac

@@ -7,7 +7,8 @@
  * connections a route to the prefix must select it, so unless "noroute" is
  * given, add installs one with the ip command (same next hop as today, plus
  * "congctl lock brutal") and del/flush remove it. Routes created here carry
- * protocol 233 and never touch routes created by anything else.
+ * protocol 233 and never touch routes created by anything else. "peers" shows
+ * the active per-IP groups exported by /proc/net/tcp_brutal/peers.
  *
  * Build: cc -O2 -Wall -o brutalctl brutalctl.c
  */
@@ -21,12 +22,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef RULES_PATH
 #define RULES_PATH "/proc/net/tcp_brutal/rules"
+#endif
+#ifndef PEERS_PATH
+#define PEERS_PATH "/proc/net/tcp_brutal/peers"
+#endif
 #define ROUTE_PROTO "233" /* rtnetlink protocol id marking brutalctl's routes */
 
 static int usage(void)
 {
     fputs("usage: brutalctl list\n"
+          "       brutalctl peers\n"
           "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute] [perip]\n"
           "       brutalctl del <prefix>[/<len>]\n"
           "       brutalctl flush\n"
@@ -183,18 +190,30 @@ static int route_present(const char *dst, char *routes)
     return 0;
 }
 
-static int open_rules(int flags)
+static int open_proc(const char *path, int flags)
 {
-    int fd = open(RULES_PATH, flags);
+    int fd = open(path, flags);
 
     if (fd < 0)
     {
         if (errno == ENOENT)
-            fprintf(stderr, "brutalctl: %s: not found (is tcp-brutal 2.x loaded?)\n", RULES_PATH);
+        {
+            if (!strcmp(path, PEERS_PATH) && access(RULES_PATH, F_OK) == 0)
+                fprintf(stderr, "brutalctl: loaded module does not provide the peers view; update TCP Brutal Custom\n");
+            else
+                fprintf(stderr, "brutalctl: TCP Brutal Custom is not loaded\n");
+        }
+        else if (errno == EACCES)
+            fprintf(stderr, "brutalctl: permission denied reading %s\n", path);
         else
-            fprintf(stderr, "brutalctl: %s: %s\n", RULES_PATH, strerror(errno));
+            fprintf(stderr, "brutalctl: %s: %s\n", path, strerror(errno));
     }
     return fd;
+}
+
+static int open_rules(int flags)
+{
+    return open_proc(RULES_PATH, flags);
 }
 
 static int send_cmd(const char *cmd)
@@ -290,6 +309,70 @@ static int list_rules(void)
     return 0;
 }
 
+static int parse_u64(const char *line, const char *key, unsigned long long *value)
+{
+    char text[32], *end;
+
+    field(line, key, text, sizeof(text));
+    if (text[0] < '0' || text[0] > '9')
+        return -1;
+    errno = 0;
+    *value = strtoull(text, &end, 10);
+    return errno || *end ? -1 : 0;
+}
+
+static int list_peers(void)
+{
+    char line[512], ip[64], family[8];
+    unsigned long long rule, rate, gain, members, sent;
+    unsigned int rows = 0, line_number = 0;
+    FILE *f;
+    int fd = open_proc(PEERS_PATH, O_RDONLY);
+
+    if (fd < 0)
+        return 1;
+    f = fdopen(fd, "r");
+    if (!f)
+    {
+        int error = errno;
+
+        close(fd);
+        fprintf(stderr, "brutalctl: cannot read %s: %s\n", PEERS_PATH, strerror(error));
+        return 1;
+    }
+    printf("%-39s %6s %8s %11s %5s %11s %10s\n",
+           "PEER IP", "FAMILY", "RULE ID", "RATE(Mbps)", "GAIN", "CONNECTIONS", "SENT(MB)");
+    while (fgets(line, sizeof(line), f))
+    {
+        line_number++;
+        field(line, "ip", ip, sizeof(ip));
+        field(line, "family", family, sizeof(family));
+        if (!ip[0] || (strcmp(family, "4") && strcmp(family, "6")) ||
+            parse_u64(line, "rule", &rule) || parse_u64(line, "rate", &rate) ||
+            parse_u64(line, "gain", &gain) || parse_u64(line, "members", &members) ||
+            parse_u64(line, "sent", &sent))
+        {
+            fclose(f);
+            fprintf(stderr, "brutalctl: invalid peers data on line %u\n", line_number);
+            return 1;
+        }
+        printf("%-39s %6s %8llu %11.2f %5llu %11llu %10.1f\n",
+               ip, !strcmp(family, "4") ? "IPv4" : "IPv6", rule,
+               rate * 8 / 1e6, gain, members, sent / 1e6);
+        rows++;
+    }
+    if (ferror(f))
+    {
+        fclose(f);
+        fprintf(stderr, "brutalctl: failed while reading %s\n", PEERS_PATH);
+        return 1;
+    }
+    fclose(f);
+    if (!rows)
+        puts("当前无活跃 perip 连接");
+    return 0;
+}
+
 static int add_rule(int argc, char **argv)
 {
     char cmd[256];
@@ -350,6 +433,8 @@ int main(int argc, char **argv)
         return usage();
     if (!strcmp(argv[1], "list") || !strcmp(argv[1], "ls"))
         return argc == 2 ? list_rules() : usage();
+    if (!strcmp(argv[1], "peers"))
+        return argc == 2 ? list_peers() : usage();
     if (!strcmp(argv[1], "add"))
         return add_rule(argc, argv);
     if (!strcmp(argv[1], "del") && argc == 3)

@@ -1,6 +1,7 @@
 // Groups and the application interface: TCP_BRUTAL_PARAMS / TCP_BRUTAL_VERSION
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include "brutal.h"
 
@@ -15,6 +16,21 @@ static DEFINE_HASHTABLE(brutal_groups, 8);
 static DEFINE_SPINLOCK(brutal_groups_lock);
 static DEFINE_HASHTABLE(brutal_perip_groups, 8);
 static DEFINE_SPINLOCK(brutal_perip_groups_lock);
+
+struct brutal_peer_snapshot
+{
+    u8 family;
+    union
+    {
+        __be32 v4;
+        struct in6_addr v6;
+    };
+    u64 rule_id;
+    u64 rate;
+    u64 sent_bytes;
+    u32 cwnd_gain;
+    u32 members;
+};
 
 static struct proto tcp_prot_override __ro_after_init;
 #ifdef _TRANSP_V6_H
@@ -53,6 +69,74 @@ u32 brutal_group_cwnd_gain(struct brutal_group *g)
 bool brutal_group_locked(struct brutal_group *g)
 {
     return READ_ONCE(brutal_group_parent(g)->locked);
+}
+
+int brutal_peers_show(struct seq_file *m, void *v)
+{
+    struct net *net = m->private;
+    struct brutal_peer_snapshot *peers;
+    struct brutal_group *g;
+    size_t count = 0, used = 0, i;
+    int bucket;
+
+    spin_lock_bh(&brutal_perip_groups_lock);
+    hash_for_each(brutal_perip_groups, bucket, g, perip_node)
+    {
+        if (g->net == net)
+            count++;
+    }
+    spin_unlock_bh(&brutal_perip_groups_lock);
+    if (!count)
+        return 0;
+
+    peers = kcalloc(count, sizeof(*peers), GFP_KERNEL);
+    if (!peers)
+        return -ENOMEM;
+
+    spin_lock_bh(&brutal_perip_groups_lock);
+    hash_for_each(brutal_perip_groups, bucket, g, perip_node)
+    {
+        struct brutal_peer_snapshot *peer;
+
+        if (g->net != net)
+            continue;
+        if (used == count)
+            break;
+        peer = &peers[used];
+        spin_lock(&g->lock);
+        peer->members = g->members;
+        peer->sent_bytes = g->sent_bytes;
+        spin_unlock(&g->lock);
+        if (!peer->members)
+            continue;
+        peer->family = g->perip_family;
+        if (peer->family == AF_INET)
+            peer->v4 = g->perip_v4;
+        else
+            peer->v6 = g->perip_v6;
+        spin_lock(&g->parent->lock);
+        peer->rule_id = g->parent->id;
+        peer->rate = g->parent->rate;
+        peer->cwnd_gain = g->parent->cwnd_gain;
+        spin_unlock(&g->parent->lock);
+        used++;
+    }
+    spin_unlock_bh(&brutal_perip_groups_lock);
+
+    for (i = 0; i < used; i++)
+    {
+        struct brutal_peer_snapshot *peer = &peers[i];
+
+        if (peer->family == AF_INET)
+            seq_printf(m, "ip=%pI4 family=4", &peer->v4);
+        else
+            seq_printf(m, "ip=%pI6c family=6", &peer->v6);
+        seq_printf(m, " rule=%llu rate=%llu gain=%u members=%u sent=%llu\n",
+                   peer->rule_id, peer->rate, peer->cwnd_gain,
+                   peer->members, peer->sent_bytes);
+    }
+    kfree(peers);
+    return 0;
 }
 
 // Application group keyed by id, uid and netns; created if missing

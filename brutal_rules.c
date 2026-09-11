@@ -38,6 +38,7 @@ struct brutal_rule
 static LIST_HEAD(brutal_rules); // readers use RCU
 static DEFINE_MUTEX(brutal_rules_mutex);
 static u32 brutal_rule_next_id;
+static struct proc_dir_entry *brutal_init_proc_dir;
 
 static bool brutal_rule_match(const struct brutal_rule *r, const struct sock *sk)
 {
@@ -301,13 +302,41 @@ static const struct proc_ops brutal_rules_proc_ops = {
     .proc_release = single_release,
 };
 
+static int __net_init brutal_peers_net_init(struct net *net)
+{
+    struct proc_dir_entry *dir = proc_net_mkdir(net, "tcp_brutal", net->proc_net);
+
+    if (!dir || !proc_create_net_single("peers", 0444, dir, brutal_peers_show, NULL))
+    {
+        remove_proc_subtree("tcp_brutal", net->proc_net);
+        return -ENOMEM;
+    }
+    if (net_eq(net, &init_net))
+        brutal_init_proc_dir = dir;
+    return 0;
+}
+
+static void __net_exit brutal_peers_net_exit(struct net *net)
+{
+    if (net_eq(net, &init_net))
+        brutal_init_proc_dir = NULL;
+    remove_proc_subtree("tcp_brutal", net->proc_net);
+}
+
+static struct pernet_operations brutal_peers_net_ops = {
+    .init = brutal_peers_net_init,
+    .exit = brutal_peers_net_exit,
+};
+
 int brutal_rules_init(void)
 {
-    struct proc_dir_entry *dir = proc_mkdir("tcp_brutal", init_net.proc_net);
+    int ret = register_pernet_subsys(&brutal_peers_net_ops);
 
-    if (!dir || !proc_create("rules", 0644, dir, &brutal_rules_proc_ops))
+    if (ret)
+        return ret;
+    if (!brutal_init_proc_dir || !proc_create("rules", 0644, brutal_init_proc_dir, &brutal_rules_proc_ops))
     {
-        remove_proc_subtree("tcp_brutal", init_net.proc_net);
+        unregister_pernet_subsys(&brutal_peers_net_ops);
         return -ENOMEM;
     }
     return 0;
@@ -315,6 +344,6 @@ int brutal_rules_init(void)
 
 void brutal_rules_exit(void)
 {
-    remove_proc_subtree("tcp_brutal", init_net.proc_net);
+    unregister_pernet_subsys(&brutal_peers_net_ops);
     brutal_rules_flush();
 }

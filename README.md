@@ -1,8 +1,8 @@
 # TCP Brutal Custom
 
-面向 **Xray / 3x-ui / VLESS + REALITY + XHTTP** 的 TCP Brutal 自定义版。
+TCP Brutal 的独立自定义版，提供按对端 IP 分组的速率控制、安装管理和活跃连接视图。
 
-本项目基于 [HyNetworks/tcp-brutal](https://github.com/HyNetworks/tcp-brutal)，将 Hysteria 的 Brutal 拥塞控制算法实现为 Linux TCP 内核模块，并新增 `perip` 规则模式：每个客户端公网 IP 独立拥有一份带宽，而同一 IP 建立的多条 XHTTP TCP 连接仍共享该带宽。
+本项目基于 [HyNetworks/tcp-brutal](https://github.com/HyNetworks/tcp-brutal)，将 Hysteria 的 Brutal 拥塞控制算法实现为 Linux TCP 内核模块，并新增 `perip` 规则模式：每个对端 IP 独立拥有一份带宽，而同一 IP 建立的多条 TCP 连接仍共享该带宽。
 
 ## 为什么需要 `perip`
 
@@ -23,7 +23,7 @@
 └── 客户端 B 的公网 IP：所有连接合计 80 Mbps
 ```
 
-这适合 XHTTP `stream-one`：无论客户端建立一条或多条底层 TCP 连接，同一公网 IP 都不会因多连接获得多份带宽。
+无论对端建立一条或多条 TCP 连接，同一 IP 都不会因多连接获得多份带宽。
 
 ## 功能
 
@@ -31,55 +31,41 @@
 - 对普通 TCP 应用生效，不要求客户端安装模块或改造协议。
 - `perip`：按对端公网 IP 隔离速率；同一 IP 连接动态共享。
 - IPv4、IPv6 和 IPv4-mapped IPv6 支持；IPv4 与 IPv6 分别计组。
-- `brutalctl` 管理规则，显示连接数、活跃 IP 组数与累计发送流量。
+- `brutalctl` 管理规则，并可查看每个活跃 IP 的速率、连接数与累计发送流量。
 - 保留上游应用 `group_id` 接口与普通共享规则行为。
 
-## 快速部署：Xray / 3x-ui / XHTTP
+## 快速部署
 
-在服务器安装或编译加载本模块后，保留系统默认 TCP 拥塞控制算法，例如 BBR；不要把 Brutal 设为系统默认值。
+使用管理器安装后，会按设置的 IPv4、IPv6 每 IP 速率创建 `perip` 规则并设置开机恢复：
 
-在 3x-ui 的 XHTTP 入站 Socket 设置中添加 Custom Sockopt：
-
-```text
-System  = linux
-Network = tcp
-Level   = 6
-Opt     = 13
-Type    = str
-Value   = brutal
+```bash
+curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh | sudo -E bash
 ```
 
-然后在服务器添加 IPv4 和 IPv6 规则。`noroute` 适用于由 Xray 的 Custom Sockopt 选择 Brutal 的方式：
+也可以直接用 `brutalctl` 添加规则；`80` 是每个 IP 的目标总速率，单位为 Mbps：
 
 ```bash
 sudo brutalctl add 0.0.0.0/0 80 noroute perip
 sudo brutalctl add ::/0 80 noroute perip
 ```
 
-`80` 是每个公网 IP 的目标总速率，单位为 Mbps。查看运行状态：
+查看规则和当前使用 TCP Brutal Custom 的 IP：
 
 ```bash
 brutalctl list
+brutalctl peers
+sudo brutal-manager view
+sudo brutal-manager view --watch
 ```
 
-示例输出中的 `GROUP=perip` 表示按 IP 分组，`IPS` 是当前活跃 IP 组数：
-
-```text
-DESTINATION                    RATE(Mbps)  GAIN  LOCK   GROUP  ROUTE   ID  MEMBERS   IPS   SENT(MB)
-0.0.0.0/0                            80.00    20   yes   perip     no    1        3     2      123.4
-```
-
-部署后用以下命令确认 Xray 入站连接正在使用 Brutal：
-
-```bash
-ss -tin 'sport = :443'
-```
+`view --watch` 每两秒刷新一次，按 Ctrl+C 退出。IP 行只在对应 `perip` 连接存活期间显示。
 
 ## 规则说明
 
 ```bash
 brutalctl add <prefix> <Mbps> [gain=<tenths>] [noroute] [perip]
 brutalctl list
+brutalctl peers
 brutalctl del <prefix>
 brutalctl flush
 ```
@@ -93,18 +79,18 @@ brutalctl flush
 
 ## 边界与建议
 
-- 分组依据是服务器看到的公网 IP，不是 VLESS 用户。处于同一 NAT 的设备仍共享一份速率。
+- 分组依据是发送端看到的对端 IP，不区分应用层身份。处于同一 NAT 的设备仍共享一份速率。
 - 双栈客户端的 IPv4 与 IPv6 会分别获得一份速率。
 - Brutal 不会探测链路带宽。速率应不高于客户端实际可承受带宽；设置过高会增加丢包。
 - `perip` 解决的是规则组内的速率竞争，不会突破 VPS 出口带宽限制。
-- XHTTP 使用 HTTP/3 时底层是 QUIC/UDP，TCP Brutal 不会作用于该连接。
+- TCP Brutal 只作用于 TCP；UDP 和 QUIC 流量不受影响。
 
 ## 从源码构建
 
 Linux 上需要当前内核对应的 headers：
 
 ```bash
-sudo apt install -y linux-headers-$(uname -r) build-essential
+sudo apt install -y linux-headers-$(uname -r) gcc make libc6-dev
 make
 sudo make load
 make -C tools
@@ -159,6 +145,4 @@ sudo brutal-manager uninstall
 
 安装和改速时可分别设置 IPv4、IPv6 的每 IP 速率，并选择 `auto`、`ipv4`、`ipv6` 或 `dual` 地址族模式。`auto` 只会为同时具备全局地址和默认路由的地址族应用规则；暂时不可用的地址族会保留配置，待下次可用时由 systemd 服务恢复。
 
-菜单中输入 `0` 或 `7` 均可退出。取消确认不会被视为错误。关闭开机启动也会关闭模块的自动加载；再次开启时会恢复两者。安装或更新失败时，管理器会清理临时文件、尝试恢复原模块和规则，并只重启本次由它暂停的代理服务。
-
-卸载前必须先在 3x-ui/Xray 中移除 Custom Sockopt 的 `brutal`。管理器会提示确认、暂停已运行的 `x-ui.service` 或 `xray.service`、移除本项目管理的规则和模块，再尝试恢复先前运行的代理服务。
+菜单提供状态、活跃 IP 快照和实时刷新，输入 `0` 退出。关闭开机启动也会关闭模块自动加载；再次开启时会恢复两者。安装或更新失败时，管理器会清理临时文件并尝试恢复原模块和规则。若模块仍被 TCP 连接占用，更新或卸载会安全退出并提示先结束相关连接。

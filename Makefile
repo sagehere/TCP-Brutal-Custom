@@ -1,7 +1,7 @@
 KERNEL_RELEASE  ?= $(shell uname -r)
 KERNEL_DIR      ?= /lib/modules/$(KERNEL_RELEASE)/build
 # Modules for a clang-built kernel (CONFIG_CC_IS_CLANG) must be built with LLVM=1
-KERNEL_CONFIG   := $(firstword $(wildcard $(KERNEL_DIR)/include/config/auto.conf $(KERNEL_DIR)/.config))
+KERNEL_CONFIG   := $(firstword $(wildcard $(KERNEL_DIR)/include/config/auto.conf $(KERNEL_DIR)/.config /boot/config-$(KERNEL_RELEASE)))
 KBUILD_LLVM     := $(if $(KERNEL_CONFIG),$(if $(shell grep -qs '^CONFIG_CC_IS_CLANG=y' $(KERNEL_CONFIG) && echo y),LLVM=1))
 DKMS_TARBALL    ?= dkms.tar.gz
 TAR             ?= tar

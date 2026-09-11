@@ -7,6 +7,8 @@
 #include <linux/spinlock.h>
 #include <net/tcp.h>
 
+struct seq_file;
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 #error "TCP Brutal requires Linux 5.10 or later"
 #endif
@@ -107,6 +109,7 @@ struct brutal_group *brutal_perip_group_get(struct sock *sk, struct brutal_group
 u64 brutal_group_rate(struct brutal_group *g);
 u32 brutal_group_cwnd_gain(struct brutal_group *g);
 bool brutal_group_locked(struct brutal_group *g);
+int brutal_peers_show(struct seq_file *m, void *v);
 void brutal_sockopt_init(void);
 void brutal_sockopt_install(struct sock *sk);
 void brutal_sockopt_uninstall(struct sock *sk);
