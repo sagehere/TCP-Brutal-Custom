@@ -1,170 +1,126 @@
-# <img src="logo.png" width="400">
+# TCP Brutal Custom
 
-TCP Brutal is [Hysteria](https://hysteria.network/)'s congestion control algorithm ported to TCP, as a Linux kernel module. Information about Brutal itself can be found in the [Hysteria documentation](https://hysteria.network/docs/advanced/Full-Server-Config/#bandwidth-behavior-explained).
+面向 **Xray / 3x-ui / VLESS + REALITY + XHTTP** 的 TCP Brutal 自定义版。
 
-As an official subproject of Hysteria, TCP Brutal is actively maintained to be in sync with the Brutal implementation in Hysteria.
+本项目基于 [HyNetworks/tcp-brutal](https://github.com/HyNetworks/tcp-brutal)，将 Hysteria 的 Brutal 拥塞控制算法实现为 Linux TCP 内核模块，并新增 `perip` 规则模式：每个客户端公网 IP 独立拥有一份带宽，而同一 IP 建立的多条 XHTTP TCP 连接仍共享该带宽。
 
-**中文文档：[README.zh.md](README.zh.md)**
+## 为什么需要 `perip`
 
-> **New in v2:** TCP Brutal no longer needs special support from the application. Set a rate for a destination once, and every connection to it uses Brutal, any program, any TCP-based protocol. Stop waiting and use it right now!
+上游普通规则将所有命中同一前缀的连接放进一个共享组：
 
-## Quick start
-
-### Install
-
-```bash
-bash <(curl -fsSL https://tcp.hy2.sh/)
+```text
+0.0.0.0/0 80 Mbps
+├── 客户端 A
+└── 客户端 B
+    合计共享 80 Mbps
 ```
 
-This installs the kernel module through DKMS and the `brutalctl` tool to `/usr/local/bin`. Linux 5.10 or later is required.
+使用 `perip` 后，TCP Brutal 自动按服务器实际看到的客户端公网 IP 分组：
 
-On NixOS with flakes, add the module to your `flake.nix`; it provides `brutalctl` as well:
-
-```nix
-{
-  inputs.tcp-brutal.url = "github:HyNetworks/tcp-brutal";
-  
-  outputs = { nixpkgs, tcp-brutal, ... }: {
-    nixosConfigurations.myHost = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        # ... your configuration.nix ...
-        tcp-brutal.nixosModules.default
-        { boot.tcp-brutal.enable = true; }
-      ];
-    };
-  };
-}
+```text
+0.0.0.0/0 80 Mbps perip
+├── 客户端 A 的公网 IP：所有连接合计 80 Mbps
+└── 客户端 B 的公网 IP：所有连接合计 80 Mbps
 ```
 
-### Use it for a destination
+这适合 XHTTP `stream-one`：无论客户端建立一条或多条底层 TCP 连接，同一公网 IP 都不会因多连接获得多份带宽。
 
-Run this on the side that sends the data. For downloads from your server, that is the server:
+## 功能
 
-```bash
-# Everything sent to 203.0.113.5 shares 100 Mbps, whichever program sends it
-brutalctl add 203.0.113.5/32 100
+- Linux 5.10+ TCP 拥塞控制模块，支持 x86_64 与 ARM64。
+- 对普通 TCP 应用生效，不要求客户端安装模块或改造协议。
+- `perip`：按对端公网 IP 隔离速率；同一 IP 连接动态共享。
+- IPv4、IPv6 和 IPv4-mapped IPv6 支持；IPv4 与 IPv6 分别计组。
+- `brutalctl` 管理规则，显示连接数、活跃 IP 组数与累计发送流量。
+- 保留上游应用 `group_id` 接口与普通共享规则行为。
+
+## 快速部署：Xray / 3x-ui / XHTTP
+
+在服务器安装或编译加载本模块后，保留系统默认 TCP 拥塞控制算法，例如 BBR；不要把 Brutal 设为系统默认值。
+
+在 3x-ui 的 XHTTP 入站 Socket 设置中添加 Custom Sockopt：
+
+```text
+System  = linux
+Network = tcp
+Level   = 6
+Opt     = 13
+Type    = str
+Value   = brutal
 ```
 
-The number is the total for all connections to that destination, which should be what the receiving side's link can actually take. A single active connection gets all of it; several share it. No application support is needed: a plain web server, proxy tool, rsync or SSH to that address is covered.
+然后在服务器添加 IPv4 和 IPv6 规则。`noroute` 适用于由 Xray 的 Custom Sockopt 选择 Brutal 的方式：
 
 ```bash
-brutalctl list                   # rules, and how many connections each one has right now
-brutalctl add 203.0.113.5/32 50  # change the rate; existing connections follow immediately
-brutalctl del 203.0.113.5/32
+sudo brutalctl add 0.0.0.0/0 80 noroute perip
+sudo brutalctl add ::/0 80 noroute perip
+```
+
+`80` 是每个公网 IP 的目标总速率，单位为 Mbps。查看运行状态：
+
+```bash
+brutalctl list
+```
+
+示例输出中的 `GROUP=perip` 表示按 IP 分组，`IPS` 是当前活跃 IP 组数：
+
+```text
+DESTINATION                    RATE(Mbps)  GAIN  LOCK   GROUP  ROUTE   ID  MEMBERS   IPS   SENT(MB)
+0.0.0.0/0                            80.00    20   yes   perip     no    1        3     2      123.4
+```
+
+部署后用以下命令确认 Xray 入站连接正在使用 Brutal：
+
+```bash
+ss -tin 'sport = :443'
+```
+
+## 规则说明
+
+```bash
+brutalctl add <prefix> <Mbps> [gain=<tenths>] [noroute] [perip]
+brutalctl list
+brutalctl del <prefix>
 brutalctl flush
 ```
 
-**A connection picks up a rule only when it is established, so add rules before making the connections that should use them; running programs need no restart, but their existing connections are unaffected. After that, `add` on the same prefix changes the rate live for every connection in the group, and `del` stops new connections from matching while existing ones keep the old rate until they close.**
+- 不带 `perip` 时，保持上游行为：所有命中规则的连接共享一份速率。
+- 带 `perip` 时，每个对端 IP 各自拥有一份速率；同一 IP 的所有连接合计共享。
+- `perip` 必须使用默认锁定规则，不能与 `nolock` 一起使用。
+- 修改同一模式规则的速率会立即影响已有连接。普通共享规则与 `perip` 规则之间切换时，先删除再重新添加规则。
+- 规则只匹配新建连接；删除规则后，旧连接会继续使用原速率直到关闭。
+- 规则重启后失效，应通过 systemd 或启动脚本恢复。
 
-Rules do not survive a reboot; put the `add` commands in a boot script if needed.
+## 边界与建议
 
-Add `perip` to give each peer IP its own shared rate. Connections from one IP still share the rate, while different IPs do not. `perip` requires the default locked rule:
+- 分组依据是服务器看到的公网 IP，不是 VLESS 用户。处于同一 NAT 的设备仍共享一份速率。
+- 双栈客户端的 IPv4 与 IPv6 会分别获得一份速率。
+- Brutal 不会探测链路带宽。速率应不高于客户端实际可承受带宽；设置过高会增加丢包。
+- `perip` 解决的是规则组内的速率竞争，不会突破 VPS 出口带宽限制。
+- XHTTP 使用 HTTP/3 时底层是 QUIC/UDP，TCP Brutal 不会作用于该连接。
 
-    brutalctl add 0.0.0.0/0 80 noroute perip
-    brutalctl add ::/0 80 noroute perip
+## 从源码构建
 
-### Check that it works
-
-Download something from the server and watch the rate, or use the speed test in [example](example): the client opens several connections that share one rate as a group.
-
-```bash
-# Server, listening on TCP port 1234
-python server.py -p 1234
-
-# Client, connect to example.com:1234, download at 50 Mbps in total
-# over 4 connections (-n) for 10 seconds (-t)
-python client.py -p 1234 example.com 50
-```
-
-The example speaks to the module directly and works without a rule. **With a rule for the client's address in place, the rule's rate wins.**
-
-## How it works
-
-**Brutal sends at the rate you set.** It does not probe for bandwidth like cubic or BBR. It paces packets at the configured rate, and when packets are lost it sends more so that the delivered rate stays at the target. This assumes you know the bandwidth of the path; set it too high and you only produce loss.
-
-**It works on one side.** Brutal controls sending, and the TCP protocol on the wire is unchanged, so the other end needs nothing. Proxy users mostly download, so running it on the server alone gives most of the benefit.
-
-**Groups.** Connections in a group share one rate as their total. Bandwidth is not divided statically: whoever is sending gets it, and a connection that uses less than its share leaves the rest to the others. Groups are formed in two ways: by a destination rule (above), or by an application that sets a group id on its sockets (below).
-
-**Rules.** A rule maps a destination prefix to a group. Two things are needed for it to take effect, and `brutalctl` does both: the rule itself, kept by the module in `/proc/net/tcp_brutal/rules`, and a route that makes the kernel pick brutal for new connections to that prefix, the same as `ip route replace <prefix> via <gateway> congctl lock brutal proto 233` with the next hop copied from the current routing table. Routes it creates carry `proto 233`, so `ip route show proto 233` lists them and `brutalctl` never touches other routes. Use `noroute` if you manage the route yourself, for example when the destination is reached through a policy routing table. When several rules match, the longest prefix wins.
-
-**Rules apply to new connections.** A connection joins a rule's group when it is established. Adding a rule does not affect connections that already exist; changing a rule's rate with `add` updates its group live; deleting a rule leaves its existing connections sharing the old rate until they close, while new ones no longer match.
-
-**Locked by default.** With the route's `lock` and the rule together, applications cannot change the algorithm or the rate on those connections. An application that itself supports TCP Brutal gets `EPERM` when it tries and should simply carry on. Add the rule with `nolock` if applications should be allowed to set their own params instead.
-
-**Do not set brutal as the system default congestion control.** A connection with no rule and no application settings runs at 1 Mbps. Applications that support TCP Brutal enable it on their own sockets, and rules cover everything else, so there is no reason to make it the default.
-
-## For developers
-
-### Enabling it on a socket
-
-```python
-s.setsockopt(socket.IPPROTO_TCP, TCP_CONGESTION, "brutal".encode())
-```
-
-Then set the send rate, the congestion window gain (1.5x to 2x recommended, written as 15 or 20 since the kernel has no floating point) and optionally a group:
-
-```c
-struct brutal_params
-{
-    u64 rate;      // Send rate in bytes per second
-    u32 cwnd_gain; // CWND gain in tenths (10=1.0)
-    u64 group_id;  // 0 = rate applies to this connection only (v1 behavior)
-} __packed;
-```
-
-```python
-TCP_BRUTAL_PARAMS = 23301
-
-rate = 2000000 # 2 MB/s
-cwnd_gain = 15
-group_id = 42
-brutal_params_value = struct.pack("<QIQ", rate, cwnd_gain, group_id)
-conn.setsockopt(socket.IPPROTO_TCP, TCP_BRUTAL_PARAMS, brutal_params_value)
-```
-
-The 12-byte v1 struct without `group_id` is still accepted. The same option can be read back with getsockopt; a group member reports the group's rate, cwnd_gain and group_id:
-
-```python
-rate, cwnd_gain, group_id = struct.unpack("<QIQ", conn.getsockopt(socket.IPPROTO_TCP, TCP_BRUTAL_PARAMS, 20))
-```
-
-To check which module is loaded, read its version on a connection that already uses brutal. v1 modules, and plain TCP sockets, fail with `ENOPROTOOPT`:
-
-```python
-TCP_BRUTAL_VERSION = 23302
-
-# u32: major << 16 | minor << 8 | patch
-version = struct.unpack("<I", conn.getsockopt(socket.IPPROTO_TCP, TCP_BRUTAL_VERSION, 4))[0]
-supports_groups = version >= 0x020000
-```
-
-### Groups
-
-All connections that set the same non-zero `group_id`, from the same user and network namespace, share `rate` as their total. Setting params on any member updates the whole group. A group exists as long as one member is open.
-
-A proxy server typically puts all connections of one client into one group keyed by that client's identity, so the client's bandwidth setting holds across all of its connections. TCP Brutal v1 had no groups, so it was only usable with protocols that multiplex everything into a single TCP connection; with groups, one-connection-per-stream protocols work too.
-
-### Rules and applications
-
-On a connection covered by a locked rule, `TCP_BRUTAL_PARAMS` returns `EPERM`, and because the route is locked, so does `setsockopt(TCP_CONGESTION, "brutal")` even though brutal is already active. Handle both: on `EPERM`, check the current algorithm with `getsockopt(TCP_CONGESTION)`, and if it is brutal, just send. [example/server.py](example/server.py) shows this.
-
-Tools can use the rules file directly instead of `brutalctl`. Reading `/proc/net/tcp_brutal/rules` gives one rule per line as `key=value` pairs with live counters:
-
-```
-dst=203.0.113.5/32 rate=12500000 gain=20 lock=1 group=perip id=1 members=3 ips=2 sent=1834021376
-```
-
-Writing accepts one command per write, with the rate in bytes per second: `add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock] [perip]`, `del <prefix>[/<len>]` and `flush`. `perip` requires a locked rule. `add` on an existing prefix updates it in place, except that changing between shared and `perip` requires deleting and recreating the rule. The route is a separate step, which is what `brutalctl` adds on top.
-
-### Exchanging bandwidth in a proxy protocol
-
-Brutal needs to know the bandwidth, and most TCP proxy protocols have no way for the client and server to exchange it. We suggest using the "destination address" field that every proxy protocol has: a client that supports TCP Brutal requests a connection to a special address such as `_BrutalBwExchange`, and if the server accepts, both sides exchange their bandwidth over that connection.
-
-### Building from source
+Linux 上需要当前内核对应的 headers：
 
 ```bash
-make && make load   # kernel headers required, e.g. apt install linux-headers-$(uname -r)
-make -C tools       # brutalctl
+sudo apt install -y linux-headers-$(uname -r) build-essential
+make
+sudo make load
+make -C tools
+sudo install -m 0755 tools/brutalctl /usr/local/bin/brutalctl
 ```
+
+构建完成后确认：
+
+```bash
+lsmod | grep brutal
+sysctl net.ipv4.tcp_available_congestion_control
+brutalctl list
+```
+
+## 与上游的关系
+
+这是非官方自定义分支。核心算法、安装方式和应用 socket API 均源自上游 TCP Brutal；本项目的额外功能是规则级 `perip` 自动分组。详细的通用 API 与上游说明可参考 [HyNetworks/tcp-brutal](https://github.com/HyNetworks/tcp-brutal)。
+
+本项目沿用上游的 GPL-3.0 许可证。
