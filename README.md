@@ -130,7 +130,14 @@ brutalctl list
 仅支持 Debian/Ubuntu、systemd、Linux 5.10+ 的 x86_64/ARM64 服务器。以下命令会下载当前 `master` 提交、通过 DKMS 构建模块、设置每 IP 速率并启用开机恢复：
 
 ```bash
-sudo -E bash <(curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh)
+curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh | sudo -E bash
+```
+
+脚本的交互输入会直接从终端读取，因此上述管道方式可以正常使用。如果当前环境没有交互终端，请先下载再运行：
+
+```bash
+curl -fsSLo install.sh https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh
+sudo -E bash install.sh
 ```
 
 安装后使用交互菜单：
@@ -151,5 +158,7 @@ sudo brutal-manager uninstall
 ```
 
 安装和改速时可分别设置 IPv4、IPv6 的每 IP 速率，并选择 `auto`、`ipv4`、`ipv6` 或 `dual` 地址族模式。`auto` 只会为同时具备全局地址和默认路由的地址族应用规则；暂时不可用的地址族会保留配置，待下次可用时由 systemd 服务恢复。
+
+菜单中输入 `0` 或 `7` 均可退出。取消确认不会被视为错误。关闭开机启动也会关闭模块的自动加载；再次开启时会恢复两者。安装或更新失败时，管理器会清理临时文件、尝试恢复原模块和规则，并只重启本次由它暂停的代理服务。
 
 卸载前必须先在 3x-ui/Xray 中移除 Custom Sockopt 的 `brutal`。管理器会提示确认、暂停已运行的 `x-ui.service` 或 `xray.service`、移除本项目管理的规则和模块，再尝试恢复先前运行的代理服务。

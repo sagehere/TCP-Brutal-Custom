@@ -16,6 +16,14 @@ TCP Brutal 是 [Hysteria](https://hysteria.network/) 的 Brutal 拥塞控制算�
 bash <(curl -fsSL https://tcp.hy2.sh/)
 ```
 
+本分支的 `perip` 管理器可使用以下命令安装或更新：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh | sudo -E bash
+```
+
+脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo brutal-manager` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status` 和 `uninstall` 子命令。菜单中的 `0` 和 `7` 均可退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块、规则以及本次暂停的代理服务。
+
 该脚本会通过 DKMS 安装内核模块，并将 `brutalctl` 工具安装到 `/usr/local/bin`。需要 Linux 5.10 或更高版本。
 
 如果使用带 flakes 的 NixOS，可以在 `flake.nix` 中加入该模块，同时也会提供 `brutalctl`：

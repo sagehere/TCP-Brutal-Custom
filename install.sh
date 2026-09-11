@@ -4,11 +4,11 @@ set -Eeuo pipefail
 
 REPO="sagehere/TCP-Brutal-Custom"
 API="https://api.github.com/repos/$REPO/commits/master"
-RAW="https://raw.githubusercontent.com/$REPO"
 TARBALL="https://github.com/$REPO/archive"
 PACKAGE="tcp-brutal-custom"
 CONFIG="/etc/tcp-brutal-custom.conf"
 MANAGER="/usr/local/bin/brutal-manager"
+BRUTALCTL="/usr/local/bin/brutalctl"
 SERVICE="/etc/systemd/system/tcp-brutal-custom.service"
 MODULES_LOAD="/etc/modules-load.d/brutal.conf"
 STATE_DIR="/var/lib/tcp-brutal-custom"
@@ -21,10 +21,18 @@ COMMIT=""
 VERSION=""
 MANAGED=0
 STOPPED_SERVICES=()
+ALLOW_RULE_REPLACE=0
 
 die() { echo "错误: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+read_tty() {
+  local prompt=$1 variable=$2
+  [[ -r /dev/tty ]] || die "当前没有可用的交互终端；请直接运行 brutal-manager，或使用子命令。"
+  printf '%s' "$prompt" >&2
+  IFS= read -r "$variable" </dev/tty || die "无法从交互终端读取输入。"
+}
 
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 或 sudo 运行。"; }
 
@@ -43,13 +51,18 @@ check_platform() {
 
 load_config() {
   IPV4_RATE=80; IPV6_RATE=80; MODE=auto; COMMIT=""; VERSION=""; MANAGED=0
-  [[ -f $CONFIG ]] || return
+  [[ -f $CONFIG ]] || return 0
   local key value
   while IFS='=' read -r key value; do
     case $key in
       IPV4_RATE|IPV6_RATE|MODE|COMMIT|VERSION|MANAGED) printf -v "$key" '%s' "$value" ;;
     esac
   done <"$CONFIG"
+  valid_rate "$IPV4_RATE" && valid_rate "$IPV6_RATE" || die "配置文件中的速率无效：$CONFIG"
+  [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "配置文件中的地址族模式无效：$CONFIG"
+  [[ $MANAGED == 1 ]] || die "配置文件中的管理标记无效：$CONFIG"
+  [[ -z $COMMIT || $COMMIT =~ ^[0-9a-f]{40}$ ]] || die "配置文件中的提交号无效：$CONFIG"
+  [[ -z $VERSION || $VERSION =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]] || die "配置文件中的版本号无效：$CONFIG"
 }
 
 save_config() {
@@ -68,12 +81,12 @@ EOF
 }
 
 valid_rate() {
-  [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v r="$1" 'BEGIN { exit !(r >= .5 && r <= 1000000) }'
+  [[ $1 =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] && awk -v r="$1" 'BEGIN { exit !(r >= .5 && r <= 1000000) }'
 }
 
 ask_rate() {
   local family=$1 current=$2 answer
-  read -r -p "$family 每 IP 速率 Mbps [$current]: " answer
+  read_tty "$family 每 IP 速率 Mbps [$current]: " answer
   answer=${answer:-$current}
   valid_rate "$answer" || die "速率必须在 0.5 到 1000000 Mbps 之间。"
   printf '%s\n' "$answer"
@@ -81,7 +94,7 @@ ask_rate() {
 
 confirm() {
   local answer
-  read -r -p "$1 [y/N]: " answer
+  read_tty "$1 [y/N]: " answer
   [[ $answer =~ ^[Yy]$ ]]
 }
 
@@ -138,17 +151,26 @@ stop_proxy_services() {
 }
 
 restore_proxy_services() {
-  local service
-  for service in "${STOPPED_SERVICES[@]:-}"; do
-    systemctl start "$service" || echo "警告: 无法恢复 $service，请执行 systemctl status $service" >&2
+  local service failed=0
+  local remaining=()
+  for service in "${STOPPED_SERVICES[@]}"; do
+    if ! systemctl start "$service" || ! systemctl is-active --quiet "$service"; then
+      echo "警告: 无法恢复 $service，请执行 systemctl status $service" >&2
+      remaining+=("$service")
+      failed=1
+    fi
   done
+  STOPPED_SERVICES=("${remaining[@]}")
+  return "$failed"
 }
 
 module_loaded() { lsmod | awk '$1 == "brutal" { found=1 } END { exit !found }'; }
 
 download_source() {
-  local temp=$1 sha archive
-  sha=$(curl -fsSL "$API" | sed -nE 's/.*"sha": "([0-9a-f]{40})".*/\1/p' | head -1)
+  local temp=$1 sha archive metadata
+  metadata="$temp/commit.json"
+  curl -fsSL "$API" -o "$metadata"
+  sha=$(sed -nE 's/.*"sha": "([0-9a-f]{40})".*/\1/p' "$metadata" | sed -n '1p')
   [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "无法解析 GitHub master 提交。"
   archive="$temp/source.tar.gz"
   curl -fsSL "$TARBALL/$sha.tar.gz" -o "$archive"
@@ -165,33 +187,28 @@ source_version() {
 }
 
 install_manager() {
-  local source=$1 sha=$2 temp=$3
-  curl -fsSL "$RAW/$sha/install.sh" -o "$temp/brutal-manager"
-  install -Dm755 "$temp/brutal-manager" "$MANAGER"
-  install -Dm644 /dev/null "$MODULES_LOAD"
-  printf 'brutal\n' >"$MODULES_LOAD"
+  local source=$1
+  install -Dm755 "$source/install.sh" "$MANAGER"
+  install -Dm755 "$source/tools/brutalctl" "$BRUTALCTL"
   install -d -m 0755 "$STATE_DIR"
   cp -a "$source/." "$STATE_DIR/source-$VERSION"
 }
 
-install_dkms() {
+build_dkms() {
   local source=$1 target="/usr/src/$PACKAGE-$VERSION"
   rm -rf "$target"
   install -d -m 0755 "$target"
   cp -a "$source/." "$target/"
   (cd "$target" && PACKAGE_NAME="$PACKAGE" PACKAGE_VERSION="$VERSION" ./scripts/mkdkmsconf.sh >dkms.conf)
-  dkms add -m "$PACKAGE" -v "$VERSION"
+  dkms status -m "$PACKAGE" -v "$VERSION" >/dev/null 2>&1 || dkms add -m "$PACKAGE" -v "$VERSION"
   dkms build -m "$PACKAGE" -v "$VERSION"
-  dkms install -m "$PACKAGE" -v "$VERSION"
-  make -C "$target/tools"
-  install -Dm755 "$target/tools/brutalctl" /usr/local/bin/brutalctl
-  depmod -a
 }
 
 backup_upstream() {
   install -d -m 0700 "$STATE_DIR/backup"
+  rm -f "$STATE_DIR/backup/upstream-dkms-status" "$STATE_DIR/backup/brutalctl" "$STATE_DIR/backup/tcp-brutal-xray.service"
   dkms status -m tcp-brutal >"$STATE_DIR/backup/upstream-dkms-status" 2>/dev/null || true
-  [[ -x /usr/local/bin/brutalctl ]] && cp -a /usr/local/bin/brutalctl "$STATE_DIR/backup/brutalctl"
+  [[ -x $BRUTALCTL ]] && cp -a "$BRUTALCTL" "$STATE_DIR/backup/brutalctl"
   [[ -f $LEGACY_SERVICE ]] && cp -a "$LEGACY_SERVICE" "$STATE_DIR/backup/tcp-brutal-xray.service"
 }
 
@@ -200,7 +217,7 @@ remove_upstream_dkms() {
   while IFS= read -r version; do
     [[ $version =~ ^[0-9][A-Za-z0-9.+-]*$ ]] || continue
     note "移除已迁移的上游 DKMS tcp-brutal/$version"
-    dkms remove -m tcp-brutal -v "$version" --all
+    dkms remove -m tcp-brutal -v "$version" --all || return 1
   done < <(dkms status -m tcp-brutal 2>/dev/null | sed -nE 's#^tcp-brutal/([^,]+),.*#\1#p' | sort -u)
 }
 
@@ -213,9 +230,31 @@ retire_legacy_service() {
 }
 
 remove_custom_dkms() {
-  [[ $VERSION =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]] || return
-  dkms remove -m "$PACKAGE" -v "$VERSION" --all >/dev/null 2>&1 || true
-  rm -rf "/usr/src/$PACKAGE-$VERSION"
+  local version
+  while IFS= read -r version; do
+    [[ $version =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]] || continue
+    [[ $version == "$VERSION" ]] && continue
+    dkms remove -m "$PACKAGE" -v "$version" --all || return 1
+    rm -rf "/usr/src/$PACKAGE-$version" "$STATE_DIR/source-$version"
+  done < <(dkms status -m "$PACKAGE" 2>/dev/null | sed -nE "s#^$PACKAGE/([^,]+),.*#\1#p" | sort -u)
+  if [[ $VERSION =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]]; then
+    dkms remove -m "$PACKAGE" -v "$VERSION" --all || return 1
+    rm -rf "/usr/src/$PACKAGE-$VERSION" "$STATE_DIR/source-$VERSION"
+  fi
+}
+
+custom_version_installed() {
+  dkms status -m "$PACKAGE" -v "$1" -k "$(uname -r)" 2>/dev/null | grep -Eq ': installed(,|$)'
+}
+
+remove_old_custom_dkms() {
+  local keep=$1 version
+  while IFS= read -r version; do
+    [[ $version == "$keep" ]] && continue
+    [[ $version =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]] || continue
+    dkms remove -m "$PACKAGE" -v "$version" --all || return 1
+    rm -rf "/usr/src/$PACKAGE-$version" "$STATE_DIR/source-$version"
+  done < <(dkms status -m "$PACKAGE" 2>/dev/null | sed -nE "s#^$PACKAGE/([^,]+),.*#\1#p" | sort -u)
 }
 
 rule_line() { grep -E "^dst=$1 " /proc/net/tcp_brutal/rules 2>/dev/null || true; }
@@ -223,9 +262,13 @@ rule_line() { grep -E "^dst=$1 " /proc/net/tcp_brutal/rules 2>/dev/null || true;
 apply_family() {
   local prefix=$1 rate=$2 line
   line=$(rule_line "$prefix")
+  if [[ -n $line && $MANAGED != 1 && $ALLOW_RULE_REPLACE != 1 ]]; then
+    echo "错误: 检测到 $prefix 的现有规则；为避免覆盖非受管配置，请先手动删除。" >&2
+    return 1
+  fi
   if [[ -n $line && $line != *"group=perip"* ]]; then
-    if [[ $MANAGED != 1 ]]; then
-      echo "错误: 检测到 $prefix 的非 perip 规则；请先手动删除，或完成迁移后重试。" >&2
+    if [[ $ALLOW_RULE_REPLACE != 1 ]]; then
+      echo "错误: 检测到 $prefix 的非受管规则；拒绝覆盖。" >&2
       return 1
     fi
     brutalctl del "$prefix"
@@ -247,6 +290,12 @@ apply_configured_rules() {
   if (( ! applied )); then
     echo "错误: 未检测到可用地址族；请设置 brutal-manager rate 的模式为 ipv4、ipv6 或 dual。" >&2
     return 1
+  fi
+  if ! family_enabled 4 && [[ $(rule_line 0.0.0.0/0) == *"group=perip"* ]]; then
+    brutalctl del 0.0.0.0/0 || return 1
+  fi
+  if ! family_enabled 6 && [[ $(rule_line ::/0) == *"group=perip"* ]]; then
+    brutalctl del ::/0 || return 1
   fi
 }
 
@@ -276,78 +325,146 @@ EOF
 }
 
 enable_boot() {
+  need_root
+  load_config
+  [[ $MANAGED == 1 && -x $BRUTALCTL && -x $MANAGER ]] || die "安装不完整，请先执行安装 / 更新。"
+  custom_version_installed "$VERSION" || die "当前内核缺少已安装的 Custom DKMS 模块，请先执行安装 / 更新。"
   [[ -f $SERVICE ]] || write_service
+  printf 'brutal\n' >"$MODULES_LOAD"
   systemctl enable --now tcp-brutal-custom.service
 }
 
 disable_boot() {
+  need_root
   systemctl disable --now tcp-brutal-custom.service 2>/dev/null || true
+  rm -f "$MODULES_LOAD"
 }
 
-install_or_update() {
+install_or_update() (
+  set -Eeuo pipefail
   need_root; check_platform; load_config
-  local old_version=$VERSION temp sha source has_upstream=0 needs_migration=0
+  local old_version=$VERSION old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE old_managed=$MANAGED
+  local temp="" sha source has_upstream=0 needs_migration=0 needs_install=0 switch_needed=0 switch_complete=0
+  local had_config=0 had_manager=0 had_brutalctl=0 had_service=0 had_modules_load=0 was_boot_enabled=0
+  local upstream_versions=()
+  cleanup_install() {
+    local rc=$?
+    trap - EXIT INT TERM
+    set +e
+    if (( switch_needed && ! switch_complete )); then
+      echo "警告: 安装未完成，正在尝试恢复原模块。" >&2
+      rmmod brutal >/dev/null 2>&1 || true
+      if [[ -n $old_version ]] && custom_version_installed "$old_version"; then
+        dkms install -m "$PACKAGE" -v "$old_version" -k "$(uname -r)" --force >/dev/null 2>&1 || echo "警告: 无法恢复 DKMS $PACKAGE/$old_version。" >&2
+      else
+        local version
+        for version in "${upstream_versions[@]}"; do
+          dkms install -m tcp-brutal -v "$version" -k "$(uname -r)" --force >/dev/null 2>&1 || echo "警告: 无法恢复 DKMS tcp-brutal/$version。" >&2
+        done
+      fi
+      if [[ -f $STATE_DIR/backup/tcp-brutal-xray.service ]]; then
+        cp -a "$STATE_DIR/backup/tcp-brutal-xray.service" "$LEGACY_SERVICE"
+        systemctl daemon-reload
+        systemctl enable --now tcp-brutal-xray.service >/dev/null 2>&1 || echo "警告: 无法恢复 tcp-brutal-xray.service。" >&2
+      fi
+      depmod -a >/dev/null 2>&1 || true
+      if [[ -n $old_version || ${#upstream_versions[@]} -gt 0 ]]; then
+        modprobe brutal >/dev/null 2>&1 || echo "警告: 无法重新加载原 brutal 模块。" >&2
+      fi
+      MODE=$old_mode; IPV4_RATE=$old_ipv4; IPV6_RATE=$old_ipv6; MANAGED=$old_managed
+      ALLOW_RULE_REPLACE=0
+      if (( old_managed )) && ! apply_configured_rules >/dev/null 2>&1; then
+        echo "警告: 无法恢复原 TCP Brutal 规则。" >&2
+      fi
+      if (( had_config )); then cp -a "$temp/old-config" "$CONFIG" || echo "警告: 无法恢复原配置文件。" >&2; else rm -f "$CONFIG"; fi
+      if (( had_manager )); then cp -a "$temp/old-manager" "$MANAGER" || echo "警告: 无法恢复原管理器。" >&2; else rm -f "$MANAGER"; fi
+      if (( had_brutalctl )); then cp -a "$temp/old-brutalctl" "$BRUTALCTL" || echo "警告: 无法恢复原 brutalctl。" >&2; else rm -f "$BRUTALCTL"; fi
+      if (( had_service )); then cp -a "$temp/old-service" "$SERVICE" || echo "警告: 无法恢复原 systemd 服务。" >&2; else rm -f "$SERVICE"; fi
+      if (( had_modules_load )); then cp -a "$temp/old-modules-load" "$MODULES_LOAD" || echo "警告: 无法恢复原模块自动加载配置。" >&2; else rm -f "$MODULES_LOAD"; fi
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      if (( was_boot_enabled )); then
+        systemctl enable tcp-brutal-custom.service >/dev/null 2>&1 || true
+      else
+        systemctl disable --now tcp-brutal-custom.service >/dev/null 2>&1 || true
+      fi
+    fi
+    restore_proxy_services || true
+    [[ -z $temp ]] || rm -rf "$temp"
+    exit "$rc"
+  }
+  trap cleanup_install EXIT
+  trap 'exit 130' INT TERM
   if dkms status -m tcp-brutal 2>/dev/null | grep -q .; then
     has_upstream=1
     needs_migration=1
+    mapfile -t upstream_versions < <(dkms status -m tcp-brutal 2>/dev/null | sed -nE 's#^tcp-brutal/([^,]+),.*#\1#p' | sort -u)
   fi
   [[ -f $LEGACY_SERVICE ]] && needs_migration=1
   if (( needs_migration )); then
-    confirm "检测到旧 TCP Brutal 安装，将在新模块构建成功后迁移，是否继续？" || return
+    confirm "检测到旧 TCP Brutal 安装，将在新模块构建成功后迁移，是否继续？" || return 0
     backup_upstream
-  fi
-  if module_loaded || (( needs_migration )); then
-    confirm "检测到正在运行的 Brutal。将暂停 x-ui/xray 并替换模块，是否继续？" || return
-    stop_proxy_services
-    if module_loaded && ! rmmod brutal; then
-      restore_proxy_services
-      die "模块仍被其他进程占用，未执行迁移。"
-    fi
   fi
   install_dependencies
   temp=$(mktemp -d)
-  trap 'rm -rf "$temp"' RETURN
+  if [[ -f $CONFIG ]]; then cp -a "$CONFIG" "$temp/old-config"; had_config=1; fi
+  if [[ -f $MANAGER ]]; then cp -a "$MANAGER" "$temp/old-manager"; had_manager=1; fi
+  if [[ -f $BRUTALCTL ]]; then cp -a "$BRUTALCTL" "$temp/old-brutalctl"; had_brutalctl=1; fi
+  if [[ -f $SERVICE ]]; then cp -a "$SERVICE" "$temp/old-service"; had_service=1; fi
+  if [[ -f $MODULES_LOAD ]]; then cp -a "$MODULES_LOAD" "$temp/old-modules-load"; had_modules_load=1; fi
+  systemctl is-enabled --quiet tcp-brutal-custom.service 2>/dev/null && was_boot_enabled=1 || true
   sha=$(download_source "$temp")
   source="$temp/source"
   VERSION=$(source_version "$source" "$sha")
-  if [[ $VERSION == "$old_version" ]] && dkms status -m "$PACKAGE" -v "$VERSION" >/dev/null 2>&1; then
+  if custom_version_installed "$VERSION"; then
     note "当前提交已安装：${sha:0:7}"
   else
-    install_dkms "$source"
+    build_dkms "$source"
+    needs_install=1
   fi
-  if (( has_upstream )) && ! remove_upstream_dkms; then
-    restore_proxy_services
-    die "上游 DKMS 仍无法移除；新构建已保留，未替换规则。"
-  fi
-  if (( needs_migration )) && ! retire_legacy_service; then
-    restore_proxy_services
-    die "旧 tcp-brutal-xray.service 无法停用；新构建已保留，未替换规则。"
-  fi
+  make -C "$source/tools"
   COMMIT=$sha
-  install_manager "$source" "$sha" "$temp"
-  if [[ $MANAGED != 1 ]]; then
+  if (( ! old_managed )); then
     MODE=auto
     IPV4_RATE=$(ask_rate IPv4 "$IPV4_RATE")
     IPV6_RATE=$(ask_rate IPv6 "$IPV6_RATE")
   fi
-  save_config
+  if module_loaded && { (( needs_migration )) || [[ $VERSION != "$old_version" ]]; }; then
+    confirm "检测到正在运行的 Brutal。将暂停 x-ui/xray 并替换模块，是否继续？" || return 0
+    switch_needed=1
+    stop_proxy_services
+    rmmod brutal || die "模块仍被其他进程占用，未执行迁移。"
+  elif ! module_loaded; then
+    switch_needed=1
+  fi
+  if (( has_upstream )) && ! remove_upstream_dkms; then
+    die "上游 DKMS 仍无法移除；新构建已保留，未替换规则。"
+  fi
+  if (( needs_migration )) && ! retire_legacy_service; then
+    die "旧 tcp-brutal-xray.service 无法停用；新构建已保留，未替换规则。"
+  fi
+  if (( needs_install )); then
+    dkms install -m "$PACKAGE" -v "$VERSION"
+  fi
+  depmod -a
+  install_manager "$source"
   write_service
+  if (( needs_migration )); then ALLOW_RULE_REPLACE=1; fi
   if ! apply_configured_rules; then
-    restore_proxy_services
     die "新规则应用失败；已保留 DKMS 构建和旧代理服务。"
   fi
+  save_config
   enable_boot
-  restore_proxy_services
-  trap - RETURN
-  rm -rf "$temp"
+  switch_complete=1
+  remove_old_custom_dkms "$VERSION" || echo "警告: 旧版 Custom DKMS 清理失败，可稍后重新执行更新。" >&2
+  restore_proxy_services || die "安装已完成，但部分代理服务无法恢复。"
   note "安装完成。3x-ui 的 Custom Sockopt 需设置 TCP_CONGESTION=brutal。"
-}
+)
 
 set_rate() {
   need_root; load_config
   [[ $MANAGED == 1 ]] || die "请先安装。"
   local answer old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE
-  read -r -p "地址族模式 [auto/ipv4/ipv6/dual] [$MODE]: " answer
+  read_tty "地址族模式 [auto/ipv4/ipv6/dual] [$MODE]: " answer
   MODE=${answer:-$MODE}
   [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "无效模式。"
   IPV4_RATE=$(ask_rate IPv4 "$IPV4_RATE")
@@ -373,29 +490,56 @@ status() {
   [[ -r /proc/net/tcp_brutal/rules ]] && brutalctl list || true
 }
 
-uninstall() {
+uninstall() (
+  set -Eeuo pipefail
   need_root; load_config
   [[ $MANAGED == 1 ]] || die "未找到本项目安装记录。"
+  local complete=0 changed=0
+  cleanup_uninstall() {
+    local rc=$?
+    trap - EXIT INT TERM
+    set +e
+    if (( changed && ! complete )); then
+      modprobe brutal >/dev/null 2>&1 || echo "警告: 无法重新加载 brutal 模块。" >&2
+      apply_configured_rules >/dev/null 2>&1 || echo "警告: 无法恢复卸载前的规则。" >&2
+    fi
+    restore_proxy_services || true
+    exit "$rc"
+  }
+  trap cleanup_uninstall EXIT
+  trap 'exit 130' INT TERM
   echo "请先在 3x-ui/Xray 移除 Custom Sockopt 中的 brutal，然后再卸载。"
-  confirm "确认已移除且继续卸载？" || return
+  confirm "确认已移除且继续卸载？" || return 0
   if module_loaded; then
-    confirm "将暂停正在运行的 x-ui/xray，是否继续？" || return
+    confirm "将暂停正在运行的 x-ui/xray，是否继续？" || return 0
     stop_proxy_services
   fi
+  changed=1
   [[ $(rule_line 0.0.0.0/0) == *"group=perip"* ]] && brutalctl del 0.0.0.0/0 2>/dev/null || true
   [[ $(rule_line ::/0) == *"group=perip"* ]] && brutalctl del ::/0 2>/dev/null || true
   if module_loaded && ! rmmod brutal; then
-    restore_proxy_services
     die "模块仍被占用，已保留安装和配置。"
   fi
+  remove_custom_dkms || die "DKMS 移除失败，已保留安装记录。"
   disable_boot
-  rm -f "$SERVICE" "$MODULES_LOAD" /usr/local/bin/brutalctl
-  remove_custom_dkms
+  rm -f "$SERVICE" "$MODULES_LOAD" "$BRUTALCTL"
   rm -rf "$STATE_DIR" "$CONFIG"
   systemctl daemon-reload
-  restore_proxy_services
   rm -f "$MANAGER"
+  complete=1
+  restore_proxy_services || die "卸载已完成，但部分代理服务无法恢复。"
   note "卸载完成。系统编译依赖和第三方 Brutal 安装未删除。"
+)
+
+run_menu_action() {
+  local rc
+  set +e
+  ( set -Eeuo pipefail; "$@" )
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    echo "操作失败，请根据上方错误信息处理后重试。" >&2
+  fi
 }
 
 menu() {
@@ -412,15 +556,15 @@ TCP Brutal Custom 管理器
 0. 退出
 EOF
     local choice
-    read -r -p '请选择: ' choice
+    read_tty '请选择: ' choice
     case $choice in
-      1) install_or_update ;;
-      2) set_rate ;;
-      3) need_root; enable_boot ;;
-      4) need_root; disable_boot ;;
-      5) status ;;
-      6) uninstall ;;
-      0) return ;;
+      1) run_menu_action install_or_update ;;
+      2) run_menu_action set_rate ;;
+      3) run_menu_action enable_boot ;;
+      4) run_menu_action disable_boot ;;
+      5) run_menu_action status ;;
+      6) run_menu_action uninstall ;;
+      0|7) return ;;
       *) echo "无效选择。" ;;
     esac
   done
@@ -435,8 +579,8 @@ case ${1:-menu} in
   install|update) install_or_update ;;
   rate) set_rate ;;
   apply) apply_rules ;;
-  enable) need_root; enable_boot ;;
-  disable) need_root; disable_boot ;;
+  enable) enable_boot ;;
+  disable) disable_boot ;;
   status) status ;;
   uninstall) uninstall ;;
   *) echo "用法: $0 {install|update|rate|apply|enable|disable|status|uninstall}" >&2; exit 2 ;;
