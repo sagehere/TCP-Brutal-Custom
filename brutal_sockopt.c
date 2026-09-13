@@ -1,6 +1,9 @@
 // Groups and the application interface: TCP_BRUTAL_PARAMS / TCP_BRUTAL_VERSION
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
+#include <linux/mempool.h>
+#include <linux/percpu_counter.h>
+#include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include "brutal.h"
@@ -14,22 +17,22 @@
 
 static DEFINE_HASHTABLE(brutal_groups, 8);
 static DEFINE_SPINLOCK(brutal_groups_lock);
-static DEFINE_HASHTABLE(brutal_perip_groups, 8);
-static DEFINE_SPINLOCK(brutal_perip_groups_lock);
+static struct rhashtable brutal_perip_groups;
+static struct kmem_cache *brutal_peer_cache;
+static mempool_t *brutal_peer_pool;
+static struct workqueue_struct *brutal_free_wq;
 
-struct brutal_peer_snapshot
+struct brutal_rule_stats
 {
-    u8 family;
-    union
-    {
-        __be32 v4;
-        struct in6_addr v6;
-    };
-    u64 rule_id;
-    u64 rate;
-    u64 sent_bytes;
-    u32 cwnd_gain;
-    u32 members;
+    struct percpu_counter sent_bytes;
+    struct work_struct destroy_work;
+    struct brutal_group *group;
+};
+static const struct rhashtable_params brutal_perip_params = {
+    .head_offset = offsetof(struct brutal_group, perip_node),
+    .key_offset = offsetof(struct brutal_group, peer_key),
+    .key_len = sizeof(struct brutal_peer_key),
+    .automatic_shrinking = true,
 };
 
 static struct proto tcp_prot_override __ro_after_init;
@@ -37,17 +40,37 @@ static struct proto tcp_prot_override __ro_after_init;
 static struct proto tcpv6_prot_override __ro_after_init;
 #endif
 
+static void brutal_group_init(struct brutal_group *g, u64 id)
+{
+    refcount_set(&g->refcnt, 1);
+    spin_lock_init(&g->lock);
+    atomic_set(&g->members, 0);
+    atomic_set(&g->ip_groups, 0);
+    atomic_set(&g->generation, 0);
+    atomic64_set(&g->sent_bytes, 0);
+    g->id = id;
+    g->rate = INIT_PACING_RATE;
+    g->cwnd_gain = INIT_CWND_GAIN;
+}
+
 struct brutal_group *brutal_group_alloc(u64 id, gfp_t gfp)
 {
     struct brutal_group *g = kzalloc(sizeof(*g), gfp);
 
     if (!g)
         return NULL;
-    refcount_set(&g->refcnt, 1);
-    spin_lock_init(&g->lock);
-    g->id = id;
-    g->rate = INIT_PACING_RATE;
-    g->cwnd_gain = INIT_CWND_GAIN;
+    brutal_group_init(g, id);
+    return g;
+}
+
+static struct brutal_group *brutal_peer_alloc(u64 id)
+{
+    struct brutal_group *g = mempool_alloc(brutal_peer_pool, GFP_ATOMIC);
+
+    if (!g)
+        return NULL;
+    memset(g, 0, sizeof(*g));
+    brutal_group_init(g, id);
     return g;
 }
 
@@ -58,86 +81,239 @@ static struct brutal_group *brutal_group_parent(struct brutal_group *g)
 
 u64 brutal_group_rate(struct brutal_group *g)
 {
-    return READ_ONCE(brutal_group_parent(g)->rate);
+    u64 rate;
+
+    brutal_group_get_config(g, &rate, NULL, NULL, NULL);
+    return rate;
 }
 
 u32 brutal_group_cwnd_gain(struct brutal_group *g)
 {
-    return READ_ONCE(brutal_group_parent(g)->cwnd_gain);
+    u32 gain;
+
+    brutal_group_get_config(g, NULL, &gain, NULL, NULL);
+    return gain;
+}
+
+int brutal_group_enable_rule_stats(struct brutal_group *g, bool perip)
+{
+    struct brutal_rule_stats *stats = kzalloc(sizeof(*stats), GFP_KERNEL);
+    struct brutal_group **fallbacks = NULL;
+    int i;
+    int ret;
+
+    if (!stats)
+        return -ENOMEM;
+    ret = percpu_counter_init(&stats->sent_bytes, 0, GFP_KERNEL);
+    if (ret)
+    {
+        kfree(stats);
+        return ret;
+    }
+    if (perip)
+    {
+        fallbacks = kcalloc(BRUTAL_FALLBACK_PACERS, sizeof(*fallbacks),
+                            GFP_KERNEL);
+        if (!fallbacks)
+            goto fail;
+        for (i = 0; i < BRUTAL_FALLBACK_PACERS; i++)
+        {
+            fallbacks[i] = brutal_group_alloc(g->id, GFP_KERNEL);
+            if (!fallbacks[i])
+                goto fail;
+            fallbacks[i]->parent = g;
+            fallbacks[i]->fallback = true;
+            refcount_inc(&g->refcnt);
+        }
+    }
+    stats->group = g;
+    g->fallbacks = fallbacks;
+    g->rule_stats = stats;
+    return 0;
+
+fail:
+    for (i = 0; i < BRUTAL_FALLBACK_PACERS; i++)
+    {
+        if (!fallbacks || !fallbacks[i])
+            break;
+        kfree(fallbacks[i]);
+        refcount_dec(&g->refcnt);
+    }
+    kfree(fallbacks);
+    percpu_counter_destroy(&stats->sent_bytes);
+    kfree(stats);
+    return -ENOMEM;
+}
+
+void brutal_group_account_sent(struct brutal_group *g, u64 bytes)
+{
+    struct brutal_rule_stats *stats = READ_ONCE(g->rule_stats);
+
+    if (stats)
+        percpu_counter_add(&stats->sent_bytes, bytes);
+    else
+        atomic64_add(bytes, &g->sent_bytes);
+}
+
+u64 brutal_group_sent(struct brutal_group *g)
+{
+    struct brutal_rule_stats *stats = READ_ONCE(g->rule_stats);
+
+    return stats ? percpu_counter_sum_positive(&stats->sent_bytes) : atomic64_read(&g->sent_bytes);
+}
+
+u16 brutal_group_generation(struct brutal_group *g)
+{
+    struct brutal_group *parent = brutal_group_parent(g);
+    u16 generation = (u16)atomic_read(&parent->generation);
+
+    smp_rmb();
+    return generation;
+}
+
+void brutal_group_get_config(struct brutal_group *g, u64 *rate, u32 *gain,
+                             bool *locked, u16 *generation)
+{
+    struct brutal_group *parent = brutal_group_parent(g);
+    u16 before, after;
+
+    do
+    {
+        before = (u16)atomic_read(&parent->generation);
+        smp_rmb();
+        if (rate)
+            *rate = READ_ONCE(parent->rate);
+        if (gain)
+            *gain = READ_ONCE(parent->cwnd_gain);
+        if (locked)
+            *locked = READ_ONCE(parent->locked);
+        smp_rmb();
+        after = (u16)atomic_read(&parent->generation);
+    } while (before != after);
+    if (generation)
+        *generation = after;
+}
+
+void brutal_group_set_config(struct brutal_group *g, u64 rate, u32 gain, bool locked)
+{
+    g = brutal_group_parent(g);
+    WRITE_ONCE(g->rate, rate);
+    WRITE_ONCE(g->cwnd_gain, gain);
+    WRITE_ONCE(g->locked, locked);
+    smp_wmb();
+    atomic_inc(&g->generation);
 }
 
 bool brutal_group_locked(struct brutal_group *g)
 {
-    return READ_ONCE(brutal_group_parent(g)->locked);
+    bool locked;
+
+    brutal_group_get_config(g, NULL, NULL, &locked, NULL);
+    return locked;
 }
 
-int brutal_peers_show(struct seq_file *m, void *v)
+struct brutal_peer_seq
 {
-    struct net *net = m->private;
-    struct brutal_peer_snapshot *peers;
+    struct rhashtable_iter iter;
+    struct net *net;
+};
+
+static struct brutal_group *brutal_peer_seq_next(struct brutal_peer_seq *ctx)
+{
     struct brutal_group *g;
-    size_t count = 0, used = 0, i;
-    int bucket;
 
-    spin_lock_bh(&brutal_perip_groups_lock);
-    hash_for_each(brutal_perip_groups, bucket, g, perip_node)
+    for (;;)
     {
-        if (g->net == net)
-            count++;
+        g = rhashtable_walk_next(&ctx->iter);
+        if (IS_ERR(g))
+        {
+            if (PTR_ERR(g) == -EAGAIN)
+                continue;
+            return NULL;
+        }
+        if (!g)
+            return NULL;
+        if (g->net == ctx->net && atomic_read(&g->members))
+            return g;
     }
-    spin_unlock_bh(&brutal_perip_groups_lock);
-    if (!count)
-        return 0;
+}
 
-    peers = kcalloc(count, sizeof(*peers), GFP_KERNEL);
-    if (!peers)
-        return -ENOMEM;
+static void *brutal_peers_seq_start(struct seq_file *m, loff_t *pos)
+{
+    struct brutal_peer_seq *ctx = m->private;
+    struct brutal_group *g = NULL;
+    loff_t i;
 
-    spin_lock_bh(&brutal_perip_groups_lock);
-    hash_for_each(brutal_perip_groups, bucket, g, perip_node)
+    rhashtable_walk_enter(&brutal_perip_groups, &ctx->iter);
+    rhashtable_walk_start(&ctx->iter);
+    for (i = 0; i <= *pos; i++)
     {
-        struct brutal_peer_snapshot *peer;
-
-        if (g->net != net)
-            continue;
-        if (used == count)
+        g = brutal_peer_seq_next(ctx);
+        if (!g)
             break;
-        peer = &peers[used];
-        spin_lock(&g->lock);
-        peer->members = g->members;
-        peer->sent_bytes = g->sent_bytes;
-        spin_unlock(&g->lock);
-        if (!peer->members)
-            continue;
-        peer->family = g->perip_family;
-        if (peer->family == AF_INET)
-            peer->v4 = g->perip_v4;
-        else
-            peer->v6 = g->perip_v6;
-        spin_lock(&g->parent->lock);
-        peer->rule_id = g->parent->id;
-        peer->rate = g->parent->rate;
-        peer->cwnd_gain = g->parent->cwnd_gain;
-        spin_unlock(&g->parent->lock);
-        used++;
     }
-    spin_unlock_bh(&brutal_perip_groups_lock);
+    return g;
+}
 
-    for (i = 0; i < used; i++)
-    {
-        struct brutal_peer_snapshot *peer = &peers[i];
+static void *brutal_peers_seq_next(struct seq_file *m, void *v, loff_t *pos)
+{
+    struct brutal_peer_seq *ctx = m->private;
 
-        if (peer->family == AF_INET)
-            seq_printf(m, "ip=%pI4 family=4", &peer->v4);
-        else
-            seq_printf(m, "ip=%pI6c family=6", &peer->v6);
-        seq_printf(m, " rule=%llu rate=%llu gain=%u members=%u sent=%llu\n",
-                   peer->rule_id, peer->rate, peer->cwnd_gain,
-                   peer->members, peer->sent_bytes);
-    }
-    kfree(peers);
+    ++*pos;
+    return brutal_peer_seq_next(ctx);
+}
+
+static void brutal_peers_seq_stop(struct seq_file *m, void *v)
+{
+    struct brutal_peer_seq *ctx = m->private;
+
+    rhashtable_walk_stop(&ctx->iter);
+    rhashtable_walk_exit(&ctx->iter);
+}
+
+static int brutal_peers_seq_show(struct seq_file *m, void *v)
+{
+    struct brutal_group *g = v;
+    u64 rate;
+    u32 gain;
+
+    brutal_group_get_config(g, &rate, &gain, NULL, NULL);
+    if (g->peer_key.family == AF_INET)
+        seq_printf(m, "ip=%pI4 family=4", &g->peer_key.v4);
+    else
+        seq_printf(m, "ip=%pI6c family=6", &g->peer_key.v6);
+    seq_printf(m, " rule=%llu rate=%llu gain=%u members=%u sent=%llu\n",
+               g->parent->id, rate, gain, atomic_read(&g->members),
+               atomic64_read(&g->sent_bytes));
     return 0;
 }
+
+static const struct seq_operations brutal_peers_seq_ops = {
+    .start = brutal_peers_seq_start,
+    .next = brutal_peers_seq_next,
+    .stop = brutal_peers_seq_stop,
+    .show = brutal_peers_seq_show,
+};
+
+static int brutal_peers_open(struct inode *inode, struct file *file)
+{
+    struct seq_file *m;
+    int ret = seq_open_private(file, &brutal_peers_seq_ops,
+                               sizeof(struct brutal_peer_seq));
+
+    if (ret)
+        return ret;
+    m = file->private_data;
+    ((struct brutal_peer_seq *)m->private)->net = pde_data(inode);
+    return 0;
+}
+
+const struct proc_ops brutal_peers_proc_ops = {
+    .proc_open = brutal_peers_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = seq_release_private,
+};
 
 // Application group keyed by id, uid and netns; created if missing
 static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
@@ -165,81 +341,115 @@ static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
     return ng;
 }
 
-static u32 brutal_perip_hash(const struct sock *sk, u8 *family)
+static void brutal_perip_key(const struct sock *sk, struct brutal_group *parent,
+                             struct brutal_peer_key *key)
 {
+    memset(key, 0, sizeof(*key));
+    key->parent = parent;
+    key->net = sock_net(sk);
 #if IS_ENABLED(CONFIG_IPV6)
     if (sk->sk_family == AF_INET6 && !ipv6_addr_v4mapped(&sk->sk_v6_daddr))
     {
-        *family = AF_INET6;
-        return jhash2((const u32 *)&sk->sk_v6_daddr, 4, 0);
+        key->family = AF_INET6;
+        key->v6 = sk->sk_v6_daddr;
+        return;
     }
 #endif
-    *family = AF_INET;
-    return (__force u32)sk->sk_daddr;
+    key->family = AF_INET;
+    key->v4 = sk->sk_daddr;
 }
 
-static bool brutal_perip_match(const struct brutal_group *g, const struct sock *sk, u8 family)
+static struct brutal_group *brutal_fallback_group_get(
+    const struct brutal_peer_key *key, struct brutal_group *parent)
 {
-    if (g->parent == NULL || g->net != sock_net(sk) || g->perip_family != family)
-        return false;
-    if (family == AF_INET)
-        return g->perip_v4 == sk->sk_daddr;
-#if IS_ENABLED(CONFIG_IPV6)
-    return ipv6_addr_equal(&g->perip_v6, &sk->sk_v6_daddr);
-#else
-    return false;
-#endif
+    struct brutal_group **fallbacks = READ_ONCE(parent->fallbacks);
+    struct brutal_group *g;
+    u32 hash;
+
+    if (!fallbacks)
+        return NULL;
+    if (key->family == AF_INET)
+        hash = jhash_1word((__force u32)key->v4, (u32)parent->id);
+    else
+        hash = jhash(key->v6.s6_addr, sizeof(key->v6.s6_addr),
+                     (u32)parent->id);
+    g = fallbacks[hash & (BRUTAL_FALLBACK_PACERS - 1)];
+    refcount_inc(&g->refcnt);
+    brutal_group_put(parent);
+    brutal_net_peer_fallback(key->net);
+    return g;
 }
 
 // Takes the caller's parent reference on success or allocation failure.
 struct brutal_group *brutal_perip_group_get(struct sock *sk, struct brutal_group *parent)
 {
     struct brutal_group *g, *ng;
-    u8 family;
-    u32 hash = brutal_perip_hash(sk, &family);
+    struct brutal_peer_key key;
 
-    spin_lock_bh(&brutal_perip_groups_lock);
-    hash_for_each_possible(brutal_perip_groups, g, perip_node, hash)
+    brutal_perip_key(sk, parent, &key);
+    rcu_read_lock();
+    g = rhashtable_lookup_fast(&brutal_perip_groups, &key,
+                               brutal_perip_params);
+    if (g && !refcount_inc_not_zero(&g->refcnt))
+        g = NULL;
+    rcu_read_unlock();
+    if (g)
     {
-        if (g->parent == parent && brutal_perip_match(g, sk, family) && refcount_inc_not_zero(&g->refcnt))
-        {
-            spin_unlock_bh(&brutal_perip_groups_lock);
-            brutal_group_put(parent);
-            return g;
-        }
+        brutal_group_put(parent);
+        return g;
     }
-    spin_unlock_bh(&brutal_perip_groups_lock);
 
-    ng = brutal_group_alloc(parent->id, GFP_ATOMIC);
+    ng = brutal_peer_alloc(parent->id);
     if (!ng)
-        return NULL;
+    {
+        brutal_net_peer_alloc_failed(sock_net(sk));
+        return brutal_fallback_group_get(&key, parent);
+    }
     ng->parent = parent;
     ng->net = sock_net(sk);
-    ng->perip_family = family;
-    if (family == AF_INET)
-        ng->perip_v4 = sk->sk_daddr;
-#if IS_ENABLED(CONFIG_IPV6)
-    else
-        ng->perip_v6 = sk->sk_v6_daddr;
-#endif
+    ng->peer_key = key;
 
-    spin_lock_bh(&brutal_perip_groups_lock);
-    hash_for_each_possible(brutal_perip_groups, g, perip_node, hash)
+    g = rhashtable_lookup_get_insert_fast(&brutal_perip_groups,
+                                          &ng->perip_node,
+                                          brutal_perip_params);
+    if (IS_ERR(g))
     {
-        if (g->parent == parent && brutal_perip_match(g, sk, family) && refcount_inc_not_zero(&g->refcnt))
+        brutal_net_peer_insert_failed(sock_net(sk));
+        mempool_free(ng, brutal_peer_pool);
+        return brutal_fallback_group_get(&key, parent);
+    }
+    if (g)
+    {
+        if (refcount_inc_not_zero(&g->refcnt))
         {
-            spin_unlock_bh(&brutal_perip_groups_lock);
             brutal_group_put(parent);
-            kfree(ng);
+            mempool_free(ng, brutal_peer_pool);
             return g;
         }
+        mempool_free(ng, brutal_peer_pool);
+        return brutal_fallback_group_get(&key, parent);
     }
-    hash_add(brutal_perip_groups, &ng->perip_node, hash);
-    spin_lock(&parent->lock);
-    parent->ip_groups++;
-    spin_unlock(&parent->lock);
-    spin_unlock_bh(&brutal_perip_groups_lock);
+    atomic_inc(&parent->ip_groups);
+    brutal_net_peer_added(sock_net(sk));
     return ng;
+}
+
+static void brutal_peer_free_rcu(struct rcu_head *rcu)
+{
+    struct brutal_group *g = container_of(rcu, struct brutal_group, rcu);
+
+    brutal_group_put(g->parent);
+    mempool_free(g, brutal_peer_pool);
+}
+
+static void brutal_rule_group_free_work(struct work_struct *work)
+{
+    struct brutal_rule_stats *stats =
+        container_of(work, struct brutal_rule_stats, destroy_work);
+
+    percpu_counter_destroy(&stats->sent_bytes);
+    kfree(stats->group);
+    kfree(stats);
 }
 
 void brutal_group_put(struct brutal_group *g)
@@ -248,19 +458,19 @@ void brutal_group_put(struct brutal_group *g)
     {
         struct brutal_group *parent = g->parent;
 
-        spin_lock_bh(&brutal_perip_groups_lock);
         if (!refcount_dec_and_test(&g->refcnt))
+            return;
+        if (g->fallback)
         {
-            spin_unlock_bh(&brutal_perip_groups_lock);
+            brutal_group_put(parent);
+            kfree(g);
             return;
         }
-        hash_del(&g->perip_node);
-        spin_lock(&parent->lock);
-        parent->ip_groups--;
-        spin_unlock(&parent->lock);
-        spin_unlock_bh(&brutal_perip_groups_lock);
-        brutal_group_put(parent);
-        kfree(g);
+        rhashtable_remove_fast(&brutal_perip_groups, &g->perip_node,
+                               brutal_perip_params);
+        atomic_dec(&parent->ip_groups);
+        brutal_net_peer_removed(g->net);
+        call_rcu(&g->rcu, brutal_peer_free_rcu);
         return;
     }
     if (!refcount_dec_and_test(&g->refcnt))
@@ -268,40 +478,53 @@ void brutal_group_put(struct brutal_group *g)
     spin_lock_bh(&brutal_groups_lock);
     hash_del(&g->node); // no-op for a rule's group, which is never hashed
     spin_unlock_bh(&brutal_groups_lock);
+    if (g->rule_stats)
+    {
+        struct brutal_rule_stats *stats = g->rule_stats;
+
+        INIT_WORK(&stats->destroy_work, brutal_rule_group_free_work);
+        queue_work(brutal_free_wq, &stats->destroy_work);
+        return;
+    }
     kfree(g);
+}
+
+void brutal_group_release_fallbacks(struct brutal_group *g)
+{
+    struct brutal_group **fallbacks = xchg(&g->fallbacks, NULL);
+    int i;
+
+    if (!fallbacks)
+        return;
+    for (i = 0; i < BRUTAL_FALLBACK_PACERS; i++)
+        brutal_group_put(fallbacks[i]);
+    kfree(fallbacks);
 }
 
 // Takes over the caller's reference on g
 void brutal_group_join(struct brutal *brutal, struct brutal_group *g)
 {
     brutal->group = g;
-    spin_lock_bh(&g->lock);
-    g->members++;
-    spin_unlock_bh(&g->lock);
+    atomic_inc(&g->members);
     if (g->parent)
     {
-        spin_lock_bh(&g->parent->lock);
-        g->parent->members++;
-        spin_unlock_bh(&g->parent->lock);
+        atomic_inc(&g->parent->members);
     }
 }
 
-void brutal_group_leave(struct brutal *brutal)
+void brutal_group_leave(struct sock *sk)
 {
+    struct brutal *brutal = inet_csk_ca(sk);
     struct brutal_group *g = brutal->group;
 
     if (!g)
         return;
+    brutal_settle_reservation(sk);
     brutal->group = NULL;
-    brutal->resv_bytes = 0;
-    spin_lock_bh(&g->lock);
-    g->members--;
-    spin_unlock_bh(&g->lock);
+    atomic_dec(&g->members);
     if (g->parent)
     {
-        spin_lock_bh(&g->parent->lock);
-        g->parent->members--;
-        spin_unlock_bh(&g->parent->lock);
+        atomic_dec(&g->parent->members);
     }
     brutal_group_put(g);
 }
@@ -338,7 +561,7 @@ static int brutal_set_params(struct sock *sk, sockptr_t optval, unsigned int opt
         return -EPERM; // governed by a locked destination rule
     }
     if (!params.group_id)
-        brutal_group_leave(brutal);
+        brutal_group_leave(sk);
     else if (!brutal->group || brutal->group->id != params.group_id)
     {
         struct brutal_group *g = brutal_group_get(sk, params.group_id);
@@ -347,13 +570,13 @@ static int brutal_set_params(struct sock *sk, sockptr_t optval, unsigned int opt
             release_sock(sk);
             return -ENOMEM;
         }
-        brutal_group_leave(brutal);
+        brutal_group_leave(sk);
         brutal_group_join(brutal, g);
     }
     if (brutal->group)
     {
-        WRITE_ONCE(brutal_group_parent(brutal->group)->rate, params.rate);
-        WRITE_ONCE(brutal_group_parent(brutal->group)->cwnd_gain, params.cwnd_gain);
+        brutal_group_set_config(brutal->group, params.rate, params.cwnd_gain,
+                                brutal_group_locked(brutal->group));
     }
     brutal->rate = params.rate;
     brutal->cwnd_gain = params.cwnd_gain;
@@ -386,8 +609,8 @@ static int brutal_get_params(struct sock *sk, char __user *optval, int __user *o
     }
     if (brutal->group)
     {
-        params.rate = brutal_group_rate(brutal->group);
-        params.cwnd_gain = brutal_group_cwnd_gain(brutal->group);
+        brutal_group_get_config(brutal->group, &params.rate,
+                                &params.cwnd_gain, NULL, NULL);
         params.group_id = brutal->group->id;
     }
     else
@@ -457,8 +680,38 @@ static int brutal_tcpv6_getsockopt(struct sock *sk, int level, int optname, char
 #endif // _TRANSP_V6_H
 
 // Prepare the proto tables that route our sockopts to us
-void __init brutal_sockopt_init(void)
+int __init brutal_sockopt_init(void)
 {
+    int ret;
+
+    brutal_free_wq = alloc_workqueue("tcp_brutal_free",
+                                     WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    if (!brutal_free_wq)
+        return -ENOMEM;
+    brutal_peer_cache = kmem_cache_create("tcp_brutal_peer",
+                                          sizeof(struct brutal_group), 0,
+                                          SLAB_HWCACHE_ALIGN, NULL);
+    if (!brutal_peer_cache)
+    {
+        destroy_workqueue(brutal_free_wq);
+        return -ENOMEM;
+    }
+    brutal_peer_pool = mempool_create_slab_pool(32, brutal_peer_cache);
+    if (!brutal_peer_pool)
+    {
+        kmem_cache_destroy(brutal_peer_cache);
+        destroy_workqueue(brutal_free_wq);
+        return -ENOMEM;
+    }
+    ret = rhashtable_init(&brutal_perip_groups, &brutal_perip_params);
+
+    if (ret)
+    {
+        mempool_destroy(brutal_peer_pool);
+        kmem_cache_destroy(brutal_peer_cache);
+        destroy_workqueue(brutal_free_wq);
+        return ret;
+    }
     tcp_prot_override = tcp_prot;
     tcp_prot_override.setsockopt = brutal_tcp_setsockopt;
     tcp_prot_override.getsockopt = brutal_tcp_getsockopt;
@@ -468,6 +721,17 @@ void __init brutal_sockopt_init(void)
     tcpv6_prot_override.setsockopt = brutal_tcpv6_setsockopt;
     tcpv6_prot_override.getsockopt = brutal_tcpv6_getsockopt;
 #endif // _TRANSP_V6_H
+    return 0;
+}
+
+void brutal_sockopt_exit(void)
+{
+    rcu_barrier();
+    flush_workqueue(brutal_free_wq);
+    rhashtable_destroy(&brutal_perip_groups);
+    mempool_destroy(brutal_peer_pool);
+    kmem_cache_destroy(brutal_peer_cache);
+    destroy_workqueue(brutal_free_wq);
 }
 
 void brutal_sockopt_install(struct sock *sk)

@@ -7,31 +7,28 @@
 #define MIN_ACK_RATE_PERCENT 80
 
 // An unused reserved slot is returned to the group this long after its time
-#define RESV_STALE_NS (20 * NSEC_PER_MSEC)
+#define RESV_STALE_MIN_NS (2 * NSEC_PER_MSEC)
+#define RESV_STALE_MAX_NS (20 * NSEC_PER_MSEC)
 // Max lag of the group clock behind real time (token bucket depth)
 #define GROUP_MAX_LAG_NS (2 * NSEC_PER_MSEC)
+#define RATE_UPDATE_INTERVAL_US 10000
+#define RATE_UPDATE_TICK_US 100
+#define RATE_UPDATE_INTERVAL_TICKS (RATE_UPDATE_INTERVAL_US / RATE_UPDATE_TICK_US)
 
-// Configured rate compensated for this socket's loss
-static u64 brutal_effective_rate(const struct brutal *brutal)
-{
-    u64 rate = brutal->group ? brutal_group_rate(brutal->group) : brutal->rate;
-
-    return div_u64(rate * 100, brutal->ack_rate);
-}
-
-void brutal_update_rate(struct sock *sk)
+static void brutal_update_rate_at(struct sock *sk, u32 sec, u16 now_tick)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct brutal *brutal = inet_csk_ca(sk);
 
-    u32 sec = div_u64(tp->tcp_mstamp, USEC_PER_SEC);
     u32 min_sec = sec - PKT_INFO_SLOTS;
-    u32 acked = 0, losses = 0;
+    u64 acked = 0, losses = 0;
     u32 ack_rate; // Scaled by 100 (100=1.00) as kernel doesn't support float
     u64 rate, bdp, cwnd;
     u32 cwnd_gain;
+    u16 generation = 0;
+    int i;
 
-    for (int i = 0; i < PKT_INFO_SLOTS; i++)
+    for (i = 0; i < PKT_INFO_SLOTS; i++)
     {
         if (brutal->slots[i].sec >= min_sec)
         {
@@ -43,14 +40,24 @@ void brutal_update_rate(struct sock *sk)
         ack_rate = 100;
     else
     {
-        ack_rate = acked * 100 / (acked + losses);
+        ack_rate = div64_u64(acked * 100, acked + losses);
         if (ack_rate < MIN_ACK_RATE_PERCENT)
             ack_rate = MIN_ACK_RATE_PERCENT;
     }
     brutal->ack_rate = ack_rate;
 
-    rate = brutal_effective_rate(brutal);
-    cwnd_gain = brutal->group ? brutal_group_cwnd_gain(brutal->group) : brutal->cwnd_gain;
+    if (brutal->group)
+        brutal_group_get_config(brutal->group, &rate, &cwnd_gain, NULL,
+                                &generation);
+    else
+    {
+        rate = brutal->rate;
+        cwnd_gain = brutal->cwnd_gain;
+    }
+    rate = div_u64(rate * 100, brutal->ack_rate);
+    brutal->effective_rate = rate;
+    brutal->last_update_tick = now_tick;
+    brutal->seen_generation = generation;
 
     // Packets in flight over one RTT at this rate, times the gain. Done in u64
     // with a microsecond RTT (floored at 1 ms) so short RTTs keep precision
@@ -60,9 +67,33 @@ void brutal_update_rate(struct sock *sk)
     // In a group, cwnd and sk_pacing_rate are sized for the full group rate so
     // that a member can take all of it at any moment; the group clock decides
     // the actual share.
-    tp->snd_cwnd = clamp_t(u64, cwnd, MIN_CWND, min_t(u32, tp->snd_cwnd_clamp, INT_MAX));
+    cwnd = clamp_t(u64, cwnd, MIN_CWND, min_t(u32, tp->snd_cwnd_clamp, INT_MAX));
+    if (tp->snd_cwnd != cwnd)
+        tp->snd_cwnd = cwnd;
 
-    WRITE_ONCE(sk->sk_pacing_rate, min_t(u64, rate, READ_ONCE(sk->sk_max_pacing_rate)));
+    rate = min_t(u64, rate, READ_ONCE(sk->sk_max_pacing_rate));
+    if (READ_ONCE(sk->sk_pacing_rate) != rate)
+        WRITE_ONCE(sk->sk_pacing_rate, rate);
+}
+
+void brutal_update_rate(struct sock *sk)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+
+    brutal_update_rate_at(sk, div_u64(tp->tcp_mstamp, USEC_PER_SEC),
+                          (u16)div_u64(tp->tcp_mstamp, RATE_UPDATE_TICK_US));
+}
+
+static void brutal_maybe_update_rate(struct sock *sk)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct brutal *brutal = inet_csk_ca(sk);
+    u16 now = (u16)div_u64(tp->tcp_mstamp, RATE_UPDATE_TICK_US);
+    u16 generation = brutal->group ? brutal_group_generation(brutal->group) : 0;
+
+    if (generation != brutal->seen_generation ||
+        (u16)(now - brutal->last_update_tick) >= RATE_UPDATE_INTERVAL_TICKS)
+        brutal_update_rate_at(sk, div_u64(tp->tcp_mstamp, USEC_PER_SEC), now);
 }
 
 // Bytes tcp_write_xmit is about to send in one go (mirrors tcp_tso_autosize)
@@ -93,41 +124,36 @@ static u32 brutal_min_tso_segs(struct sock *sk)
     struct brutal *brutal = inet_csk_ca(sk);
     struct brutal_group *g = brutal->group;
     u64 now = tp->tcp_clock_cache;
-    u64 rate, start;
-    u32 unsent, burst;
+    u64 rate, start = 0, sent = 0;
+    s64 correction_ns = 0;
+    u32 unsent, burst = 0, duration_ns = 0;
+    bool settle = false;
 
     if (!g)
         return 2;
 
-    rate = brutal_effective_rate(brutal);
+    brutal_maybe_update_rate(sk);
+    rate = brutal->effective_rate;
 
     // Settle the previous reservation against what was actually sent
     if (brutal->resv_bytes)
     {
-        u64 sent = tp->bytes_sent - brutal->resv_bytes_sent;
-        s64 delta;
+        u64 used_ns;
+        u32 stale_ns = clamp_t(u32, brutal->resv_duration_ns / 2,
+                               RESV_STALE_MIN_NS, RESV_STALE_MAX_NS);
 
-        if (!sent && (s64)(now - brutal->resv_start_ns) < (s64)RESV_STALE_NS)
+        sent = tp->bytes_sent - brutal->resv_bytes_sent;
+        if (!sent && (s64)(now - brutal->resv_start_ns) < (s64)stale_ns)
         {
             // Pacing timer wake-up (or a blocked send): the slot is still ours
             if (tp->tcp_wstamp_ns < brutal->resv_start_ns)
                 tp->tcp_wstamp_ns = brutal->resv_start_ns;
             return 2;
         }
-        delta = (s64)sent - (s64)brutal->resv_bytes; // < 0: give time back
-        spin_lock_bh(&g->lock);
-        if (delta >= 0)
-            g->next_ns += div64_u64((u64)delta * NSEC_PER_SEC, rate);
-        else
-            g->next_ns -= div64_u64((u64)(-delta) * NSEC_PER_SEC, rate);
-        g->sent_bytes += sent;
-        spin_unlock_bh(&g->lock);
-        if (g->parent)
-        {
-            spin_lock_bh(&g->parent->lock);
-            g->parent->sent_bytes += sent;
-            spin_unlock_bh(&g->parent->lock);
-        }
+        used_ns = div64_u64((u64)brutal->resv_duration_ns * sent,
+                            brutal->resv_bytes);
+        correction_ns = (s64)used_ns - (s64)brutal->resv_duration_ns;
+        settle = true;
         brutal->resv_bytes = 0;
     }
 
@@ -135,22 +161,46 @@ static u32 brutal_min_tso_segs(struct sock *sk)
     unsent = tp->write_seq - tp->snd_nxt;
     if (!unsent)
     {
-        if (tp->lost_out <= tp->retrans_out)
-            return 2;
-        unsent = tp->mss_cache; // retransmission pending
+        if (tp->lost_out > tp->retrans_out)
+            unsent = tp->mss_cache; // retransmission pending
     }
-    if (tcp_packets_in_flight(tp) >= tp->snd_cwnd || !after(tcp_wnd_end(tp), tp->snd_nxt))
+    if (unsent && tcp_packets_in_flight(tp) < tp->snd_cwnd &&
+        after(tcp_wnd_end(tp), tp->snd_nxt))
+    {
+        burst = brutal_burst_estimate(sk, rate, unsent);
+        duration_ns = div64_u64((u64)burst * NSEC_PER_SEC, rate);
+    }
+
+    if (settle || burst)
+    {
+        spin_lock_bh(&g->lock);
+        if (correction_ns >= 0)
+            g->next_ns += correction_ns;
+        else
+            g->next_ns -= min_t(u64, g->next_ns, -correction_ns);
+        if (burst)
+        {
+            start = max(g->next_ns, now - GROUP_MAX_LAG_NS);
+            g->next_ns = start + duration_ns;
+        }
+        spin_unlock_bh(&g->lock);
+    }
+    if (settle)
+    {
+        if (g->parent)
+        {
+            atomic64_add(sent, &g->sent_bytes);
+            brutal_group_account_sent(g->parent, sent);
+        }
+        else
+            brutal_group_account_sent(g, sent);
+    }
+    if (!burst)
         return 2;
-
-    burst = brutal_burst_estimate(sk, rate, unsent);
-
-    spin_lock_bh(&g->lock);
-    start = max(g->next_ns, now - GROUP_MAX_LAG_NS);
-    g->next_ns = start + div64_u64((u64)burst * NSEC_PER_SEC, rate);
-    spin_unlock_bh(&g->lock);
 
     brutal->resv_start_ns = start;
     brutal->resv_bytes = burst;
+    brutal->resv_duration_ns = duration_ns;
     brutal->resv_bytes_sent = tp->bytes_sent;
     if (tp->tcp_wstamp_ns < start)
         tp->tcp_wstamp_ns = start;
@@ -179,9 +229,37 @@ static void brutal_init(struct sock *sk)
     cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
 
+void brutal_settle_reservation(struct sock *sk)
+{
+    struct brutal *brutal = inet_csk_ca(sk);
+    struct brutal_group *g = brutal->group;
+
+    if (g && brutal->resv_bytes)
+    {
+        u64 sent = tcp_sk(sk)->bytes_sent - brutal->resv_bytes_sent;
+        u64 used_ns = div64_u64((u64)brutal->resv_duration_ns * sent,
+                                brutal->resv_bytes);
+        s64 correction_ns = (s64)used_ns - (s64)brutal->resv_duration_ns;
+
+        spin_lock_bh(&g->lock);
+        if (correction_ns >= 0)
+            g->next_ns += correction_ns;
+        else
+            g->next_ns -= min_t(u64, g->next_ns, -correction_ns);
+        spin_unlock_bh(&g->lock);
+        if (g->parent)
+            atomic64_add(sent, &g->sent_bytes);
+        if (g->parent)
+            brutal_group_account_sent(g->parent, sent);
+        else
+            brutal_group_account_sent(g, sent);
+        brutal->resv_bytes = 0;
+    }
+}
+
 static void brutal_release(struct sock *sk)
 {
-    brutal_group_leave(inet_csk_ca(sk));
+    brutal_group_leave(sk);
     brutal_sockopt_uninstall(sk);
 }
 
@@ -217,7 +295,13 @@ static void brutal_main(struct sock *sk, const struct rate_sample *rs)
         brutal->slots[slot].losses = rs->losses;
     }
 
-    brutal_update_rate(sk);
+    if ((u16)((u16)div_u64(tp->tcp_mstamp, RATE_UPDATE_TICK_US) -
+              brutal->last_update_tick) >= RATE_UPDATE_INTERVAL_TICKS ||
+        (brutal->group && brutal_group_generation(brutal->group) !=
+                              brutal->seen_generation))
+        brutal_update_rate_at(sk, sec,
+                              (u16)div_u64(tp->tcp_mstamp,
+                                           RATE_UPDATE_TICK_US));
 }
 
 static u32 brutal_undo_cwnd(struct sock *sk)
@@ -249,13 +333,21 @@ static int __init brutal_register(void)
     BUILD_BUG_ON(sizeof(struct brutal) > ICSK_CA_PRIV_SIZE);
     BUILD_BUG_ON(sizeof(struct brutal_params) != 20);
 
-    brutal_sockopt_init();
-    ret = brutal_rules_init();
+    ret = brutal_sockopt_init();
     if (ret)
         return ret;
+    ret = brutal_rules_init();
+    if (ret)
+    {
+        brutal_sockopt_exit();
+        return ret;
+    }
     ret = tcp_register_congestion_control(&tcp_brutal_ops);
     if (ret)
+    {
         brutal_rules_exit();
+        brutal_sockopt_exit();
+    }
     return ret;
 }
 
@@ -263,6 +355,7 @@ static void __exit brutal_unregister(void)
 {
     tcp_unregister_congestion_control(&tcp_brutal_ops);
     brutal_rules_exit();
+    brutal_sockopt_exit();
 }
 
 module_init(brutal_register);
