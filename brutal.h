@@ -149,8 +149,7 @@ u64 brutal_pacer_id(struct brutal_pacer *p);
 void brutal_group_join(struct brutal *brutal, struct brutal_pacer *p);
 void brutal_group_leave(struct sock *sk);
 void brutal_settle_reservation(struct sock *sk);
-struct brutal_pacer *brutal_perip_group_get(struct sock *sk,
-                                             struct brutal_group *parent);
+struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group *parent);
 u64 brutal_group_rate(struct brutal_pacer *p);
 u32 brutal_group_cwnd_gain(struct brutal_pacer *p);
 u16 brutal_group_generation(struct brutal_pacer *p);

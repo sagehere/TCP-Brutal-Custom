@@ -296,6 +296,7 @@ int brutal_group_dump_peers(struct seq_file *m, struct brutal_group *parent)
     return 0;
 }
 
+// Application group keyed by id, uid and netns; created if missing.
 static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
 {
     struct brutal_group *g, *ng = brutal_group_alloc(id, GFP_KERNEL);
@@ -358,8 +359,7 @@ static struct brutal_pacer *brutal_fallback_group_get(
     return p;
 }
 
-struct brutal_pacer *brutal_perip_group_get(struct sock *sk,
-                                             struct brutal_group *parent)
+struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group *parent)
 {
     struct brutal_rule_stats *stats = brutal_group_rule_stats(parent);
     struct brutal_peer *peer, *new_peer;
