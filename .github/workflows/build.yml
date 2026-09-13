@@ -61,4 +61,5 @@ jobs:
       - name: Build CLI and run user-space tests
         run: |
           make -C tools
+          cc -O2 -Wall -Wextra -Werror -o /tmp/app-group-netns tests/app-group-netns.c
           bash tests/install-manager-test.sh
