@@ -552,7 +552,7 @@ show_peers() {
     pending_reboot_message >&2
     return 1
   fi
-  "$BRUTALCTL" peers
+  "$BRUTALCTL" peers --limit 1000
 }
 
 view() {

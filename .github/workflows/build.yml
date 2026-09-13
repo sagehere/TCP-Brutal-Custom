@@ -1,0 +1,64 @@
+name: Build and test
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  kernel-module:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel: 5.10.269
+            arch: x86
+            compiler: gcc
+          - kernel: 6.1.187
+            arch: x86
+            compiler: clang
+          - kernel: 6.6.156
+            arch: arm64
+            compiler: gcc
+          - kernel: 6.12.109
+            arch: arm64
+            compiler: clang
+          - kernel: 7.2.4
+            arch: x86
+            compiler: gcc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison clang flex gcc-aarch64-linux-gnu \
+            libelf-dev libssl-dev make xz-utils
+      - name: Prepare Linux ${{ matrix.kernel }}
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel }}
+          KERNEL_ARCH: ${{ matrix.arch }}
+          KERNEL_COMPILER: ${{ matrix.compiler }}
+        run: |
+          major=${KERNEL_VERSION%%.*}
+          curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KERNEL_VERSION}.tar.xz"
+          tar -xf "linux-${KERNEL_VERSION}.tar.xz"
+          args=(ARCH="$KERNEL_ARCH")
+          if [[ $KERNEL_COMPILER == clang ]]; then
+            args+=(LLVM=1)
+          elif [[ $KERNEL_ARCH == arm64 ]]; then
+            args+=(CROSS_COMPILE=aarch64-linux-gnu-)
+          fi
+          make -C "linux-${KERNEL_VERSION}" "${args[@]}" defconfig
+          make -C "linux-${KERNEL_VERSION}" "${args[@]}" modules_prepare
+          make KERNEL_DIR="$PWD/linux-${KERNEL_VERSION}" "${args[@]}" \
+            KBUILD_MODPOST_WARN=1
+
+  userspace:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CLI and run user-space tests
+        run: |
+          make -C tools
+          bash tests/install-manager-test.sh

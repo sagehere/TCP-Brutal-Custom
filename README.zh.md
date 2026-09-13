@@ -81,9 +81,15 @@ brutalctl add ::/0 80 noroute perip
 
 ```bash
 brutalctl peers
+brutalctl peers --family 4 --limit 1000
 sudo brutal-manager view
 sudo brutal-manager view --watch  # 每两秒刷新，Ctrl+C 退出
 ```
+
+`brutalctl peers` 还支持 `--rule ID` 和 `--ip ADDRESS`。管理器默认显示前
+1000 条并在截断时提示；不指定 `--limit` 可完整导出。规则、peer 和统计均按
+network namespace 隔离，因此容器需要在自己的 namespace 中配置规则。分配
+失败、fallback、当前及峰值 peer 数见 `/proc/net/tcp_brutal/stats`。
 
 所有连接关闭后，对应 IP 行立即消失；这里不保存历史统计。
 

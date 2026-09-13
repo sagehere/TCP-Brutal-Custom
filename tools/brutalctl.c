@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +34,7 @@
 static int usage(void)
 {
     fputs("usage: brutalctl list\n"
-          "       brutalctl peers\n"
+          "       brutalctl peers [--rule ID] [--ip ADDRESS] [--family 4|6] [--limit N]\n"
           "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute] [perip]\n"
           "       brutalctl del <prefix>[/<len>]\n"
           "       brutalctl flush\n"
@@ -323,13 +324,45 @@ static int parse_u64(const char *line, const char *key, unsigned long long *valu
     return errno || *end ? -1 : 0;
 }
 
-static int list_peers(void)
+static int list_peers(int argc, char **argv)
 {
     char line[512], ip[64], family[8];
     unsigned long long rule, rate, gain, members, sent;
-    unsigned int rows = 0, line_number = 0;
+    unsigned long long rule_filter = 0;
+    unsigned int rows = 0, line_number = 0, limit = 0;
+    int truncated = 0;
+    const char *ip_filter = NULL, *family_filter = NULL;
     FILE *f;
-    int fd = open_proc(PEERS_PATH, O_RDONLY);
+    int fd, i;
+
+    for (i = 2; i < argc; i += 2)
+    {
+        char *end;
+        unsigned long long value;
+
+        if (i + 1 == argc)
+            return usage();
+        if (!strcmp(argv[i], "--ip"))
+            ip_filter = argv[i + 1];
+        else if (!strcmp(argv[i], "--family") &&
+                 (!strcmp(argv[i + 1], "4") || !strcmp(argv[i + 1], "6")))
+            family_filter = argv[i + 1];
+        else if (!strcmp(argv[i], "--rule") || !strcmp(argv[i], "--limit"))
+        {
+            errno = 0;
+            value = strtoull(argv[i + 1], &end, 10);
+            if (errno || *end || (!strcmp(argv[i], "--limit") && value > UINT_MAX))
+                return usage();
+            if (!strcmp(argv[i], "--rule"))
+                rule_filter = value;
+            else
+                limit = (unsigned int)value;
+        }
+        else
+            return usage();
+    }
+
+    fd = open_proc(PEERS_PATH, O_RDONLY);
 
     if (fd < 0)
         return 1;
@@ -358,6 +391,15 @@ static int list_peers(void)
             fprintf(stderr, "brutalctl: invalid peers data on line %u\n", line_number);
             return 1;
         }
+        if ((ip_filter && strcmp(ip_filter, ip)) ||
+            (family_filter && strcmp(family_filter, family)) ||
+            (rule_filter && rule_filter != rule))
+            continue;
+        if (limit && rows == limit)
+        {
+            truncated = 1;
+            break;
+        }
         printf("%-39s %6s %8llu %11.2f %5llu %11llu %10.1f\n",
                ip, !strcmp(family, "4") ? "IPv4" : "IPv6", rule,
                rate * 8 / 1e6, gain, members, sent / 1e6);
@@ -370,6 +412,8 @@ static int list_peers(void)
         return 1;
     }
     fclose(f);
+    if (truncated)
+        fprintf(stderr, "brutalctl: output limited to %u peers\n", limit);
     if (!rows)
         puts("当前无活跃 perip 连接");
     return 0;
@@ -436,7 +480,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "list") || !strcmp(argv[1], "ls"))
         return argc == 2 ? list_rules() : usage();
     if (!strcmp(argv[1], "peers"))
-        return argc == 2 ? list_peers() : usage();
+        return list_peers(argc, argv);
     if (!strcmp(argv[1], "add"))
         return add_rule(argc, argv);
     if (!strcmp(argv[1], "del") && argc == 3)

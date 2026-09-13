@@ -39,7 +39,7 @@ source "$repo/install.sh"
   BRUTALCTL="$tmp/fixed-brutalctl"
   PEERS_PROC="$tmp/peers"
   PENDING_REBOOT="$tmp/no-pending-reboot"
-  [[ $(view) == peers ]]
+  [[ $(view) == 'peers --limit 1000' ]]
   mkdir -p "$tmp/view-state"
   printf '%s\n' 2.1.0.custom.2222222 >"$tmp/view-state/reboot-required"
   PENDING_REBOOT="$tmp/view-state/reboot-required"
@@ -351,6 +351,11 @@ if command -v cc >/dev/null; then
   peers_output=$("$tmp/brutalctl-test" peers)
   grep -q '198.51.100.7.*IPv4.*80.00.*3.*1.2' <<<"$peers_output"
   grep -q '2001:db8::7.*IPv6.*20.00.*1.*0.5' <<<"$peers_output"
+  [[ $("$tmp/brutalctl-test" peers --family 4 | grep -c '198.51.100.7') == 1 ]]
+  ! ("$tmp/brutalctl-test" peers --family 4 | grep -q '2001:db8::7')
+  [[ $("$tmp/brutalctl-test" peers --rule 2 --limit 1 | grep -c '2001:db8::7') == 1 ]]
+  [[ $("$tmp/brutalctl-test" peers --ip 198.51.100.7 | grep -c '198.51.100.7') == 1 ]]
+  ! "$tmp/brutalctl-test" peers --family 5 >/dev/null 2>&1
 
   : >"$peers_file"
   grep -q '当前无活跃 perip 连接' <<<"$("$tmp/brutalctl-test" peers)"
@@ -366,7 +371,7 @@ if command -v cc >/dev/null; then
 fi
 
 if command -v script >/dev/null && command -v timeout >/dev/null; then
-  output=$(printf '0\n' | timeout 5 script -qfec "cat '$repo/install.sh' | bash" /dev/null)
+  output=$(printf '0\n' | BRUTAL_MANAGER_LIB=0 timeout 5 script -qfec "cat '$repo/install.sh' | bash" /dev/null)
   grep -q 'TCP Brutal Custom 管理器' <<<"$output"
 fi
 echo 'install-manager tests passed'

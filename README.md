@@ -54,6 +54,7 @@ sudo brutalctl add ::/0 80 noroute perip
 ```bash
 brutalctl list
 brutalctl peers
+brutalctl peers --family 4 --limit 1000
 sudo brutal-manager view
 sudo brutal-manager view --watch
 ```
@@ -75,7 +76,12 @@ brutalctl flush
 - `perip` 必须使用默认锁定规则，不能与 `nolock` 一起使用。
 - 修改同一模式规则的速率会立即影响已有连接。普通共享规则与 `perip` 规则之间切换时，先删除再重新添加规则。
 - 规则只匹配新建连接；删除规则后，旧连接会继续使用原速率直到关闭。
+- 规则和统计按 network namespace 隔离；需要在对应容器或 namespace 内配置规则。
 - 规则重启后失效，应通过 systemd 或启动脚本恢复。
+
+`brutalctl peers` 支持 `--rule ID`、`--ip ADDRESS`、`--family 4|6` 和
+`--limit N`。`/proc/net/tcp_brutal/stats` 提供 peer 分配失败、fallback、
+当前及峰值 peer 组数。
 
 ## 边界与建议
 
