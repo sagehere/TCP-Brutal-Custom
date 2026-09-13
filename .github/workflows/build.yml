@@ -32,7 +32,7 @@ jobs:
       - name: Install kernel build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison clang flex gcc-aarch64-linux-gnu lld \
+          sudo apt-get install -y bc bison clang flex gcc-aarch64-linux-gnu lld llvm \
             libelf-dev libssl-dev make xz-utils
       - name: Prepare Linux ${{ matrix.kernel }}
         env:
