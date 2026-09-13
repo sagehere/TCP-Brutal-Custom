@@ -15,6 +15,11 @@ struct proc_ops;
 #error "TCP Brutal requires Linux 5.10 or later"
 #endif
 
+/* procfs private-data helper was renamed in Linux 5.17. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+#define pde_data(inode) PDE_DATA(inode)
+#endif
+
 #define BRUTAL_VERSION_MAJOR 2
 #define BRUTAL_VERSION_MINOR 2
 #define BRUTAL_VERSION_PATCH 0
