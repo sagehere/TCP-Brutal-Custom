@@ -53,13 +53,13 @@ static void brutal_pacer_init(struct brutal_pacer *p, u8 type,
 static void brutal_group_init(struct brutal_group *g, u64 id)
 {
     brutal_pacer_init(&g->pacer, BRUTAL_PACER_GROUP, NULL);
-    spin_lock_init(&g->config_lock);
-    seqcount_init(&g->config_seq);
+    spin_lock_init(&g->cfg.lock);
+    seqcount_init(&g->cfg.seq);
+    atomic_set(&g->cfg.generation, 0);
     atomic_set(&g->ip_groups, 0);
-    atomic_set(&g->generation, 0);
     g->id = id;
-    g->rate = INIT_PACING_RATE;
-    g->cwnd_gain = INIT_CWND_GAIN;
+    g->cfg.rate = INIT_PACING_RATE;
+    g->cfg.cwnd_gain = INIT_CWND_GAIN;
 }
 
 struct brutal_group *brutal_group_alloc(u64 id, gfp_t gfp)
@@ -201,27 +201,27 @@ u64 brutal_group_sent(struct brutal_group *g)
 
 u16 brutal_group_generation(struct brutal_pacer *p)
 {
-    return (u16)atomic_read(&brutal_pacer_config_group(p)->generation);
+    return (u16)atomic_read(&brutal_pacer_config_group(p)->cfg.generation);
 }
 
 void brutal_group_get_config(struct brutal_pacer *p, u64 *rate, u32 *gain,
                              bool *locked, u16 *generation)
 {
-    struct brutal_group *g = brutal_pacer_config_group(p);
+    struct brutal_rate_cfg *cfg = &brutal_pacer_config_group(p)->cfg;
     unsigned int seq;
     u16 gen;
 
     do
     {
-        seq = read_seqcount_begin(&g->config_seq);
+        seq = read_seqcount_begin(&cfg->seq);
         if (rate)
-            *rate = READ_ONCE(g->rate);
+            *rate = READ_ONCE(cfg->rate);
         if (gain)
-            *gain = READ_ONCE(g->cwnd_gain);
+            *gain = READ_ONCE(cfg->cwnd_gain);
         if (locked)
-            *locked = READ_ONCE(g->locked);
-        gen = (u16)atomic_read(&g->generation);
-    } while (read_seqcount_retry(&g->config_seq, seq));
+            *locked = READ_ONCE(cfg->locked);
+        gen = (u16)atomic_read(&cfg->generation);
+    } while (read_seqcount_retry(&cfg->seq, seq));
 
     if (generation)
         *generation = gen;
@@ -230,16 +230,16 @@ void brutal_group_get_config(struct brutal_pacer *p, u64 *rate, u32 *gain,
 void brutal_group_set_config(struct brutal_pacer *p, u64 rate, u32 gain,
                              bool locked)
 {
-    struct brutal_group *g = brutal_pacer_config_group(p);
+    struct brutal_rate_cfg *cfg = &brutal_pacer_config_group(p)->cfg;
 
-    spin_lock_bh(&g->config_lock);
-    write_seqcount_begin(&g->config_seq);
-    WRITE_ONCE(g->rate, rate);
-    WRITE_ONCE(g->cwnd_gain, gain);
-    WRITE_ONCE(g->locked, locked);
-    atomic_inc(&g->generation);
-    write_seqcount_end(&g->config_seq);
-    spin_unlock_bh(&g->config_lock);
+    spin_lock_bh(&cfg->lock);
+    write_seqcount_begin(&cfg->seq);
+    WRITE_ONCE(cfg->rate, rate);
+    WRITE_ONCE(cfg->cwnd_gain, gain);
+    WRITE_ONCE(cfg->locked, locked);
+    atomic_inc(&cfg->generation);
+    write_seqcount_end(&cfg->seq);
+    spin_unlock_bh(&cfg->lock);
 }
 
 bool brutal_group_locked(struct brutal_pacer *p)

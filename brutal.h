@@ -74,6 +74,16 @@ enum brutal_pacer_type
     BRUTAL_PACER_FALLBACK,
 };
 
+struct brutal_rate_cfg
+{
+    spinlock_t lock;
+    seqcount_t seq;
+    u64 rate;
+    u32 cwnd_gain;
+    atomic_t generation;
+    u8 locked;
+};
+
 /* Hot shared state used by the transmit path. */
 struct brutal_pacer
 {
@@ -86,19 +96,13 @@ struct brutal_pacer
     u8 type;
 };
 
-/* Root object for application groups and destination-rule groups. */
+/* Lifetime/configuration owner for application and destination-rule groups. */
 struct brutal_group
 {
     struct brutal_pacer pacer;
+    struct brutal_rate_cfg cfg;
     u64 id;
     struct net *net; // non-NULL only for application groups
-
-    spinlock_t config_lock;
-    seqcount_t config_seq;
-    u64 rate;
-    u32 cwnd_gain;
-    atomic_t generation;
-    u8 locked;
 
     void *rule_stats;
     struct brutal_pacer **fallbacks;
