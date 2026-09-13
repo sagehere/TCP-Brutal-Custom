@@ -20,8 +20,8 @@
 
 struct brutal_rule
 {
-    struct list_head list;        // all rules, for control-plane enumeration
-    struct list_head prefix_node; // only non-default, non-exact CIDRs
+    struct list_head list;
+    struct list_head prefix_node;
     struct list_head free_list;
     struct hlist_node exact_node;
     u8 family;
@@ -130,8 +130,6 @@ static struct brutal_rule *brutal_exact_lookup(struct brutal_net *bn,
     return NULL;
 }
 
-// Join the group of the longest matching rule, if any.
-// Exact host rules and default rules never enter the prefix scan.
 void brutal_apply_rule(struct sock *sk, struct brutal *brutal)
 {
     struct brutal_net *bn = brutal_pernet(sock_net(sk));
@@ -157,22 +155,22 @@ void brutal_apply_rule(struct sock *sk, struct brutal *brutal)
 found:
     if (best)
     {
-        refcount_inc(&best->group->refcnt);
+        brutal_pacer_get(&best->group->pacer);
         if (best->perip)
         {
-            struct brutal_group *g = brutal_perip_group_get(sk, best->group);
+            struct brutal_pacer *p = brutal_perip_group_get(sk, best->group);
 
-            if (g)
-                brutal_group_join(brutal, g);
+            if (p)
+                brutal_group_join(brutal, p);
             else
             {
                 brutal_net_peer_fallback(sock_net(sk));
                 pr_warn_ratelimited("tcp_brutal: per-IP group allocation failed; using shared rule group\n");
-                brutal_group_join(brutal, best->group);
+                brutal_group_join(brutal, &best->group->pacer);
             }
         }
         else
-            brutal_group_join(brutal, best->group);
+            brutal_group_join(brutal, &best->group->pacer);
     }
     rcu_read_unlock();
 }
@@ -212,7 +210,6 @@ static int brutal_parse_prefix(char *s, struct brutal_rule *r)
     return -EINVAL;
 }
 
-// Caller holds rules_mutex.
 static struct brutal_rule *brutal_rule_find(struct brutal_net *bn,
                                             const struct brutal_rule *key)
 {
@@ -269,7 +266,6 @@ static void brutal_rule_index_del(struct brutal_net *bn, struct brutal_rule *r)
         list_del_rcu(&r->prefix_node);
 }
 
-// Rule is already unlinked; wait for sockets that may still be joining through it.
 static void brutal_rule_free(struct brutal_rule *r)
 {
     synchronize_rcu();
@@ -340,7 +336,7 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         r->perip = perip;
         INIT_LIST_HEAD(&r->prefix_node);
         INIT_LIST_HEAD(&r->free_list);
-        brutal_group_set_config(g, rate, gain, lock);
+        brutal_group_set_config(&g->pacer, rate, gain, lock);
         list_add_tail_rcu(&r->list, &bn->rules);
         brutal_rule_index_add(bn, r);
         created = true;
@@ -352,7 +348,7 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     }
     g = r->group;
     if (!created)
-        brutal_group_set_config(g, rate, gain, lock);
+        brutal_group_set_config(&g->pacer, rate, gain, lock);
     mutex_unlock(&bn->rules_mutex);
     return 0;
 }
@@ -419,14 +415,14 @@ static int brutal_rules_show(struct seq_file *m, void *v)
         u32 gain;
         bool locked;
 
-        brutal_group_get_config(g, &rate, &gain, &locked, NULL);
+        brutal_group_get_config(&g->pacer, &rate, &gain, &locked, NULL);
         if (r->family == AF_INET)
             seq_printf(m, "dst=%pI4/%u", &r->v4, r->plen);
         else
             seq_printf(m, "dst=%pI6c/%u", &r->v6, r->plen);
         seq_printf(m, " rate=%llu gain=%u lock=%u group=%s id=%llu members=%u ips=%u sent=%llu\n",
                    rate, gain, locked, r->perip ? "perip" : "shared", g->id,
-                   atomic_read(&g->members), atomic_read(&g->ip_groups),
+                   atomic_read(&g->pacer.members), atomic_read(&g->ip_groups),
                    brutal_group_sent(g));
     }
     rcu_read_unlock();

@@ -31,8 +31,8 @@ struct brutal_rule_stats
 };
 
 static const struct rhashtable_params brutal_perip_params = {
-    .head_offset = offsetof(struct brutal_group, perip_node),
-    .key_offset = offsetof(struct brutal_group, peer_key),
+    .head_offset = offsetof(struct brutal_peer, node),
+    .key_offset = offsetof(struct brutal_peer, key),
     .key_len = sizeof(struct brutal_peer_key),
     .automatic_shrinking = true,
 };
@@ -42,16 +42,24 @@ static struct proto tcp_prot_override __ro_after_init;
 static struct proto tcpv6_prot_override __ro_after_init;
 #endif
 
+static void brutal_pacer_init(struct brutal_pacer *p, u8 type,
+                              struct brutal_group *parent)
+{
+    refcount_set(&p->refcnt, 1);
+    spin_lock_init(&p->lock);
+    atomic_set(&p->members, 0);
+    atomic64_set(&p->sent_bytes, 0);
+    p->parent = parent;
+    p->type = type;
+}
+
 static void brutal_group_init(struct brutal_group *g, u64 id)
 {
-    refcount_set(&g->refcnt, 1);
-    spin_lock_init(&g->lock);
+    brutal_pacer_init(&g->pacer, BRUTAL_PACER_GROUP, NULL);
     spin_lock_init(&g->config_lock);
     seqcount_init(&g->config_seq);
-    atomic_set(&g->members, 0);
     atomic_set(&g->ip_groups, 0);
     atomic_set(&g->generation, 0);
-    atomic64_set(&g->sent_bytes, 0);
     g->id = id;
     g->rate = INIT_PACING_RATE;
     g->cwnd_gain = INIT_CWND_GAIN;
@@ -67,47 +75,57 @@ struct brutal_group *brutal_group_alloc(u64 id, gfp_t gfp)
     return g;
 }
 
-static struct brutal_group *brutal_peer_alloc(u64 id)
+static struct brutal_peer *brutal_peer_alloc(void)
 {
-    struct brutal_group *g = mempool_alloc(brutal_peer_pool, GFP_ATOMIC);
+    struct brutal_peer *peer = mempool_alloc(brutal_peer_pool, GFP_ATOMIC);
 
-    if (!g)
+    if (!peer)
         return NULL;
-    memset(g, 0, sizeof(*g));
-    brutal_group_init(g, id);
-    return g;
+    memset(peer, 0, sizeof(*peer));
+    brutal_pacer_init(&peer->pacer, BRUTAL_PACER_PEER, NULL);
+    return peer;
 }
 
-static struct brutal_group *brutal_group_parent(struct brutal_group *g)
+static struct brutal_group *brutal_pacer_config_group(struct brutal_pacer *p)
 {
-    return g->parent ? g->parent : g;
+    return p->parent ? p->parent : container_of(p, struct brutal_group, pacer);
 }
 
 static struct brutal_rule_stats *brutal_group_rule_stats(struct brutal_group *g)
 {
-    return READ_ONCE(brutal_group_parent(g)->rule_stats);
+    return READ_ONCE(g->rule_stats);
 }
 
-u64 brutal_group_rate(struct brutal_group *g)
+void brutal_pacer_get(struct brutal_pacer *p)
+{
+    refcount_inc(&p->refcnt);
+}
+
+u64 brutal_pacer_id(struct brutal_pacer *p)
+{
+    return brutal_pacer_config_group(p)->id;
+}
+
+u64 brutal_group_rate(struct brutal_pacer *p)
 {
     u64 rate;
 
-    brutal_group_get_config(g, &rate, NULL, NULL, NULL);
+    brutal_group_get_config(p, &rate, NULL, NULL, NULL);
     return rate;
 }
 
-u32 brutal_group_cwnd_gain(struct brutal_group *g)
+u32 brutal_group_cwnd_gain(struct brutal_pacer *p)
 {
     u32 gain;
 
-    brutal_group_get_config(g, NULL, &gain, NULL, NULL);
+    brutal_group_get_config(p, NULL, &gain, NULL, NULL);
     return gain;
 }
 
 int brutal_group_enable_rule_stats(struct brutal_group *g, bool perip)
 {
     struct brutal_rule_stats *stats = kzalloc(sizeof(*stats), GFP_KERNEL);
-    struct brutal_group **fallbacks = NULL;
+    struct brutal_pacer **fallbacks = NULL;
     int i;
     int ret;
 
@@ -135,15 +153,14 @@ int brutal_group_enable_rule_stats(struct brutal_group *g, bool perip)
         }
         for (i = 0; i < BRUTAL_FALLBACK_PACERS; i++)
         {
-            fallbacks[i] = brutal_group_alloc(g->id, GFP_KERNEL);
+            fallbacks[i] = kzalloc(sizeof(*fallbacks[i]), GFP_KERNEL);
             if (!fallbacks[i])
             {
                 ret = -ENOMEM;
                 goto fail;
             }
-            fallbacks[i]->parent = g;
-            fallbacks[i]->fallback = true;
-            refcount_inc(&g->refcnt);
+            brutal_pacer_init(fallbacks[i], BRUTAL_PACER_FALLBACK, g);
+            refcount_inc(&g->pacer.refcnt);
         }
     }
     stats->group = g;
@@ -157,7 +174,7 @@ fail:
         if (!fallbacks || !fallbacks[i])
             break;
         kfree(fallbacks[i]);
-        refcount_dec(&g->refcnt);
+        refcount_dec(&g->pacer.refcnt);
     }
     kfree(fallbacks);
     if (stats->peers_initialized)
@@ -174,7 +191,7 @@ void brutal_group_account_sent(struct brutal_group *g, u64 bytes)
     if (stats)
         percpu_counter_add(&stats->sent_bytes, bytes);
     else
-        atomic64_add(bytes, &g->sent_bytes);
+        atomic64_add(bytes, &g->pacer.sent_bytes);
 }
 
 u64 brutal_group_sent(struct brutal_group *g)
@@ -182,42 +199,41 @@ u64 brutal_group_sent(struct brutal_group *g)
     struct brutal_rule_stats *stats = READ_ONCE(g->rule_stats);
 
     return stats ? percpu_counter_sum_positive(&stats->sent_bytes)
-                 : atomic64_read(&g->sent_bytes);
+                 : atomic64_read(&g->pacer.sent_bytes);
 }
 
-u16 brutal_group_generation(struct brutal_group *g)
+u16 brutal_group_generation(struct brutal_pacer *p)
 {
-    struct brutal_group *parent = brutal_group_parent(g);
-
-    return (u16)atomic_read(&parent->generation);
+    return (u16)atomic_read(&brutal_pacer_config_group(p)->generation);
 }
 
-void brutal_group_get_config(struct brutal_group *g, u64 *rate, u32 *gain,
+void brutal_group_get_config(struct brutal_pacer *p, u64 *rate, u32 *gain,
                              bool *locked, u16 *generation)
 {
-    struct brutal_group *parent = brutal_group_parent(g);
+    struct brutal_group *g = brutal_pacer_config_group(p);
     unsigned int seq;
     u16 gen;
 
     do
     {
-        seq = read_seqcount_begin(&parent->config_seq);
+        seq = read_seqcount_begin(&g->config_seq);
         if (rate)
-            *rate = READ_ONCE(parent->rate);
+            *rate = READ_ONCE(g->rate);
         if (gain)
-            *gain = READ_ONCE(parent->cwnd_gain);
+            *gain = READ_ONCE(g->cwnd_gain);
         if (locked)
-            *locked = READ_ONCE(parent->locked);
-        gen = (u16)atomic_read(&parent->generation);
-    } while (read_seqcount_retry(&parent->config_seq, seq));
+            *locked = READ_ONCE(g->locked);
+        gen = (u16)atomic_read(&g->generation);
+    } while (read_seqcount_retry(&g->config_seq, seq));
 
     if (generation)
         *generation = gen;
 }
 
-void brutal_group_set_config(struct brutal_group *g, u64 rate, u32 gain, bool locked)
+void brutal_group_set_config(struct brutal_pacer *p, u64 rate, u32 gain,
+                             bool locked)
 {
-    g = brutal_group_parent(g);
+    struct brutal_group *g = brutal_pacer_config_group(p);
 
     spin_lock_bh(&g->config_lock);
     write_seqcount_begin(&g->config_seq);
@@ -229,11 +245,11 @@ void brutal_group_set_config(struct brutal_group *g, u64 rate, u32 gain, bool lo
     spin_unlock_bh(&g->config_lock);
 }
 
-bool brutal_group_locked(struct brutal_group *g)
+bool brutal_group_locked(struct brutal_pacer *p)
 {
     bool locked;
 
-    brutal_group_get_config(g, NULL, NULL, &locked, NULL);
+    brutal_group_get_config(p, NULL, NULL, &locked, NULL);
     return locked;
 }
 
@@ -241,7 +257,7 @@ int brutal_group_dump_peers(struct seq_file *m, struct brutal_group *parent)
 {
     struct brutal_rule_stats *stats = brutal_group_rule_stats(parent);
     struct rhashtable_iter iter;
-    struct brutal_group *g;
+    struct brutal_peer *peer;
 
     if (!stats || !stats->peers_initialized)
         return 0;
@@ -253,33 +269,33 @@ int brutal_group_dump_peers(struct seq_file *m, struct brutal_group *parent)
         u64 rate;
         u32 gain;
 
-        g = rhashtable_walk_next(&iter);
-        if (IS_ERR(g))
+        peer = rhashtable_walk_next(&iter);
+        if (IS_ERR(peer))
         {
-            if (PTR_ERR(g) == -EAGAIN)
+            if (PTR_ERR(peer) == -EAGAIN)
                 continue;
             break;
         }
-        if (!g)
+        if (!peer)
             break;
-        if (!atomic_read(&g->members))
+        if (!atomic_read(&peer->pacer.members))
             continue;
 
-        brutal_group_get_config(g, &rate, &gain, NULL, NULL);
-        if (g->peer_key.family == AF_INET)
-            seq_printf(m, "ip=%pI4 family=4", &g->peer_key.v4);
+        brutal_group_get_config(&peer->pacer, &rate, &gain, NULL, NULL);
+        if (peer->key.family == AF_INET)
+            seq_printf(m, "ip=%pI4 family=4", &peer->key.v4);
         else
-            seq_printf(m, "ip=%pI6c family=6", &g->peer_key.v6);
+            seq_printf(m, "ip=%pI6c family=6", &peer->key.v6);
         seq_printf(m, " rule=%llu rate=%llu gain=%u members=%u sent=%llu\n",
-                   parent->id, rate, gain, atomic_read(&g->members),
-                   atomic64_read(&g->sent_bytes));
+                   parent->id, rate, gain,
+                   atomic_read(&peer->pacer.members),
+                   atomic64_read(&peer->pacer.sent_bytes));
     }
     rhashtable_walk_stop(&iter);
     rhashtable_walk_exit(&iter);
     return 0;
 }
 
-// Application group keyed by id, uid and netns; created if missing.
 static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
 {
     struct brutal_group *g, *ng = brutal_group_alloc(id, GFP_KERNEL);
@@ -288,7 +304,7 @@ static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
     hash_for_each_possible(brutal_groups, g, node, id)
     {
         if (g->id == id && uid_eq(g->uid, sk->sk_uid) &&
-            g->net == sock_net(sk) && refcount_inc_not_zero(&g->refcnt))
+            g->net == sock_net(sk) && refcount_inc_not_zero(&g->pacer.refcnt))
         {
             spin_unlock_bh(&brutal_groups_lock);
             kfree(ng);
@@ -320,12 +336,12 @@ static void brutal_perip_key(const struct sock *sk, struct brutal_peer_key *key)
     key->v4 = sk->sk_daddr;
 }
 
-static struct brutal_group *brutal_fallback_group_get(
+static struct brutal_pacer *brutal_fallback_group_get(
     const struct brutal_peer_key *key, struct brutal_group *parent,
     struct net *net)
 {
-    struct brutal_group **fallbacks = READ_ONCE(parent->fallbacks);
-    struct brutal_group *g;
+    struct brutal_pacer **fallbacks = READ_ONCE(parent->fallbacks);
+    struct brutal_pacer *p;
     u32 hash;
 
     if (!fallbacks)
@@ -335,19 +351,18 @@ static struct brutal_group *brutal_fallback_group_get(
     else
         hash = jhash(key->v6.s6_addr, sizeof(key->v6.s6_addr),
                      (u32)parent->id);
-    g = fallbacks[hash & (BRUTAL_FALLBACK_PACERS - 1)];
-    refcount_inc(&g->refcnt);
+    p = fallbacks[hash & (BRUTAL_FALLBACK_PACERS - 1)];
+    brutal_pacer_get(p);
     brutal_group_put(parent);
     brutal_net_peer_fallback(net);
-    return g;
+    return p;
 }
 
-// Takes the caller's parent reference on success or allocation failure.
-struct brutal_group *brutal_perip_group_get(struct sock *sk,
-                                            struct brutal_group *parent)
+struct brutal_pacer *brutal_perip_group_get(struct sock *sk,
+                                             struct brutal_group *parent)
 {
     struct brutal_rule_stats *stats = brutal_group_rule_stats(parent);
-    struct brutal_group *g, *ng;
+    struct brutal_peer *peer, *new_peer;
     struct brutal_peer_key key;
     struct net *net = sock_net(sk);
 
@@ -356,56 +371,56 @@ struct brutal_group *brutal_perip_group_get(struct sock *sk,
 
     brutal_perip_key(sk, &key);
     rcu_read_lock();
-    g = rhashtable_lookup_fast(&stats->peers, &key, brutal_perip_params);
-    if (g && !refcount_inc_not_zero(&g->refcnt))
-        g = NULL;
+    peer = rhashtable_lookup_fast(&stats->peers, &key, brutal_perip_params);
+    if (peer && !refcount_inc_not_zero(&peer->pacer.refcnt))
+        peer = NULL;
     rcu_read_unlock();
-    if (g)
+    if (peer)
     {
         brutal_group_put(parent);
-        return g;
+        return &peer->pacer;
     }
 
-    ng = brutal_peer_alloc(parent->id);
-    if (!ng)
+    new_peer = brutal_peer_alloc();
+    if (!new_peer)
     {
         brutal_net_peer_alloc_failed(net);
         return brutal_fallback_group_get(&key, parent, net);
     }
-    ng->parent = parent;
-    ng->net = net;
-    ng->peer_key = key;
+    new_peer->pacer.parent = parent;
+    new_peer->net = net;
+    new_peer->key = key;
 
-    g = rhashtable_lookup_get_insert_fast(&stats->peers, &ng->perip_node,
-                                          brutal_perip_params);
-    if (IS_ERR(g))
+    peer = rhashtable_lookup_get_insert_fast(&stats->peers, &new_peer->node,
+                                             brutal_perip_params);
+    if (IS_ERR(peer))
     {
         brutal_net_peer_insert_failed(net);
-        mempool_free(ng, brutal_peer_pool);
+        mempool_free(new_peer, brutal_peer_pool);
         return brutal_fallback_group_get(&key, parent, net);
     }
-    if (g)
+    if (peer)
     {
-        if (refcount_inc_not_zero(&g->refcnt))
+        if (refcount_inc_not_zero(&peer->pacer.refcnt))
         {
             brutal_group_put(parent);
-            mempool_free(ng, brutal_peer_pool);
-            return g;
+            mempool_free(new_peer, brutal_peer_pool);
+            return &peer->pacer;
         }
-        mempool_free(ng, brutal_peer_pool);
+        mempool_free(new_peer, brutal_peer_pool);
         return brutal_fallback_group_get(&key, parent, net);
     }
     atomic_inc(&parent->ip_groups);
     brutal_net_peer_added(net);
-    return ng;
+    return &new_peer->pacer;
 }
 
 static void brutal_peer_free_rcu(struct rcu_head *rcu)
 {
-    struct brutal_group *g = container_of(rcu, struct brutal_group, rcu);
+    struct brutal_peer *peer = container_of(rcu, struct brutal_peer, rcu);
 
-    brutal_group_put(g->parent);
-    mempool_free(g, brutal_peer_pool);
+    brutal_group_put(peer->pacer.parent);
+    mempool_free(peer, brutal_peer_pool);
 }
 
 static void brutal_rule_group_free_work(struct work_struct *work)
@@ -420,80 +435,101 @@ static void brutal_rule_group_free_work(struct work_struct *work)
     kfree(stats);
 }
 
-void brutal_group_put(struct brutal_group *g)
+void brutal_pacer_put(struct brutal_pacer *p)
 {
-    if (g->parent)
+    if (!refcount_dec_and_test(&p->refcnt))
+        return;
+
+    switch (p->type)
     {
-        struct brutal_group *parent = g->parent;
+    case BRUTAL_PACER_PEER:
+    {
+        struct brutal_peer *peer = container_of(p, struct brutal_peer, pacer);
+        struct brutal_group *parent = p->parent;
         struct brutal_rule_stats *stats = brutal_group_rule_stats(parent);
 
-        if (!refcount_dec_and_test(&g->refcnt))
-            return;
-        if (g->fallback)
+        if (WARN_ON_ONCE(!stats || !stats->peers_initialized))
         {
             brutal_group_put(parent);
-            kfree(g);
+            mempool_free(peer, brutal_peer_pool);
             return;
         }
-        if (WARN_ON_ONCE(!stats || !stats->peers_initialized))
-            return;
-        rhashtable_remove_fast(&stats->peers, &g->perip_node,
+        rhashtable_remove_fast(&stats->peers, &peer->node,
                                brutal_perip_params);
         atomic_dec(&parent->ip_groups);
-        brutal_net_peer_removed(g->net);
-        call_rcu(&g->rcu, brutal_peer_free_rcu);
+        brutal_net_peer_removed(peer->net);
+        call_rcu(&peer->rcu, brutal_peer_free_rcu);
         return;
     }
-    if (!refcount_dec_and_test(&g->refcnt))
-        return;
-    spin_lock_bh(&brutal_groups_lock);
-    hash_del(&g->node); // no-op for a rule's group, which is never hashed
-    spin_unlock_bh(&brutal_groups_lock);
-    if (g->rule_stats)
+    case BRUTAL_PACER_FALLBACK:
     {
-        struct brutal_rule_stats *stats = g->rule_stats;
+        struct brutal_group *parent = p->parent;
 
-        INIT_WORK(&stats->destroy_work, brutal_rule_group_free_work);
-        queue_work(brutal_free_wq, &stats->destroy_work);
+        brutal_group_put(parent);
+        kfree(p);
         return;
     }
-    kfree(g);
+    case BRUTAL_PACER_GROUP:
+    default:
+    {
+        struct brutal_group *g = container_of(p, struct brutal_group, pacer);
+
+        spin_lock_bh(&brutal_groups_lock);
+        if (!hlist_unhashed(&g->node))
+            hash_del(&g->node);
+        spin_unlock_bh(&brutal_groups_lock);
+        if (g->rule_stats)
+        {
+            struct brutal_rule_stats *stats = g->rule_stats;
+
+            INIT_WORK(&stats->destroy_work, brutal_rule_group_free_work);
+            queue_work(brutal_free_wq, &stats->destroy_work);
+            return;
+        }
+        kfree(g);
+        return;
+    }
+    }
+}
+
+void brutal_group_put(struct brutal_group *g)
+{
+    brutal_pacer_put(&g->pacer);
 }
 
 void brutal_group_release_fallbacks(struct brutal_group *g)
 {
-    struct brutal_group **fallbacks = xchg(&g->fallbacks, NULL);
+    struct brutal_pacer **fallbacks = xchg(&g->fallbacks, NULL);
     int i;
 
     if (!fallbacks)
         return;
     for (i = 0; i < BRUTAL_FALLBACK_PACERS; i++)
-        brutal_group_put(fallbacks[i]);
+        brutal_pacer_put(fallbacks[i]);
     kfree(fallbacks);
 }
 
-// Takes over the caller's reference on g.
-void brutal_group_join(struct brutal *brutal, struct brutal_group *g)
+void brutal_group_join(struct brutal *brutal, struct brutal_pacer *p)
 {
-    brutal->group = g;
-    atomic_inc(&g->members);
-    if (g->parent)
-        atomic_inc(&g->parent->members);
+    brutal->group = p;
+    atomic_inc(&p->members);
+    if (p->parent)
+        atomic_inc(&p->parent->pacer.members);
 }
 
 void brutal_group_leave(struct sock *sk)
 {
     struct brutal *brutal = inet_csk_ca(sk);
-    struct brutal_group *g = brutal->group;
+    struct brutal_pacer *p = brutal->group;
 
-    if (!g)
+    if (!p)
         return;
     brutal_settle_reservation(sk);
     brutal->group = NULL;
-    atomic_dec(&g->members);
-    if (g->parent)
-        atomic_dec(&g->parent->members);
-    brutal_group_put(g);
+    atomic_dec(&p->members);
+    if (p->parent)
+        atomic_dec(&p->parent->pacer.members);
+    brutal_pacer_put(p);
 }
 
 static int brutal_set_params(struct sock *sk, sockptr_t optval,
@@ -528,7 +564,7 @@ static int brutal_set_params(struct sock *sk, sockptr_t optval,
     }
     if (!params.group_id)
         brutal_group_leave(sk);
-    else if (!brutal->group || brutal->group->id != params.group_id)
+    else if (!brutal->group || brutal_pacer_id(brutal->group) != params.group_id)
     {
         struct brutal_group *g = brutal_group_get(sk, params.group_id);
 
@@ -538,7 +574,7 @@ static int brutal_set_params(struct sock *sk, sockptr_t optval,
             return -ENOMEM;
         }
         brutal_group_leave(sk);
-        brutal_group_join(brutal, g);
+        brutal_group_join(brutal, &g->pacer);
     }
     if (brutal->group)
         brutal_group_set_config(brutal->group, params.rate, params.cwnd_gain,
@@ -573,7 +609,7 @@ static int brutal_get_params(struct sock *sk, char __user *optval,
     {
         brutal_group_get_config(brutal->group, &params.rate,
                                 &params.cwnd_gain, NULL, NULL);
-        params.group_id = brutal->group->id;
+        params.group_id = brutal_pacer_id(brutal->group);
     }
     else
     {
@@ -648,7 +684,7 @@ int __init brutal_sockopt_init(void)
     if (!brutal_free_wq)
         return -ENOMEM;
     brutal_peer_cache = kmem_cache_create("tcp_brutal_peer",
-                                          sizeof(struct brutal_group), 0,
+                                          sizeof(struct brutal_peer), 0,
                                           SLAB_HWCACHE_ALIGN, NULL);
     if (!brutal_peer_cache)
     {
