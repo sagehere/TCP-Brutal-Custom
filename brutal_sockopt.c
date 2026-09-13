@@ -1,5 +1,4 @@
 // Groups and the application interface: TCP_BRUTAL_PARAMS / TCP_BRUTAL_VERSION
-#include <linux/hashtable.h>
 #include <linux/jhash.h>
 #include <linux/mempool.h>
 #include <linux/percpu_counter.h>
@@ -15,8 +14,6 @@
 #include <net/tls.h>
 #endif
 
-static DEFINE_HASHTABLE(brutal_groups, 8);
-static DEFINE_SPINLOCK(brutal_groups_lock);
 static struct kmem_cache *brutal_peer_cache;
 static mempool_t *brutal_peer_pool;
 static struct workqueue_struct *brutal_free_wq;
@@ -296,32 +293,6 @@ int brutal_group_dump_peers(struct seq_file *m, struct brutal_group *parent)
     return 0;
 }
 
-// Application group keyed by id, uid and netns; created if missing.
-static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
-{
-    struct brutal_group *g, *ng = brutal_group_alloc(id, GFP_KERNEL);
-
-    spin_lock_bh(&brutal_groups_lock);
-    hash_for_each_possible(brutal_groups, g, node, id)
-    {
-        if (g->id == id && uid_eq(g->uid, sk->sk_uid) &&
-            g->net == sock_net(sk) && refcount_inc_not_zero(&g->pacer.refcnt))
-        {
-            spin_unlock_bh(&brutal_groups_lock);
-            kfree(ng);
-            return g;
-        }
-    }
-    if (ng)
-    {
-        ng->uid = sk->sk_uid;
-        ng->net = sock_net(sk);
-        hash_add(brutal_groups, &ng->node, id);
-    }
-    spin_unlock_bh(&brutal_groups_lock);
-    return ng;
-}
-
 static void brutal_perip_key(const struct sock *sk, struct brutal_peer_key *key)
 {
     memset(key, 0, sizeof(*key));
@@ -474,16 +445,17 @@ void brutal_pacer_put(struct brutal_pacer *p)
     {
         struct brutal_group *g = container_of(p, struct brutal_group, pacer);
 
-        spin_lock_bh(&brutal_groups_lock);
-        if (!hlist_unhashed(&g->node))
-            hash_del(&g->node);
-        spin_unlock_bh(&brutal_groups_lock);
         if (g->rule_stats)
         {
             struct brutal_rule_stats *stats = g->rule_stats;
 
             INIT_WORK(&stats->destroy_work, brutal_rule_group_free_work);
             queue_work(brutal_free_wq, &stats->destroy_work);
+            return;
+        }
+        if (g->net)
+        {
+            brutal_app_group_remove(g);
             return;
         }
         kfree(g);
@@ -566,7 +538,7 @@ static int brutal_set_params(struct sock *sk, sockptr_t optval,
         brutal_group_leave(sk);
     else if (!brutal->group || brutal_pacer_id(brutal->group) != params.group_id)
     {
-        struct brutal_group *g = brutal_group_get(sk, params.group_id);
+        struct brutal_group *g = brutal_app_group_get(sk, params.group_id);
 
         if (!g)
         {

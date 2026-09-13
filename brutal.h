@@ -58,6 +58,13 @@ struct brutal_peer_key
     };
 };
 
+struct brutal_app_key
+{
+    kuid_t uid;
+    u32 padding;
+    u64 id;
+};
+
 struct brutal_group;
 
 enum brutal_pacer_type
@@ -82,11 +89,9 @@ struct brutal_pacer
 /* Root object for application groups and destination-rule groups. */
 struct brutal_group
 {
-    struct hlist_node node;
     struct brutal_pacer pacer;
     u64 id;
-    kuid_t uid;
-    struct net *net;
+    struct net *net; // non-NULL only for application groups
 
     spinlock_t config_lock;
     seqcount_t config_seq;
@@ -98,6 +103,10 @@ struct brutal_group
     void *rule_stats;
     struct brutal_pacer **fallbacks;
     atomic_t ip_groups;
+
+    struct rhash_head app_node;
+    struct rcu_head rcu;
+    struct brutal_app_key app_key;
 };
 
 /* Lightweight per-IP object; it does not carry rule/app configuration fields. */
@@ -173,6 +182,8 @@ void brutal_net_peer_fallback(struct net *net);
 void brutal_net_peer_added(struct net *net);
 void brutal_net_peer_removed(struct net *net);
 
+struct brutal_group *brutal_app_group_get(struct sock *sk, u64 id);
+void brutal_app_group_remove(struct brutal_group *g);
 void brutal_apply_rule(struct sock *sk, struct brutal *brutal);
 int brutal_rules_init(void);
 void brutal_rules_exit(void);

@@ -9,6 +9,7 @@
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/rculist.h>
+#include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <net/ipv6.h>
@@ -42,6 +43,7 @@ struct brutal_net
     struct mutex rules_mutex;
     DECLARE_HASHTABLE(exact_v4, 8);
     DECLARE_HASHTABLE(exact_v6, 8);
+    struct rhashtable app_groups;
     u32 rule_next_id;
     atomic64_t peer_alloc_failures;
     atomic64_t peer_insert_failures;
@@ -52,11 +54,78 @@ struct brutal_net
     struct brutal_rule __rcu *default_v6;
 };
 
+static const struct rhashtable_params brutal_app_params = {
+    .head_offset = offsetof(struct brutal_group, app_node),
+    .key_offset = offsetof(struct brutal_group, app_key),
+    .key_len = sizeof(struct brutal_app_key),
+    .automatic_shrinking = true,
+};
+
 static unsigned int brutal_net_id;
 
 static struct brutal_net *brutal_pernet(struct net *net)
 {
     return net_generic(net, brutal_net_id);
+}
+
+static void brutal_app_group_free_rcu(struct rcu_head *rcu)
+{
+    struct brutal_group *g = container_of(rcu, struct brutal_group, rcu);
+
+    kfree(g);
+}
+
+struct brutal_group *brutal_app_group_get(struct sock *sk, u64 id)
+{
+    struct brutal_net *bn = brutal_pernet(sock_net(sk));
+    struct brutal_app_key key = {};
+    struct brutal_group *g, *ng;
+
+    key.uid = sk->sk_uid;
+    key.id = id;
+    ng = brutal_group_alloc(id, GFP_KERNEL);
+    if (!ng)
+        return NULL;
+    ng->net = sock_net(sk);
+    ng->app_key = key;
+
+    for (;;)
+    {
+        rcu_read_lock();
+        g = rhashtable_lookup_fast(&bn->app_groups, &key, brutal_app_params);
+        if (g && !refcount_inc_not_zero(&g->pacer.refcnt))
+            g = NULL;
+        rcu_read_unlock();
+        if (g)
+        {
+            kfree(ng);
+            return g;
+        }
+
+        g = rhashtable_lookup_get_insert_fast(&bn->app_groups, &ng->app_node,
+                                              brutal_app_params);
+        if (IS_ERR(g))
+        {
+            kfree(ng);
+            return NULL;
+        }
+        if (!g)
+            return ng;
+        if (refcount_inc_not_zero(&g->pacer.refcnt))
+        {
+            kfree(ng);
+            return g;
+        }
+        cond_resched();
+    }
+}
+
+void brutal_app_group_remove(struct brutal_group *g)
+{
+    struct brutal_net *bn = brutal_pernet(g->net);
+
+    rhashtable_remove_fast(&bn->app_groups, &g->app_node, brutal_app_params);
+    call_rcu(&g->rcu, brutal_app_group_free_rcu);
 }
 
 void brutal_net_peer_alloc_failed(struct net *net)
@@ -516,7 +585,8 @@ static int brutal_stats_show(struct seq_file *m, void *v)
 static int __net_init brutal_net_init(struct net *net)
 {
     struct brutal_net *bn = brutal_pernet(net);
-    struct proc_dir_entry *dir = proc_net_mkdir(net, "tcp_brutal", net->proc_net);
+    struct proc_dir_entry *dir;
+    int ret;
 
     INIT_LIST_HEAD(&bn->rules);
     INIT_LIST_HEAD(&bn->prefix_rules);
@@ -528,12 +598,19 @@ static int __net_init brutal_net_init(struct net *net)
     atomic64_set(&bn->peer_fallback_connections, 0);
     atomic_set(&bn->active_peers, 0);
     atomic_set(&bn->peak_peers, 0);
+
+    ret = rhashtable_init(&bn->app_groups, &brutal_app_params);
+    if (ret)
+        return ret;
+
+    dir = proc_net_mkdir(net, "tcp_brutal", net->proc_net);
     if (!dir ||
         !proc_create_data("peers", 0444, dir, &brutal_peers_proc_ops, net) ||
         !proc_create_net_single("stats", 0444, dir, brutal_stats_show, NULL) ||
         !proc_create_data("rules", 0644, dir, &brutal_rules_proc_ops, net))
     {
         remove_proc_subtree("tcp_brutal", net->proc_net);
+        rhashtable_destroy(&bn->app_groups);
         return -ENOMEM;
     }
     return 0;
@@ -541,8 +618,11 @@ static int __net_init brutal_net_init(struct net *net)
 
 static void __net_exit brutal_net_exit(struct net *net)
 {
-    brutal_rules_flush(brutal_pernet(net));
+    struct brutal_net *bn = brutal_pernet(net);
+
+    brutal_rules_flush(bn);
     remove_proc_subtree("tcp_brutal", net->proc_net);
+    rhashtable_destroy(&bn->app_groups);
 }
 
 static struct pernet_operations brutal_net_ops = {
