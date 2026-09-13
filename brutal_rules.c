@@ -3,12 +3,6 @@
 // Every connection to a rule's prefix joins the rule's group, without
 // application support. The route must select brutal for the prefix
 // ("ip route ... congctl lock brutal"); brutalctl in tools/ does both.
-//
-// Read:  one rule per line, "dst=<prefix>/<len> rate=<bytes/s> gain=<tenths>
-//        lock=<0|1> group=<shared|perip> id=<n> members=<n> ips=<n> sent=<bytes>"
-// Write: "add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock] [perip]"
-//        (replaces an existing rule for the same prefix, keeping its group)
-//        "del <prefix>[/<len>]"   "flush"
 #include <linux/hashtable.h>
 #include <linux/inet.h>
 #include <linux/jhash.h>
@@ -26,7 +20,8 @@
 
 struct brutal_rule
 {
-    struct list_head list;
+    struct list_head list;        // all rules, for control-plane enumeration
+    struct list_head prefix_node; // only non-default, non-exact CIDRs
     struct list_head free_list;
     struct hlist_node exact_node;
     u8 family;
@@ -43,6 +38,7 @@ struct brutal_rule
 struct brutal_net
 {
     struct list_head rules;
+    struct list_head prefix_rules;
     struct mutex rules_mutex;
     DECLARE_HASHTABLE(exact_v4, 8);
     DECLARE_HASHTABLE(exact_v6, 8);
@@ -98,10 +94,12 @@ static bool brutal_rule_match(const struct brutal_rule *r, const struct sock *sk
 {
 #if IS_ENABLED(CONFIG_IPV6)
     if (sk->sk_family == AF_INET6 && !ipv6_addr_v4mapped(&sk->sk_v6_daddr))
-        return r->family == AF_INET6 && ipv6_prefix_equal(&sk->sk_v6_daddr, &r->v6, r->plen);
+        return r->family == AF_INET6 &&
+               ipv6_prefix_equal(&sk->sk_v6_daddr, &r->v6, r->plen);
 #endif
     return r->family == AF_INET &&
-           !((sk->sk_daddr ^ r->v4) & (r->plen ? htonl(~0u << (32 - r->plen)) : 0));
+           !((sk->sk_daddr ^ r->v4) &
+             (r->plen ? htonl(~0u << (32 - r->plen)) : 0));
 }
 
 static struct brutal_rule *brutal_exact_lookup(struct brutal_net *bn,
@@ -115,16 +113,25 @@ static struct brutal_rule *brutal_exact_lookup(struct brutal_net *bn,
         u32 key = jhash(sk->sk_v6_daddr.s6_addr,
                         sizeof(sk->sk_v6_daddr.s6_addr), 0);
 
-        hash_for_each_possible_rcu(bn->exact_v6, r, exact_node, key) if (ipv6_addr_equal(&r->v6, &sk->sk_v6_daddr)) return r;
+        hash_for_each_possible_rcu(bn->exact_v6, r, exact_node, key)
+        {
+            if (ipv6_addr_equal(&r->v6, &sk->sk_v6_daddr))
+                return r;
+        }
         return NULL;
     }
 #endif
     hash_for_each_possible_rcu(bn->exact_v4, r, exact_node,
-                               (__force u32)sk->sk_daddr) if (r->v4 == sk->sk_daddr) return r;
+                               (__force u32)sk->sk_daddr)
+    {
+        if (r->v4 == sk->sk_daddr)
+            return r;
+    }
     return NULL;
 }
 
-// Join the group of the longest matching rule, if any
+// Join the group of the longest matching rule, if any.
+// Exact host rules and default rules never enter the prefix scan.
 void brutal_apply_rule(struct sock *sk, struct brutal *brutal)
 {
     struct brutal_net *bn = brutal_pernet(sock_net(sk));
@@ -142,10 +149,9 @@ void brutal_apply_rule(struct sock *sk, struct brutal *brutal)
 #else
     best = rcu_dereference(bn->default_v4);
 #endif
-    list_for_each_entry_rcu(r, &bn->rules, list)
+    list_for_each_entry_rcu(r, &bn->prefix_rules, prefix_node)
     {
-        if (r->plen && brutal_rule_match(r, sk) &&
-            (!best || r->plen > best->plen))
+        if (brutal_rule_match(r, sk) && (!best || r->plen > best->plen))
             best = r;
     }
 found:
@@ -206,7 +212,7 @@ static int brutal_parse_prefix(char *s, struct brutal_rule *r)
     return -EINVAL;
 }
 
-// Caller holds brutal_rules_mutex
+// Caller holds rules_mutex.
 static struct brutal_rule *brutal_rule_find(struct brutal_net *bn,
                                             const struct brutal_rule *key)
 {
@@ -215,13 +221,55 @@ static struct brutal_rule *brutal_rule_find(struct brutal_net *bn,
     list_for_each_entry(r, &bn->rules, list)
     {
         if (r->family == key->family && r->plen == key->plen &&
-            (r->family == AF_INET ? r->v4 == key->v4 : ipv6_addr_equal(&r->v6, &key->v6)))
+            (r->family == AF_INET ? r->v4 == key->v4
+                                  : ipv6_addr_equal(&r->v6, &key->v6)))
             return r;
     }
     return NULL;
 }
 
-// Rule is already unlinked; wait for sockets that may still be joining through it
+static bool brutal_rule_is_exact(const struct brutal_rule *r)
+{
+    return r->plen == (r->family == AF_INET ? 32 : 128);
+}
+
+static void brutal_rule_index_add(struct brutal_net *bn, struct brutal_rule *r)
+{
+    if (!r->plen)
+    {
+        if (r->family == AF_INET)
+            rcu_assign_pointer(bn->default_v4, r);
+        else
+            rcu_assign_pointer(bn->default_v6, r);
+    }
+    else if (brutal_rule_is_exact(r))
+    {
+        if (r->family == AF_INET)
+            hash_add_rcu(bn->exact_v4, &r->exact_node, (__force u32)r->v4);
+        else
+            hash_add_rcu(bn->exact_v6, &r->exact_node,
+                         jhash(r->v6.s6_addr, sizeof(r->v6.s6_addr), 0));
+    }
+    else
+        list_add_tail_rcu(&r->prefix_node, &bn->prefix_rules);
+}
+
+static void brutal_rule_index_del(struct brutal_net *bn, struct brutal_rule *r)
+{
+    if (!r->plen)
+    {
+        if (r->family == AF_INET)
+            RCU_INIT_POINTER(bn->default_v4, NULL);
+        else
+            RCU_INIT_POINTER(bn->default_v6, NULL);
+    }
+    else if (brutal_rule_is_exact(r))
+        hash_del_rcu(&r->exact_node);
+    else
+        list_del_rcu(&r->prefix_node);
+}
+
+// Rule is already unlinked; wait for sockets that may still be joining through it.
 static void brutal_rule_free(struct brutal_rule *r)
 {
     synchronize_rcu();
@@ -239,7 +287,7 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     bool lock = true;
     bool perip = false, created = false;
     char *tok = strsep(&args, " ");
-    int ret;
+    int ret = 0;
 
     if (!tok || (ret = brutal_parse_prefix(tok, &key)))
         return tok ? ret : -EINVAL;
@@ -262,7 +310,8 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         if (ret)
             return -EINVAL;
     }
-    if (rate < MIN_PACING_RATE || rate > MAX_PACING_RATE || gain < MIN_CWND_GAIN || gain > MAX_CWND_GAIN)
+    if (rate < MIN_PACING_RATE || rate > MAX_PACING_RATE ||
+        gain < MIN_CWND_GAIN || gain > MAX_CWND_GAIN)
         return -EINVAL;
     if (perip && !lock)
         return -EINVAL;
@@ -288,26 +337,12 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
             return ret;
         }
         r->group = g;
+        r->perip = perip;
+        INIT_LIST_HEAD(&r->prefix_node);
         INIT_LIST_HEAD(&r->free_list);
         brutal_group_set_config(g, rate, gain, lock);
-        r->perip = perip;
         list_add_tail_rcu(&r->list, &bn->rules);
-        if (!r->plen)
-        {
-            if (r->family == AF_INET)
-                rcu_assign_pointer(bn->default_v4, r);
-            else
-                rcu_assign_pointer(bn->default_v6, r);
-        }
-        else if (r->plen == (r->family == AF_INET ? 32 : 128))
-        {
-            if (r->family == AF_INET)
-                hash_add_rcu(bn->exact_v4, &r->exact_node,
-                             (__force u32)r->v4);
-            else
-                hash_add_rcu(bn->exact_v6, &r->exact_node,
-                             jhash(r->v6.s6_addr, sizeof(r->v6.s6_addr), 0));
-        }
+        brutal_rule_index_add(bn, r);
         created = true;
     }
     else if (r->perip != perip)
@@ -317,9 +352,7 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     }
     g = r->group;
     if (!created)
-    {
         brutal_group_set_config(g, rate, gain, lock);
-    }
     mutex_unlock(&bn->rules_mutex);
     return 0;
 }
@@ -337,15 +370,7 @@ static int brutal_rule_del(struct brutal_net *bn, char *args)
     r = brutal_rule_find(bn, &key);
     if (r)
     {
-        if (!r->plen)
-        {
-            if (r->family == AF_INET)
-                RCU_INIT_POINTER(bn->default_v4, NULL);
-            else
-                RCU_INIT_POINTER(bn->default_v6, NULL);
-        }
-        else if (!hlist_unhashed(&r->exact_node))
-            hash_del_rcu(&r->exact_node);
+        brutal_rule_index_del(bn, r);
         list_del_rcu(&r->list);
     }
     mutex_unlock(&bn->rules_mutex);
@@ -361,12 +386,9 @@ static void brutal_rules_flush(struct brutal_net *bn)
     struct brutal_rule *r, *tmp;
 
     mutex_lock(&bn->rules_mutex);
-    RCU_INIT_POINTER(bn->default_v4, NULL);
-    RCU_INIT_POINTER(bn->default_v6, NULL);
     list_for_each_entry_safe(r, tmp, &bn->rules, list)
     {
-        if (!hlist_unhashed(&r->exact_node))
-            hash_del_rcu(&r->exact_node);
+        brutal_rule_index_del(bn, r);
         list_del_rcu(&r->list);
         list_add_tail(&r->free_list, &free_list);
     }
@@ -398,15 +420,14 @@ static int brutal_rules_show(struct seq_file *m, void *v)
         bool locked;
 
         brutal_group_get_config(g, &rate, &gain, &locked, NULL);
-
         if (r->family == AF_INET)
             seq_printf(m, "dst=%pI4/%u", &r->v4, r->plen);
         else
             seq_printf(m, "dst=%pI6c/%u", &r->v6, r->plen);
         seq_printf(m, " rate=%llu gain=%u lock=%u group=%s id=%llu members=%u ips=%u sent=%llu\n",
-                   rate, gain, locked,
-                   r->perip ? "perip" : "shared", g->id, atomic_read(&g->members),
-                   atomic_read(&g->ip_groups), brutal_group_sent(g));
+                   rate, gain, locked, r->perip ? "perip" : "shared", g->id,
+                   atomic_read(&g->members), atomic_read(&g->ip_groups),
+                   brutal_group_sent(g));
     }
     rcu_read_unlock();
     return 0;
@@ -417,7 +438,8 @@ static int brutal_rules_open(struct inode *inode, struct file *file)
     return single_open(file, brutal_rules_show, pde_data(inode));
 }
 
-static ssize_t brutal_rules_write(struct file *file, const char __user *ubuf, size_t len, loff_t *off)
+static ssize_t brutal_rules_write(struct file *file, const char __user *ubuf,
+                                  size_t len, loff_t *off)
 {
     struct net *net = pde_data(file_inode(file));
     struct brutal_net *bn = brutal_pernet(net);
@@ -453,12 +475,41 @@ static const struct proc_ops brutal_rules_proc_ops = {
     .proc_release = single_release,
 };
 
+static int brutal_peers_show(struct seq_file *m, void *v)
+{
+    struct brutal_net *bn = brutal_pernet(m->private);
+    struct brutal_rule *r;
+
+    rcu_read_lock();
+    list_for_each_entry_rcu(r, &bn->rules, list)
+    {
+        if (r->perip)
+            brutal_group_dump_peers(m, r->group);
+    }
+    rcu_read_unlock();
+    return 0;
+}
+
+static int brutal_peers_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, brutal_peers_show, pde_data(inode));
+}
+
+static const struct proc_ops brutal_peers_proc_ops = {
+    .proc_open = brutal_peers_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
 static int brutal_stats_show(struct seq_file *m, void *v)
 {
     struct brutal_net *bn = brutal_pernet(m->private);
 
-    seq_printf(m, "peer_alloc_failures=%lld\n", atomic64_read(&bn->peer_alloc_failures));
-    seq_printf(m, "peer_insert_failures=%lld\n", atomic64_read(&bn->peer_insert_failures));
+    seq_printf(m, "peer_alloc_failures=%lld\n",
+               atomic64_read(&bn->peer_alloc_failures));
+    seq_printf(m, "peer_insert_failures=%lld\n",
+               atomic64_read(&bn->peer_insert_failures));
     seq_printf(m, "peer_fallback_connections=%lld\n",
                atomic64_read(&bn->peer_fallback_connections));
     seq_printf(m, "active_peer_groups=%d\n", atomic_read(&bn->active_peers));
@@ -472,6 +523,7 @@ static int __net_init brutal_net_init(struct net *net)
     struct proc_dir_entry *dir = proc_net_mkdir(net, "tcp_brutal", net->proc_net);
 
     INIT_LIST_HEAD(&bn->rules);
+    INIT_LIST_HEAD(&bn->prefix_rules);
     mutex_init(&bn->rules_mutex);
     hash_init(bn->exact_v4);
     hash_init(bn->exact_v6);
@@ -480,7 +532,8 @@ static int __net_init brutal_net_init(struct net *net)
     atomic64_set(&bn->peer_fallback_connections, 0);
     atomic_set(&bn->active_peers, 0);
     atomic_set(&bn->peak_peers, 0);
-    if (!dir || !proc_create_data("peers", 0444, dir, &brutal_peers_proc_ops, net) ||
+    if (!dir ||
+        !proc_create_data("peers", 0444, dir, &brutal_peers_proc_ops, net) ||
         !proc_create_net_single("stats", 0444, dir, brutal_stats_show, NULL) ||
         !proc_create_data("rules", 0644, dir, &brutal_rules_proc_ops, net))
     {

@@ -17,7 +17,6 @@
 
 static DEFINE_HASHTABLE(brutal_groups, 8);
 static DEFINE_SPINLOCK(brutal_groups_lock);
-static struct rhashtable brutal_perip_groups;
 static struct kmem_cache *brutal_peer_cache;
 static mempool_t *brutal_peer_pool;
 static struct workqueue_struct *brutal_free_wq;
@@ -25,9 +24,12 @@ static struct workqueue_struct *brutal_free_wq;
 struct brutal_rule_stats
 {
     struct percpu_counter sent_bytes;
+    struct rhashtable peers;
     struct work_struct destroy_work;
     struct brutal_group *group;
+    bool peers_initialized;
 };
+
 static const struct rhashtable_params brutal_perip_params = {
     .head_offset = offsetof(struct brutal_group, perip_node),
     .key_offset = offsetof(struct brutal_group, peer_key),
@@ -44,6 +46,8 @@ static void brutal_group_init(struct brutal_group *g, u64 id)
 {
     refcount_set(&g->refcnt, 1);
     spin_lock_init(&g->lock);
+    spin_lock_init(&g->config_lock);
+    seqcount_init(&g->config_seq);
     atomic_set(&g->members, 0);
     atomic_set(&g->ip_groups, 0);
     atomic_set(&g->generation, 0);
@@ -79,6 +83,11 @@ static struct brutal_group *brutal_group_parent(struct brutal_group *g)
     return g->parent ? g->parent : g;
 }
 
+static struct brutal_rule_stats *brutal_group_rule_stats(struct brutal_group *g)
+{
+    return READ_ONCE(brutal_group_parent(g)->rule_stats);
+}
+
 u64 brutal_group_rate(struct brutal_group *g)
 {
     u64 rate;
@@ -112,15 +121,26 @@ int brutal_group_enable_rule_stats(struct brutal_group *g, bool perip)
     }
     if (perip)
     {
+        ret = rhashtable_init(&stats->peers, &brutal_perip_params);
+        if (ret)
+            goto fail;
+        stats->peers_initialized = true;
+
         fallbacks = kcalloc(BRUTAL_FALLBACK_PACERS, sizeof(*fallbacks),
                             GFP_KERNEL);
         if (!fallbacks)
+        {
+            ret = -ENOMEM;
             goto fail;
+        }
         for (i = 0; i < BRUTAL_FALLBACK_PACERS; i++)
         {
             fallbacks[i] = brutal_group_alloc(g->id, GFP_KERNEL);
             if (!fallbacks[i])
+            {
+                ret = -ENOMEM;
                 goto fail;
+            }
             fallbacks[i]->parent = g;
             fallbacks[i]->fallback = true;
             refcount_inc(&g->refcnt);
@@ -140,9 +160,11 @@ fail:
         refcount_dec(&g->refcnt);
     }
     kfree(fallbacks);
+    if (stats->peers_initialized)
+        rhashtable_destroy(&stats->peers);
     percpu_counter_destroy(&stats->sent_bytes);
     kfree(stats);
-    return -ENOMEM;
+    return ret ?: -ENOMEM;
 }
 
 void brutal_group_account_sent(struct brutal_group *g, u64 bytes)
@@ -159,49 +181,52 @@ u64 brutal_group_sent(struct brutal_group *g)
 {
     struct brutal_rule_stats *stats = READ_ONCE(g->rule_stats);
 
-    return stats ? percpu_counter_sum_positive(&stats->sent_bytes) : atomic64_read(&g->sent_bytes);
+    return stats ? percpu_counter_sum_positive(&stats->sent_bytes)
+                 : atomic64_read(&g->sent_bytes);
 }
 
 u16 brutal_group_generation(struct brutal_group *g)
 {
     struct brutal_group *parent = brutal_group_parent(g);
-    u16 generation = (u16)atomic_read(&parent->generation);
 
-    smp_rmb();
-    return generation;
+    return (u16)atomic_read(&parent->generation);
 }
 
 void brutal_group_get_config(struct brutal_group *g, u64 *rate, u32 *gain,
                              bool *locked, u16 *generation)
 {
     struct brutal_group *parent = brutal_group_parent(g);
-    u16 before, after;
+    unsigned int seq;
+    u16 gen;
 
     do
     {
-        before = (u16)atomic_read(&parent->generation);
-        smp_rmb();
+        seq = read_seqcount_begin(&parent->config_seq);
         if (rate)
             *rate = READ_ONCE(parent->rate);
         if (gain)
             *gain = READ_ONCE(parent->cwnd_gain);
         if (locked)
             *locked = READ_ONCE(parent->locked);
-        smp_rmb();
-        after = (u16)atomic_read(&parent->generation);
-    } while (before != after);
+        gen = (u16)atomic_read(&parent->generation);
+    } while (read_seqcount_retry(&parent->config_seq, seq));
+
     if (generation)
-        *generation = after;
+        *generation = gen;
 }
 
 void brutal_group_set_config(struct brutal_group *g, u64 rate, u32 gain, bool locked)
 {
     g = brutal_group_parent(g);
+
+    spin_lock_bh(&g->config_lock);
+    write_seqcount_begin(&g->config_seq);
     WRITE_ONCE(g->rate, rate);
     WRITE_ONCE(g->cwnd_gain, gain);
     WRITE_ONCE(g->locked, locked);
-    smp_wmb();
     atomic_inc(&g->generation);
+    write_seqcount_end(&g->config_seq);
+    spin_unlock_bh(&g->config_lock);
 }
 
 bool brutal_group_locked(struct brutal_group *g)
@@ -212,110 +237,49 @@ bool brutal_group_locked(struct brutal_group *g)
     return locked;
 }
 
-struct brutal_peer_seq
+int brutal_group_dump_peers(struct seq_file *m, struct brutal_group *parent)
 {
+    struct brutal_rule_stats *stats = brutal_group_rule_stats(parent);
     struct rhashtable_iter iter;
-    struct net *net;
-};
-
-static struct brutal_group *brutal_peer_seq_next(struct brutal_peer_seq *ctx)
-{
     struct brutal_group *g;
 
+    if (!stats || !stats->peers_initialized)
+        return 0;
+
+    rhashtable_walk_enter(&stats->peers, &iter);
+    rhashtable_walk_start(&iter);
     for (;;)
     {
-        g = rhashtable_walk_next(&ctx->iter);
+        u64 rate;
+        u32 gain;
+
+        g = rhashtable_walk_next(&iter);
         if (IS_ERR(g))
         {
             if (PTR_ERR(g) == -EAGAIN)
                 continue;
-            return NULL;
+            break;
         }
         if (!g)
-            return NULL;
-        if (g->net == ctx->net && atomic_read(&g->members))
-            return g;
-    }
-}
-
-static void *brutal_peers_seq_start(struct seq_file *m, loff_t *pos)
-{
-    struct brutal_peer_seq *ctx = m->private;
-    struct brutal_group *g = NULL;
-    loff_t i;
-
-    rhashtable_walk_enter(&brutal_perip_groups, &ctx->iter);
-    rhashtable_walk_start(&ctx->iter);
-    for (i = 0; i <= *pos; i++)
-    {
-        g = brutal_peer_seq_next(ctx);
-        if (!g)
             break;
+        if (!atomic_read(&g->members))
+            continue;
+
+        brutal_group_get_config(g, &rate, &gain, NULL, NULL);
+        if (g->peer_key.family == AF_INET)
+            seq_printf(m, "ip=%pI4 family=4", &g->peer_key.v4);
+        else
+            seq_printf(m, "ip=%pI6c family=6", &g->peer_key.v6);
+        seq_printf(m, " rule=%llu rate=%llu gain=%u members=%u sent=%llu\n",
+                   parent->id, rate, gain, atomic_read(&g->members),
+                   atomic64_read(&g->sent_bytes));
     }
-    return g;
-}
-
-static void *brutal_peers_seq_next(struct seq_file *m, void *v, loff_t *pos)
-{
-    struct brutal_peer_seq *ctx = m->private;
-
-    ++*pos;
-    return brutal_peer_seq_next(ctx);
-}
-
-static void brutal_peers_seq_stop(struct seq_file *m, void *v)
-{
-    struct brutal_peer_seq *ctx = m->private;
-
-    rhashtable_walk_stop(&ctx->iter);
-    rhashtable_walk_exit(&ctx->iter);
-}
-
-static int brutal_peers_seq_show(struct seq_file *m, void *v)
-{
-    struct brutal_group *g = v;
-    u64 rate;
-    u32 gain;
-
-    brutal_group_get_config(g, &rate, &gain, NULL, NULL);
-    if (g->peer_key.family == AF_INET)
-        seq_printf(m, "ip=%pI4 family=4", &g->peer_key.v4);
-    else
-        seq_printf(m, "ip=%pI6c family=6", &g->peer_key.v6);
-    seq_printf(m, " rule=%llu rate=%llu gain=%u members=%u sent=%llu\n",
-               g->parent->id, rate, gain, atomic_read(&g->members),
-               atomic64_read(&g->sent_bytes));
+    rhashtable_walk_stop(&iter);
+    rhashtable_walk_exit(&iter);
     return 0;
 }
 
-static const struct seq_operations brutal_peers_seq_ops = {
-    .start = brutal_peers_seq_start,
-    .next = brutal_peers_seq_next,
-    .stop = brutal_peers_seq_stop,
-    .show = brutal_peers_seq_show,
-};
-
-static int brutal_peers_open(struct inode *inode, struct file *file)
-{
-    struct seq_file *m;
-    int ret = seq_open_private(file, &brutal_peers_seq_ops,
-                               sizeof(struct brutal_peer_seq));
-
-    if (ret)
-        return ret;
-    m = file->private_data;
-    ((struct brutal_peer_seq *)m->private)->net = pde_data(inode);
-    return 0;
-}
-
-const struct proc_ops brutal_peers_proc_ops = {
-    .proc_open = brutal_peers_open,
-    .proc_read = seq_read,
-    .proc_lseek = seq_lseek,
-    .proc_release = seq_release_private,
-};
-
-// Application group keyed by id, uid and netns; created if missing
+// Application group keyed by id, uid and netns; created if missing.
 static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
 {
     struct brutal_group *g, *ng = brutal_group_alloc(id, GFP_KERNEL);
@@ -323,8 +287,8 @@ static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
     spin_lock_bh(&brutal_groups_lock);
     hash_for_each_possible(brutal_groups, g, node, id)
     {
-        if (g->id == id && uid_eq(g->uid, sk->sk_uid) && g->net == sock_net(sk) &&
-            refcount_inc_not_zero(&g->refcnt))
+        if (g->id == id && uid_eq(g->uid, sk->sk_uid) &&
+            g->net == sock_net(sk) && refcount_inc_not_zero(&g->refcnt))
         {
             spin_unlock_bh(&brutal_groups_lock);
             kfree(ng);
@@ -341,12 +305,9 @@ static struct brutal_group *brutal_group_get(struct sock *sk, u64 id)
     return ng;
 }
 
-static void brutal_perip_key(const struct sock *sk, struct brutal_group *parent,
-                             struct brutal_peer_key *key)
+static void brutal_perip_key(const struct sock *sk, struct brutal_peer_key *key)
 {
     memset(key, 0, sizeof(*key));
-    key->parent = parent;
-    key->net = sock_net(sk);
 #if IS_ENABLED(CONFIG_IPV6)
     if (sk->sk_family == AF_INET6 && !ipv6_addr_v4mapped(&sk->sk_v6_daddr))
     {
@@ -360,7 +321,8 @@ static void brutal_perip_key(const struct sock *sk, struct brutal_group *parent,
 }
 
 static struct brutal_group *brutal_fallback_group_get(
-    const struct brutal_peer_key *key, struct brutal_group *parent)
+    const struct brutal_peer_key *key, struct brutal_group *parent,
+    struct net *net)
 {
     struct brutal_group **fallbacks = READ_ONCE(parent->fallbacks);
     struct brutal_group *g;
@@ -376,20 +338,25 @@ static struct brutal_group *brutal_fallback_group_get(
     g = fallbacks[hash & (BRUTAL_FALLBACK_PACERS - 1)];
     refcount_inc(&g->refcnt);
     brutal_group_put(parent);
-    brutal_net_peer_fallback(key->net);
+    brutal_net_peer_fallback(net);
     return g;
 }
 
 // Takes the caller's parent reference on success or allocation failure.
-struct brutal_group *brutal_perip_group_get(struct sock *sk, struct brutal_group *parent)
+struct brutal_group *brutal_perip_group_get(struct sock *sk,
+                                            struct brutal_group *parent)
 {
+    struct brutal_rule_stats *stats = brutal_group_rule_stats(parent);
     struct brutal_group *g, *ng;
     struct brutal_peer_key key;
+    struct net *net = sock_net(sk);
 
-    brutal_perip_key(sk, parent, &key);
+    if (WARN_ON_ONCE(!stats || !stats->peers_initialized))
+        return NULL;
+
+    brutal_perip_key(sk, &key);
     rcu_read_lock();
-    g = rhashtable_lookup_fast(&brutal_perip_groups, &key,
-                               brutal_perip_params);
+    g = rhashtable_lookup_fast(&stats->peers, &key, brutal_perip_params);
     if (g && !refcount_inc_not_zero(&g->refcnt))
         g = NULL;
     rcu_read_unlock();
@@ -402,21 +369,20 @@ struct brutal_group *brutal_perip_group_get(struct sock *sk, struct brutal_group
     ng = brutal_peer_alloc(parent->id);
     if (!ng)
     {
-        brutal_net_peer_alloc_failed(sock_net(sk));
-        return brutal_fallback_group_get(&key, parent);
+        brutal_net_peer_alloc_failed(net);
+        return brutal_fallback_group_get(&key, parent, net);
     }
     ng->parent = parent;
-    ng->net = sock_net(sk);
+    ng->net = net;
     ng->peer_key = key;
 
-    g = rhashtable_lookup_get_insert_fast(&brutal_perip_groups,
-                                          &ng->perip_node,
+    g = rhashtable_lookup_get_insert_fast(&stats->peers, &ng->perip_node,
                                           brutal_perip_params);
     if (IS_ERR(g))
     {
-        brutal_net_peer_insert_failed(sock_net(sk));
+        brutal_net_peer_insert_failed(net);
         mempool_free(ng, brutal_peer_pool);
-        return brutal_fallback_group_get(&key, parent);
+        return brutal_fallback_group_get(&key, parent, net);
     }
     if (g)
     {
@@ -427,10 +393,10 @@ struct brutal_group *brutal_perip_group_get(struct sock *sk, struct brutal_group
             return g;
         }
         mempool_free(ng, brutal_peer_pool);
-        return brutal_fallback_group_get(&key, parent);
+        return brutal_fallback_group_get(&key, parent, net);
     }
     atomic_inc(&parent->ip_groups);
-    brutal_net_peer_added(sock_net(sk));
+    brutal_net_peer_added(net);
     return ng;
 }
 
@@ -447,6 +413,8 @@ static void brutal_rule_group_free_work(struct work_struct *work)
     struct brutal_rule_stats *stats =
         container_of(work, struct brutal_rule_stats, destroy_work);
 
+    if (stats->peers_initialized)
+        rhashtable_destroy(&stats->peers);
     percpu_counter_destroy(&stats->sent_bytes);
     kfree(stats->group);
     kfree(stats);
@@ -457,6 +425,7 @@ void brutal_group_put(struct brutal_group *g)
     if (g->parent)
     {
         struct brutal_group *parent = g->parent;
+        struct brutal_rule_stats *stats = brutal_group_rule_stats(parent);
 
         if (!refcount_dec_and_test(&g->refcnt))
             return;
@@ -466,7 +435,9 @@ void brutal_group_put(struct brutal_group *g)
             kfree(g);
             return;
         }
-        rhashtable_remove_fast(&brutal_perip_groups, &g->perip_node,
+        if (WARN_ON_ONCE(!stats || !stats->peers_initialized))
+            return;
+        rhashtable_remove_fast(&stats->peers, &g->perip_node,
                                brutal_perip_params);
         atomic_dec(&parent->ip_groups);
         brutal_net_peer_removed(g->net);
@@ -501,15 +472,13 @@ void brutal_group_release_fallbacks(struct brutal_group *g)
     kfree(fallbacks);
 }
 
-// Takes over the caller's reference on g
+// Takes over the caller's reference on g.
 void brutal_group_join(struct brutal *brutal, struct brutal_group *g)
 {
     brutal->group = g;
     atomic_inc(&g->members);
     if (g->parent)
-    {
         atomic_inc(&g->parent->members);
-    }
 }
 
 void brutal_group_leave(struct sock *sk)
@@ -523,48 +492,46 @@ void brutal_group_leave(struct sock *sk)
     brutal->group = NULL;
     atomic_dec(&g->members);
     if (g->parent)
-    {
         atomic_dec(&g->parent->members);
-    }
     brutal_group_put(g);
 }
 
-static int brutal_set_params(struct sock *sk, sockptr_t optval, unsigned int optlen)
+static int brutal_set_params(struct sock *sk, sockptr_t optval,
+                             unsigned int optlen)
 {
     struct brutal *brutal = inet_csk_ca(sk);
     struct brutal_params params = {};
 
     if (optlen < BRUTAL_PARAMS_V1_SIZE)
         return -EINVAL;
-    if (copy_from_sockptr(&params, optval, min_t(unsigned int, optlen, sizeof(params))))
+    if (copy_from_sockptr(&params, optval,
+                          min_t(unsigned int, optlen, sizeof(params))))
         return -EFAULT;
     if (optlen < sizeof(params))
         params.group_id = 0;
 
-    // Sanity checks
     if (params.rate < MIN_PACING_RATE || params.rate > MAX_PACING_RATE)
         return -EINVAL;
     if (params.cwnd_gain < MIN_CWND_GAIN || params.cwnd_gain > MAX_CWND_GAIN)
         return -EINVAL;
 
-    // The proto-level override runs before the kernel would take the socket
-    // lock, and the group pointer must not change under the transmit hook
     lock_sock(sk);
     if (inet_csk(sk)->icsk_ca_ops != &tcp_brutal_ops)
     {
-        release_sock(sk); // the socket has been switched to another algorithm
+        release_sock(sk);
         return -ENOPROTOOPT;
     }
     if (brutal->group && brutal_group_locked(brutal->group))
     {
         release_sock(sk);
-        return -EPERM; // governed by a locked destination rule
+        return -EPERM;
     }
     if (!params.group_id)
         brutal_group_leave(sk);
     else if (!brutal->group || brutal->group->id != params.group_id)
     {
         struct brutal_group *g = brutal_group_get(sk, params.group_id);
+
         if (!g)
         {
             release_sock(sk);
@@ -574,22 +541,17 @@ static int brutal_set_params(struct sock *sk, sockptr_t optval, unsigned int opt
         brutal_group_join(brutal, g);
     }
     if (brutal->group)
-    {
         brutal_group_set_config(brutal->group, params.rate, params.cwnd_gain,
                                 brutal_group_locked(brutal->group));
-    }
     brutal->rate = params.rate;
     brutal->cwnd_gain = params.cwnd_gain;
     brutal_update_rate(sk);
     release_sock(sk);
-
     return 0;
 }
 
-// Returns the params in effect:
-// For a group member, the group's rate and cwnd_gain.
-// A 12-byte (v1) buffer gets the first two fields.
-static int brutal_get_params(struct sock *sk, char __user *optval, int __user *optlen)
+static int brutal_get_params(struct sock *sk, char __user *optval,
+                             int __user *optlen)
 {
     struct brutal *brutal = inet_csk_ca(sk);
     struct brutal_params params;
@@ -641,49 +603,46 @@ static int brutal_get_version(char __user *optval, int __user *optlen)
     return 0;
 }
 
-static int brutal_tcp_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval, unsigned int optlen)
+static int brutal_tcp_setsockopt(struct sock *sk, int level, int optname,
+                                 sockptr_t optval, unsigned int optlen)
 {
     if (level == IPPROTO_TCP && optname == TCP_BRUTAL_PARAMS)
         return brutal_set_params(sk, optval, optlen);
-    else
-        return tcp_prot.setsockopt(sk, level, optname, optval, optlen);
+    return tcp_prot.setsockopt(sk, level, optname, optval, optlen);
 }
 
-static int brutal_tcp_getsockopt(struct sock *sk, int level, int optname, char __user *optval, int __user *optlen)
+static int brutal_tcp_getsockopt(struct sock *sk, int level, int optname,
+                                 char __user *optval, int __user *optlen)
 {
     if (level == IPPROTO_TCP && optname == TCP_BRUTAL_PARAMS)
         return brutal_get_params(sk, optval, optlen);
-    else if (level == IPPROTO_TCP && optname == TCP_BRUTAL_VERSION)
+    if (level == IPPROTO_TCP && optname == TCP_BRUTAL_VERSION)
         return brutal_get_version(optval, optlen);
-    else
-        return tcp_prot.getsockopt(sk, level, optname, optval, optlen);
+    return tcp_prot.getsockopt(sk, level, optname, optval, optlen);
 }
 
 #ifdef _TRANSP_V6_H
-static int brutal_tcpv6_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval, unsigned int optlen)
+static int brutal_tcpv6_setsockopt(struct sock *sk, int level, int optname,
+                                   sockptr_t optval, unsigned int optlen)
 {
     if (level == IPPROTO_TCP && optname == TCP_BRUTAL_PARAMS)
         return brutal_set_params(sk, optval, optlen);
-    else
-        return tcpv6_prot.setsockopt(sk, level, optname, optval, optlen);
+    return tcpv6_prot.setsockopt(sk, level, optname, optval, optlen);
 }
 
-static int brutal_tcpv6_getsockopt(struct sock *sk, int level, int optname, char __user *optval, int __user *optlen)
+static int brutal_tcpv6_getsockopt(struct sock *sk, int level, int optname,
+                                   char __user *optval, int __user *optlen)
 {
     if (level == IPPROTO_TCP && optname == TCP_BRUTAL_PARAMS)
         return brutal_get_params(sk, optval, optlen);
-    else if (level == IPPROTO_TCP && optname == TCP_BRUTAL_VERSION)
+    if (level == IPPROTO_TCP && optname == TCP_BRUTAL_VERSION)
         return brutal_get_version(optval, optlen);
-    else
-        return tcpv6_prot.getsockopt(sk, level, optname, optval, optlen);
+    return tcpv6_prot.getsockopt(sk, level, optname, optval, optlen);
 }
-#endif // _TRANSP_V6_H
+#endif
 
-// Prepare the proto tables that route our sockopts to us
 int __init brutal_sockopt_init(void)
 {
-    int ret;
-
     brutal_free_wq = alloc_workqueue("tcp_brutal_free",
                                      WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
     if (!brutal_free_wq)
@@ -703,24 +662,15 @@ int __init brutal_sockopt_init(void)
         destroy_workqueue(brutal_free_wq);
         return -ENOMEM;
     }
-    ret = rhashtable_init(&brutal_perip_groups, &brutal_perip_params);
 
-    if (ret)
-    {
-        mempool_destroy(brutal_peer_pool);
-        kmem_cache_destroy(brutal_peer_cache);
-        destroy_workqueue(brutal_free_wq);
-        return ret;
-    }
     tcp_prot_override = tcp_prot;
     tcp_prot_override.setsockopt = brutal_tcp_setsockopt;
     tcp_prot_override.getsockopt = brutal_tcp_getsockopt;
-
 #ifdef _TRANSP_V6_H
     tcpv6_prot_override = tcpv6_prot;
     tcpv6_prot_override.setsockopt = brutal_tcpv6_setsockopt;
     tcpv6_prot_override.getsockopt = brutal_tcpv6_getsockopt;
-#endif // _TRANSP_V6_H
+#endif
     return 0;
 }
 
@@ -728,7 +678,6 @@ void brutal_sockopt_exit(void)
 {
     rcu_barrier();
     flush_workqueue(brutal_free_wq);
-    rhashtable_destroy(&brutal_perip_groups);
     mempool_destroy(brutal_peer_pool);
     kmem_cache_destroy(brutal_peer_cache);
     destroy_workqueue(brutal_free_wq);
@@ -741,7 +690,7 @@ void brutal_sockopt_install(struct sock *sk)
 #ifdef _TRANSP_V6_H
     else if (sk->sk_prot == &tcpv6_prot)
         sk->sk_prot = &tcpv6_prot_override;
-#endif // _TRANSP_V6_H
+#endif
     else
         WARN_ON_ONCE(sk->sk_family != AF_INET && sk->sk_family != AF_INET6);
 }
@@ -755,7 +704,7 @@ static void brutal_restore_proto(struct proto **protp)
 #ifdef _TRANSP_V6_H
     else if (prot == &tcpv6_prot_override)
         WRITE_ONCE(*protp, &tcpv6_prot);
-#endif // _TRANSP_V6_H
+#endif
 }
 
 void brutal_sockopt_uninstall(struct sock *sk)
@@ -767,7 +716,6 @@ void brutal_sockopt_uninstall(struct sock *sk)
     {
         struct tls_context *ctx = tls_get_ctx(sk);
 
-        // TLS retains the base proto for sockopts and restores it on close.
         if (ctx)
             brutal_restore_proto(&ctx->sk_proto);
     }

@@ -5,6 +5,7 @@
 #include <linux/gfp.h>
 #include <linux/refcount.h>
 #include <linux/rhashtable.h>
+#include <linux/seqlock.h>
 #include <linux/spinlock.h>
 #include <net/tcp.h>
 
@@ -21,7 +22,7 @@ struct proc_ops;
 #endif
 
 #define BRUTAL_VERSION_MAJOR 2
-#define BRUTAL_VERSION_MINOR 2
+#define BRUTAL_VERSION_MINOR 3
 #define BRUTAL_VERSION_PATCH 0
 #define BRUTAL_VERSION ((BRUTAL_VERSION_MAJOR << 16) | (BRUTAL_VERSION_MINOR << 8) | BRUTAL_VERSION_PATCH)
 
@@ -47,10 +48,9 @@ struct brutal_pkt_info
     u32 losses;
 };
 
+/* Peer tables are scoped by destination rule and network namespace. */
 struct brutal_peer_key
 {
-    struct brutal_group *parent;
-    struct net *net;
     u8 family;
     u8 padding[3];
     union
@@ -73,10 +73,14 @@ struct brutal_group
     kuid_t uid;
     struct net *net;
 
+    /* Configuration is independent from the pacing lock. */
+    spinlock_t config_lock;
+    seqcount_t config_seq;
     u64 rate;
     u32 cwnd_gain;
     atomic_t generation;
     u8 locked; // rule group: applications may not change the params
+
     atomic_t members;
     atomic64_t sent_bytes;
     void *rule_stats;
@@ -144,7 +148,7 @@ int brutal_group_enable_rule_stats(struct brutal_group *g, bool perip);
 void brutal_group_release_fallbacks(struct brutal_group *g);
 void brutal_group_account_sent(struct brutal_group *g, u64 bytes);
 u64 brutal_group_sent(struct brutal_group *g);
-extern const struct proc_ops brutal_peers_proc_ops;
+int brutal_group_dump_peers(struct seq_file *m, struct brutal_group *parent);
 int brutal_sockopt_init(void);
 void brutal_sockopt_exit(void);
 void brutal_sockopt_install(struct sock *sk);
