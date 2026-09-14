@@ -18,15 +18,6 @@ static struct kmem_cache *brutal_peer_cache;
 static mempool_t *brutal_peer_pool;
 static struct workqueue_struct *brutal_free_wq;
 
-struct brutal_rule_stats
-{
-    struct percpu_counter sent_bytes;
-    struct rhashtable peers;
-    struct work_struct destroy_work;
-    struct brutal_group *group;
-    bool peers_initialized;
-};
-
 static const struct rhashtable_params brutal_perip_params = {
     .head_offset = offsetof(struct brutal_peer, node),
     .key_offset = offsetof(struct brutal_peer, key),
