@@ -13,5 +13,15 @@
   "worst_target_error_percent": 0.125,
   "baseline_median_bps": 199787457.0,
   "throughput_regression": false,
-  "raw_run_json_archived": false
+  "cpu_metric": "iperf3 cpu_utilization_percent on remote/server sender",
+  "baseline_sender_cpu_total_median_percent": 0.5512,
+  "final_sender_cpu_total_median_percent": 0.5413,
+  "sender_cpu_total_relative_change_percent": -1.8,
+  "baseline_sender_cpu_system_median_percent": 0.5374,
+  "final_sender_cpu_system_median_percent": 0.5183,
+  "sender_cpu_system_relative_change_percent": -3.6,
+  "cpu_regression": false,
+  "raw_run_json_archived": true,
+  "raw_archive_sha256": "9e3f13fa464dde3b43eb6411c18be4920f167951945a7338676dde9166f92b39",
+  "raw_archive_base64_sha256": "1c3986cac91c85018e841061e37eb0b8a8ab0db8240afd604a00881c2d115cf7"
 }

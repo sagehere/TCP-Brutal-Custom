@@ -41,10 +41,21 @@ Verified aggregate from the benchmark script:
 
 Saved baseline median on the same ARM64/6.17 host: 199.787457 Mbps. No measurable throughput regression was observed.
 
-See `summary.json` and `stats.txt` for machine-readable summary and final counters.
+## CPU comparison
 
-## Raw benchmark JSON status
+The saved baseline and final 2.3.0 iperf3 JSON were generated with the same host, reverse-mode workload, 5 x 60-second runs, 16 streams and 200 Mbps target. In reverse mode the remote/server endpoint is the sender using `brutal`, so the server/sender CPU fields are the relevant comparison.
 
-The five full iperf JSON files from the final run remain on the test host and are not copied into this directory yet. The host's Remote Desktop Commander channel was offline when this evidence bundle was created, so this directory intentionally records only values already captured from the benchmark script and PR runtime-validation log. Do not substitute the older `candidate/` JSON files for the final 2.3.0 run.
+- sender total CPU median: 0.5512% baseline -> 0.5413% final (about -1.8%)
+- sender system CPU median: 0.5374% baseline -> 0.5183% final (about -3.6%)
 
-Copy the five final `run-*.json` files here before creating the final release tag if full raw-run archival is required by the release policy.
+The differences are small and should be interpreted as no CPU regression, with a slight decrease in this workload, not as a material CPU-performance gain.
+
+## Raw benchmark JSON archive
+
+The five exact final `run-*.json` files are archived losslessly under `raw/` as a Base64-split `tar.xz` archive. The decoded archive SHA-256 is:
+
+`9e3f13fa464dde3b43eb6411c18be4920f167951945a7338676dde9166f92b39`
+
+`raw/README.md` contains reconstruction commands and `raw/SHA256SUMS` records the Base64 archive, decoded archive and each individual run hash. The five Base64 parts total 74,636 bytes.
+
+See `summary.json` and `stats.txt` for the machine-readable summary and final counters.
