@@ -13,6 +13,7 @@ SERVICE="/etc/systemd/system/tcp-brutal-custom.service"
 MODULES_LOAD="/etc/modules-load.d/brutal.conf"
 STATE_DIR="/var/lib/tcp-brutal-custom"
 PENDING_REBOOT="$STATE_DIR/reboot-required"
+CLEANUP_REQUIRED="$STATE_DIR/cleanup-required"
 PEERS_PROC="/proc/net/tcp_brutal/peers"
 
 IPV4_RATE=80
@@ -192,9 +193,15 @@ module_loaded() { lsmod | awk '$1 == "brutal" { found=1 } END { exit !found }'; 
 module_supports_peers() { [[ -r $PEERS_PROC ]]; }
 
 mark_pending_reboot() {
+  local cleanup_upstream=${1:-0}
   install -d -m 0755 "$STATE_DIR"
   printf '%s\n' "$VERSION" >"$PENDING_REBOOT.tmp"
   mv "$PENDING_REBOOT.tmp" "$PENDING_REBOOT"
+  {
+    printf 'CUSTOM=1\n'
+    printf 'UPSTREAM=%s\n' "$cleanup_upstream"
+  } >"$CLEANUP_REQUIRED.tmp"
+  mv "$CLEANUP_REQUIRED.tmp" "$CLEANUP_REQUIRED"
 }
 
 pending_reboot_message() {
@@ -278,6 +285,60 @@ remove_old_custom_dkms() {
   done < <(dkms status -m "$PACKAGE" 2>/dev/null | sed -nE "s#^$PACKAGE/([^,]+),.*#\1#p" | sort -u)
 }
 
+module_matches_installed() {
+  local live_version live_src disk_version disk_src target_version
+  [[ -r /sys/module/brutal/version && -r /sys/module/brutal/srcversion ]] || return 1
+  [[ $VERSION =~ ^([0-9]+[.][0-9]+[.][0-9]+)[.]custom[.][0-9a-f]{7}$ ]] || return 1
+  target_version=${BASH_REMATCH[1]}
+  live_version=$(cat /sys/module/brutal/version 2>/dev/null || true)
+  live_src=$(cat /sys/module/brutal/srcversion 2>/dev/null || true)
+  disk_version=$(modinfo -F version brutal 2>/dev/null || true)
+  disk_src=$(modinfo -F srcversion brutal 2>/dev/null || true)
+  [[ -n $live_src && -n $disk_src && $disk_version == "$target_version" &&
+     $live_version == "$disk_version" && $live_src == "$disk_src" ]]
+}
+
+cleanup_wants_upstream() {
+  [[ -f $CLEANUP_REQUIRED ]] && grep -qx 'UPSTREAM=1' "$CLEANUP_REQUIRED"
+}
+
+retry_pending_cleanup() {
+  [[ -f $CLEANUP_REQUIRED ]] || return 0
+  local failed=0
+  remove_old_custom_dkms "$VERSION" || failed=1
+  if cleanup_wants_upstream; then
+    remove_upstream_dkms || failed=1
+  fi
+  if (( failed )); then
+    echo "警告: 新模块已生效，但旧 DKMS 清理未完成；稍后执行 brutal-manager apply 可重试。" >&2
+    return 0
+  fi
+  dkms install -m "$PACKAGE" -v "$VERSION" -k "$(uname -r)" --force >/dev/null 2>&1 || {
+    echo "警告: 旧 DKMS 已清理，但无法重新确认目标 Custom 模块；保留清理状态以便重试。" >&2
+    return 0
+  }
+  depmod -a || {
+    echo "警告: DKMS 已清理，但 depmod 失败；稍后执行 brutal-manager apply 可重试。" >&2
+    return 0
+  }
+  module_matches_installed || {
+    echo "警告: DKMS 清理后磁盘模块与当前目标不一致；保留清理状态以便重试。" >&2
+    return 0
+  }
+  rm -f "$CLEANUP_REQUIRED"
+}
+
+finalize_pending_update() {
+  if [[ -f $PENDING_REBOOT ]]; then
+    module_matches_installed || {
+      echo "错误: 已加载的 brutal 模块与磁盘目标模块不一致；保留旧 DKMS 与待重启状态。" >&2
+      return 1
+    }
+    rm -f "$PENDING_REBOOT"
+  fi
+  retry_pending_cleanup
+}
+
 rule_line() { grep -E "^dst=$1 " /proc/net/tcp_brutal/rules 2>/dev/null || true; }
 
 apply_family() {
@@ -325,7 +386,7 @@ apply_rules() {
   [[ $MANAGED == 1 ]] || die "尚未完成安装。"
   apply_configured_rules || die "恢复规则失败。"
   module_supports_peers || die "当前加载的模块不支持活跃 IP 视图；请重启服务器完成更新。"
-  rm -f "$PENDING_REBOOT"
+  finalize_pending_update || die "更新收尾验证失败；请检查当前加载模块后重试。"
 }
 
 write_service() {
@@ -487,7 +548,7 @@ install_or_update() (
       if ! rmmod brutal; then
         save_config
         enable_boot_deferred
-        mark_pending_reboot
+        mark_pending_reboot "$has_upstream"
         switch_complete=1
         note "更新已暂存，现有连接继续使用旧模块；请重启服务器完成更新。"
         return 0
@@ -543,6 +604,7 @@ status() {
   else
     echo "更新状态: 已生效"
   fi
+  [[ -f $CLEANUP_REQUIRED ]] && echo "清理状态: 旧 DKMS 清理待完成" || echo "清理状态: 已完成"
   [[ -r /proc/net/tcp_brutal/rules && -x $BRUTALCTL ]] && "$BRUTALCTL" list || true
 }
 
