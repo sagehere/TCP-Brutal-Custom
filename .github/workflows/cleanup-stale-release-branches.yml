@@ -1,0 +1,31 @@
+name: Remove stale release evidence branches
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/cleanup-stale-release-branches.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Delete stale evidence branches and self-remove
+        run: |
+          set -euo pipefail
+          git push origin --delete release/2.3.0-evidence docs/2.3-release-evidence
+          git rm .github/workflows/cleanup-stale-release-branches.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "release: remove stale evidence branches"
+          git push origin HEAD:master
