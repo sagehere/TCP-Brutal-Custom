@@ -64,7 +64,9 @@ int main(int argc, char **argv)
     struct brutal_params params;
     uint64_t group, rate;
     unsigned hold;
-    int fd;
+    struct sockaddr_in addr = {};
+    socklen_t addrlen = sizeof(addr);
+    int listener, peer, fd;
 
     if (argc != 4)
     {
@@ -76,12 +78,41 @@ int main(int argc, char **argv)
     rate = parse_u64(argv[2]);
     hold = (unsigned)parse_u64(argv[3]);
 
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0)
+    {
+        perror("socket(listener)");
+        return 1;
+    }
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) ||
+        getsockname(listener, (struct sockaddr *)&addr, &addrlen) ||
+        listen(listener, 1))
+    {
+        perror("prepare loopback listener");
+        return 1;
+    }
+
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
     {
-        perror("socket");
+        perror("socket(client)");
         return 1;
     }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)))
+    {
+        perror("connect(loopback)");
+        return 1;
+    }
+    peer = accept(listener, NULL, NULL);
+    if (peer < 0)
+    {
+        perror("accept(loopback)");
+        return 1;
+    }
+
     if (setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, cc, sizeof(cc)))
     {
         perror("setsockopt(TCP_CONGESTION=brutal)");
@@ -101,6 +132,8 @@ int main(int argc, char **argv)
     read_back(fd, "initial", rate, group);
     sleep(hold);
     read_back(fd, "final", rate, group);
+    close(peer);
     close(fd);
+    close(listener);
     return 0;
 }
