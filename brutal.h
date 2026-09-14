@@ -117,6 +117,7 @@ struct brutal_group
 struct brutal_peer
 {
     struct brutal_pacer pacer;
+    spinlock_t lifecycle_lock; // serializes live ref acquisition vs final removal
     struct rhash_head node;
     struct rcu_head rcu;
     struct brutal_peer_key key;
@@ -158,6 +159,7 @@ struct brutal_group *brutal_group_alloc(u64 id, gfp_t gfp);
 void brutal_group_put(struct brutal_group *g);
 void brutal_pacer_get(struct brutal_pacer *p);
 void brutal_pacer_put(struct brutal_pacer *p);
+bool brutal_peer_try_get(struct brutal_peer *peer);
 u64 brutal_pacer_id(struct brutal_pacer *p);
 void brutal_group_join(struct brutal *brutal, struct brutal_pacer *p);
 void brutal_group_leave(struct sock *sk);
