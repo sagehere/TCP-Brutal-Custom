@@ -1,0 +1,17 @@
+{
+  "release_commit": "510f5e25e75f2537a1b802d1ce174b8ed3a1db64",
+  "release_tree": "5075c071bf939773de792053df6795f15073aa5e",
+  "architecture": "aarch64",
+  "kernel": "6.17.0-1020-oracle",
+  "target_mbps": 200,
+  "runs": 5,
+  "seconds_per_run": 60,
+  "streams": 16,
+  "median_bps": 199820192.82901347,
+  "min_bps": 199750402.1558041,
+  "max_bps": 199839483.972197,
+  "worst_target_error_percent": 0.125,
+  "baseline_median_bps": 199787457.0,
+  "throughput_regression": false,
+  "raw_run_json_archived": false
+}

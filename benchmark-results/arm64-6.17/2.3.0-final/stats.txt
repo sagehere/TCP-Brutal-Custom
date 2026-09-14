@@ -1,0 +1,5 @@
+peer_alloc_failures=0
+peer_insert_failures=0
+peer_fallback_connections=0
+active_peer_groups=0
+peak_peer_groups=2
