@@ -1,7 +1,7 @@
 # Optimization coverage and validation
 
-Baseline: `459c220`. Current release candidate: `2.3.0` at master commit
-`510f5e25e75f2537a1b802d1ce174b8ed3a1db64`.
+Baseline: `459c220`. Release `v2.3.0` is tagged at
+`31ee60cd35200acfb78fa4a2334a10e97c2f0e2a`.
 
 The implementation preserves fixed configured rates, same-IP aggregation, and
 independent pacing for different peer addresses. The 2.3 work completes all
@@ -155,7 +155,7 @@ until those environments are actually tested.
 
 ## Release acceptance for 2.3.0
 
-Current status before creating the release tag:
+Final release status:
 
 1. GitHub compile, userspace, and formatting jobs: **PASS**.
 2. Release-scale two-CPU validation including 10,000 peer churn, 80,000
@@ -171,11 +171,13 @@ Current status before creating the release tag:
    **PASS**.
 7. Dedicated CPU-utilization comparison against the saved baseline: **PASS**;
    no CPU regression was measured on the available host/workload.
-8. Git tag / GitHub Release: **PENDING THIS FINAL MERGE**.
+8. Git tag / GitHub Release: **PASS**; `v2.3.0` targets
+   `31ee60cd35200acfb78fa4a2334a10e97c2f0e2a` and the published release is
+   non-draft and non-prerelease.
 
-The code and available-host validation are release-ready. After this evidence
-change is merged and its CI passes, that merge commit is the intended `v2.3.0`
-release/tag target.
+Release `v2.3.0` was published after the evidence merge and its CI passed. The
+tag points to `31ee60cd35200acfb78fa4a2334a10e97c2f0e2a`; later master commits are
+release housekeeping only and do not alter the tagged release tree.
 
 ## Rollback
 
