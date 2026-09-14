@@ -1,0 +1,100 @@
+name: Finalize v2.3.0 housekeeping
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/finalize-v2.3.0.yml
+      - .github/workflows/release-v2.3.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Mark release complete and remove one-shot finalizer
+        env:
+          RELEASE_SHA: 31ee60cd35200acfb78fa4a2334a10e97c2f0e2a
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("docs/optimization-report.md")
+          text = path.read_text()
+          replacements = [
+              (
+                  "Baseline: `459c220`. Current release candidate: `2.3.0` at master commit\n"
+                  "`510f5e25e75f2537a1b802d1ce174b8ed3a1db64`.",
+                  "Baseline: `459c220`. Release `v2.3.0` is tagged at\n"
+                  "`31ee60cd35200acfb78fa4a2334a10e97c2f0e2a`.",
+              ),
+              (
+                  "Current status before creating the release tag:",
+                  "Final release status:",
+              ),
+              (
+                  "8. Git tag / GitHub Release: **PENDING THIS FINAL MERGE**.",
+                  "8. Git tag / GitHub Release: **PASS**; `v2.3.0` targets\n"
+                  "   `31ee60cd35200acfb78fa4a2334a10e97c2f0e2a` and the published release is\n"
+                  "   non-draft and non-prerelease.",
+              ),
+              (
+                  "The code and available-host validation are release-ready. After this evidence\n"
+                  "change is merged and its CI passes, that merge commit is the intended `v2.3.0`\n"
+                  "release/tag target.",
+                  "Release `v2.3.0` was published after the evidence merge and its CI passed. The\n"
+                  "tag points to `31ee60cd35200acfb78fa4a2334a10e97c2f0e2a`; later master commits are\n"
+                  "release housekeeping only and do not alter the tagged release tree.",
+              ),
+          ]
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit(f"expected release-report text not found: {old!r}")
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+
+          git rm .github/workflows/finalize-v2.3.0.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/optimization-report.md
+          git commit -m "release: mark v2.3.0 published"
+          git push origin HEAD:master
+
+      - name: Remove merged and temporary release branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for branch in \
+            release/2.3-final-evidence \
+            release/2.3-final-evidence-sync \
+            release/2.3-final-evidence-work \
+            release/2.3-final-evidence-complete \
+            release/2.3-final-evidence-final \
+            release/2.3-final-evidence-active \
+            release/2.3-final-evidence-ready \
+            release/2.3-final-evidence-working \
+            release/2.3-final-evidence-finalize \
+            release/2.3-final-evidence-completion \
+            release/2.3-final-evidence-done \
+            release/2.3-final-evidence-ready2 \
+            release/2.3-final-evidence-x \
+            release/2.3-final-evidence-y \
+            release/2.3-final-evidence-z \
+            release/create-v2.3.0 \
+            release/v2.3.0-cleanup
+          do
+            encoded=${branch//\//%2F}
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$encoded" >/dev/null 2>&1 || true
+          done
