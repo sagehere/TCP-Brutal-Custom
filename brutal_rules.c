@@ -593,8 +593,8 @@ static const struct proc_ops brutal_rules_proc_ops = {
     .proc_release = single_release,
 };
 
-static struct brutal_group *brutal_peers_next_group(struct brutal_net *bn,
-                                                     u64 after_id)
+static struct brutal_group *
+brutal_peers_next_group(struct brutal_net *bn, u64 after_id)
 {
     struct brutal_rule *r;
     struct brutal_group *g = NULL;
