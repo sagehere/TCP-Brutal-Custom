@@ -124,6 +124,13 @@ struct brutal_peer
     struct net *net;
 };
 
+struct brutal_peer_iter
+{
+    struct rhashtable_iter iter;
+    bool entered;
+    bool started;
+};
+
 struct brutal
 {
     u64 rate;
@@ -178,6 +185,12 @@ void brutal_group_release_fallbacks(struct brutal_group *g);
 void brutal_group_account_sent(struct brutal_group *g, u64 bytes);
 u64 brutal_group_sent(struct brutal_group *g);
 int brutal_group_dump_peers(struct seq_file *m, struct brutal_group *parent);
+int brutal_peer_iter_enter(struct brutal_group *parent,
+                           struct brutal_peer_iter *iter);
+void brutal_peer_iter_start(struct brutal_peer_iter *iter);
+struct brutal_peer *brutal_peer_iter_next(struct brutal_peer_iter *iter);
+void brutal_peer_iter_stop(struct brutal_peer_iter *iter);
+void brutal_peer_iter_exit(struct brutal_peer_iter *iter);
 int brutal_sockopt_init(void);
 void brutal_sockopt_exit(void);
 void brutal_sockopt_install(struct sock *sk);
