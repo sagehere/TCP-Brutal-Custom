@@ -105,7 +105,7 @@ client actively closed every connection and exhausted ephemeral ports/TIME_WAIT.
 The test was corrected to wait for the server active close, and the repeated 80k
 run passed. No module defect was involved.
 
-## Final ARM64 throughput measurement
+## Final ARM64 throughput and CPU measurement
 
 Five 60-second runs with 16 same-IP streams and a 200 Mbps target produced:
 
@@ -118,12 +118,25 @@ The final 2.3.0 candidate median is within normal run-to-run variation of the
 saved baseline. Worst target error was about 0.125%, so no measurable throughput
 regression was observed.
 
-The aggregate release evidence and final counters are stored under
-`benchmark-results/arm64-6.17/2.3.0-final/`.
+The same saved iperf3 JSON records also provide a consistent CPU comparison.
+The benchmark uses reverse mode: the remote/server endpoint is the sender using
+`brutal`, so its CPU utilization is the relevant metric.
 
-The five full raw iperf `run-*.json` files from the final run have not yet been
-copied from the test host. Older `benchmark-results/arm64-6.17/candidate/` files
-must not be presented as the final 2.3.0 run.
+| Metric | `459c220` baseline median | 2.3.0 final median | Relative change |
+| --- | ---: | ---: | ---: |
+| Sender total CPU | 0.5512% | 0.5413% | about -1.8% |
+| Sender system CPU | 0.5374% | 0.5183% | about -3.6% |
+
+These small differences establish no CPU regression on the available host and
+workload. They are not presented as a material CPU-performance improvement.
+
+The aggregate release evidence, final counters, and exact raw benchmark input
+are stored under `benchmark-results/arm64-6.17/2.3.0-final/`. The five final
+`run-*.json` files are preserved losslessly in the `raw/` archive; its decoded
+`tar.xz` SHA-256 is
+`9e3f13fa464dde3b43eb6411c18be4920f167951945a7338676dde9166f92b39`.
+`raw/SHA256SUMS` records hashes for the encoded archive, decoded archive, and
+each individual run.
 
 ## Validation still requiring dedicated environments
 
@@ -142,7 +155,7 @@ until those environments are actually tested.
 
 ## Release acceptance for 2.3.0
 
-Current status:
+Current status before creating the release tag:
 
 1. GitHub compile, userspace, and formatting jobs: **PASS**.
 2. Release-scale two-CPU validation including 10,000 peer churn, 80,000
@@ -154,13 +167,15 @@ Current status:
    well below 1% and no measurable throughput regression.
 5. Aggregate benchmark summary and final proc stats saved with release evidence:
    **PASS**.
-6. Full raw final-run iperf JSON archival: **PENDING**.
-7. Dedicated CPU-utilization comparison against the saved baseline: **PENDING**;
-   no CPU-performance claim should be made until it is measured consistently.
-8. Git tag / GitHub Release: **PENDING**.
+6. Full raw final-run iperf JSON archival with per-file SHA-256 verification:
+   **PASS**.
+7. Dedicated CPU-utilization comparison against the saved baseline: **PASS**;
+   no CPU regression was measured on the available host/workload.
+8. Git tag / GitHub Release: **PENDING THIS FINAL MERGE**.
 
-The code and available-host validation are release-ready. The remaining items
-are release-evidence/archive work, not unresolved structural implementation.
+The code and available-host validation are release-ready. After this evidence
+change is merged and its CI passes, that merge commit is the intended `v2.3.0`
+release/tag target.
 
 ## Rollback
 
