@@ -7,7 +7,8 @@ API="https://api.github.com/repos/$REPO/commits/master"
 TARBALL="https://github.com/$REPO/archive"
 PACKAGE="tcp-brutal-custom"
 CONFIG="/etc/tcp-brutal-custom.conf"
-MANAGER="/usr/local/bin/brutal-manager"
+MANAGER="/usr/local/bin/tbc"
+LEGACY_MANAGER="/usr/local/bin/brutal-manager"
 BRUTALCTL="/usr/local/bin/brutalctl"
 SERVICE="/etc/systemd/system/tcp-brutal-custom.service"
 MODULES_LOAD="/etc/modules-load.d/brutal.conf"
@@ -15,6 +16,7 @@ STATE_DIR="/var/lib/tcp-brutal-custom"
 PENDING_REBOOT="$STATE_DIR/reboot-required"
 CLEANUP_REQUIRED="$STATE_DIR/cleanup-required"
 PEERS_PROC="/proc/net/tcp_brutal/peers"
+MANAGER_VERSION="2.3.1"
 
 IPV4_RATE=80
 IPV6_RATE=80
@@ -30,7 +32,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 read_tty() {
   local prompt=$1 variable=$2
-  [[ -r /dev/tty ]] || die "当前没有可用的交互终端；请直接运行 brutal-manager，或使用子命令。"
+  [[ -r /dev/tty ]] || die "当前没有可用的交互终端；请直接运行 tbc，或使用子命令。"
   printf '%s' "$prompt" >&2
   IFS= read -r "$variable" </dev/tty || die "无法从交互终端读取输入。"
 }
@@ -63,7 +65,7 @@ load_config() {
   [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "配置文件中的地址族模式无效：$CONFIG"
   [[ $MANAGED == 1 ]] || die "配置文件中的管理标记无效：$CONFIG"
   [[ -z $COMMIT || $COMMIT =~ ^[0-9a-f]{40}$ ]] || die "配置文件中的提交号无效：$CONFIG"
-  [[ -z $VERSION || $VERSION =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]] || die "配置文件中的版本号无效：$CONFIG"
+  [[ -z $VERSION ]] || valid_custom_version "$VERSION" || die "配置文件中的版本号无效：$CONFIG"
 }
 
 save_config() {
@@ -83,6 +85,10 @@ EOF
 
 valid_rate() {
   [[ $1 =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] && awk -v r="$1" 'BEGIN { exit !(r >= .5 && r <= 1000000) }'
+}
+
+valid_custom_version() {
+  [[ $1 =~ ^[0-9]+[.][0-9]+[.][0-9]+$ || $1 =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]]
 }
 
 ask_rate() {
@@ -224,15 +230,16 @@ download_source() {
 }
 
 source_version() {
-  local source=$1 sha=$2 version
+  local source=$1 version
   version=$(sed -nE 's/^#define BRUTAL_VERSION_(MAJOR|MINOR|PATCH)[[:space:]]+([0-9]+).*/\2/p' "$source/brutal.h" | paste -sd.)
   [[ $version =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] || die "无法读取模块版本。"
-  printf '%s.custom.%s\n' "$version" "${sha:0:7}"
+  printf '%s\n' "$version"
 }
 
 install_manager() {
   local source=$1
   install -Dm755 "$source/install.sh" "$MANAGER"
+  ln -sfn "$MANAGER" "$LEGACY_MANAGER"
   install -Dm755 "$source/tools/brutalctl" "$BRUTALCTL"
   install -d -m 0755 "$STATE_DIR"
   cp -a "$source/." "$STATE_DIR/source-$VERSION"
@@ -260,12 +267,12 @@ remove_upstream_dkms() {
 remove_custom_dkms() {
   local version
   while IFS= read -r version; do
-    [[ $version =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]] || continue
+    valid_custom_version "$version" || continue
     [[ $version == "$VERSION" ]] && continue
     dkms remove -m "$PACKAGE" -v "$version" --all || return 1
     rm -rf "/usr/src/$PACKAGE-$version" "$STATE_DIR/source-$version"
   done < <(dkms status -m "$PACKAGE" 2>/dev/null | sed -nE "s#^$PACKAGE/([^,]+),.*#\1#p" | sort -u)
-  if [[ $VERSION =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]]; then
+  if valid_custom_version "$VERSION"; then
     dkms remove -m "$PACKAGE" -v "$VERSION" --all || return 1
     rm -rf "/usr/src/$PACKAGE-$VERSION" "$STATE_DIR/source-$VERSION"
   fi
@@ -279,7 +286,7 @@ remove_old_custom_dkms() {
   local keep=$1 version
   while IFS= read -r version; do
     [[ $version == "$keep" ]] && continue
-    [[ $version =~ ^[0-9]+[.][0-9]+[.][0-9]+[.]custom[.][0-9a-f]{7}$ ]] || continue
+    valid_custom_version "$version" || continue
     dkms remove -m "$PACKAGE" -v "$version" --all || return 1
     rm -rf "/usr/src/$PACKAGE-$version" "$STATE_DIR/source-$version"
   done < <(dkms status -m "$PACKAGE" 2>/dev/null | sed -nE "s#^$PACKAGE/([^,]+),.*#\1#p" | sort -u)
@@ -288,7 +295,7 @@ remove_old_custom_dkms() {
 module_matches_installed() {
   local live_version live_src disk_version disk_src target_version
   [[ -r /sys/module/brutal/version && -r /sys/module/brutal/srcversion ]] || return 1
-  [[ $VERSION =~ ^([0-9]+[.][0-9]+[.][0-9]+)[.]custom[.][0-9a-f]{7}$ ]] || return 1
+  [[ $VERSION =~ ^([0-9]+[.][0-9]+[.][0-9]+)([.]custom[.][0-9a-f]{7})?$ ]] || return 1
   target_version=${BASH_REMATCH[1]}
   live_version=$(cat /sys/module/brutal/version 2>/dev/null || true)
   live_src=$(cat /sys/module/brutal/srcversion 2>/dev/null || true)
@@ -310,7 +317,7 @@ retry_pending_cleanup() {
     remove_upstream_dkms || failed=1
   fi
   if (( failed )); then
-    echo "警告: 新模块已生效，但旧 DKMS 清理未完成；稍后执行 brutal-manager apply 可重试。" >&2
+    echo "警告: 新模块已生效，但旧 DKMS 清理未完成；稍后执行 tbc apply 可重试。" >&2
     return 0
   fi
   dkms install -m "$PACKAGE" -v "$VERSION" -k "$(uname -r)" --force >/dev/null 2>&1 || {
@@ -318,7 +325,7 @@ retry_pending_cleanup() {
     return 0
   }
   depmod -a || {
-    echo "警告: DKMS 已清理，但 depmod 失败；稍后执行 brutal-manager apply 可重试。" >&2
+    echo "警告: DKMS 已清理，但 depmod 失败；稍后执行 tbc apply 可重试。" >&2
     return 0
   }
   module_matches_installed || {
@@ -370,7 +377,7 @@ apply_configured_rules() {
     applied=1
   fi
   if (( ! applied )); then
-    echo "错误: 未检测到可用地址族；请设置 brutal-manager rate 的模式为 ipv4、ipv6 或 dual。" >&2
+    echo "错误: 未检测到可用地址族；请设置 tbc rate 的模式为 ipv4、ipv6 或 dual。" >&2
     return 1
   fi
   if ! family_enabled 4 && [[ $(rule_line 0.0.0.0/0) == *"group=perip"* ]]; then
@@ -439,7 +446,7 @@ install_or_update() (
   local old_version=$VERSION old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE old_managed=$MANAGED
   local temp="" sha source has_upstream=0 needs_migration=0 needs_install=0 switch_needed=0 switch_complete=0
   local disk_module_changed=0 artifacts_changed=0
-  local had_config=0 had_manager=0 had_brutalctl=0 had_service=0 had_modules_load=0 was_boot_enabled=0
+  local had_config=0 had_manager=0 had_legacy_manager=0 had_brutalctl=0 had_service=0 had_modules_load=0 was_boot_enabled=0
   local upstream_versions=()
   cleanup_install() {
     local rc=$?
@@ -478,7 +485,8 @@ install_or_update() (
     fi
     if (( artifacts_changed && ! switch_complete )); then
       if (( had_config )); then cp -a "$temp/old-config" "$CONFIG" || echo "警告: 无法恢复原配置文件。" >&2; else rm -f "$CONFIG"; fi
-      if (( had_manager )); then cp -a "$temp/old-manager" "$MANAGER" || echo "警告: 无法恢复原管理器。" >&2; else rm -f "$MANAGER"; fi
+      if (( had_manager )); then rm -f "$MANAGER"; cp -a "$temp/old-manager" "$MANAGER" || echo "警告: 无法恢复原管理器。" >&2; else rm -f "$MANAGER"; fi
+      if (( had_legacy_manager )); then rm -f "$LEGACY_MANAGER"; cp -a "$temp/old-legacy-manager" "$LEGACY_MANAGER" || echo "警告: 无法恢复原兼容入口。" >&2; else rm -f "$LEGACY_MANAGER"; fi
       if (( had_brutalctl )); then cp -a "$temp/old-brutalctl" "$BRUTALCTL" || echo "警告: 无法恢复原 brutalctl。" >&2; else rm -f "$BRUTALCTL"; fi
       if (( had_service )); then cp -a "$temp/old-service" "$SERVICE" || echo "警告: 无法恢复原 systemd 服务。" >&2; else rm -f "$SERVICE"; fi
       if (( had_modules_load )); then cp -a "$temp/old-modules-load" "$MODULES_LOAD" || echo "警告: 无法恢复原模块自动加载配置。" >&2; else rm -f "$MODULES_LOAD"; fi
@@ -506,6 +514,7 @@ install_or_update() (
   temp=$(mktemp -d)
   if [[ -f $CONFIG ]]; then cp -a "$CONFIG" "$temp/old-config"; had_config=1; fi
   if [[ -f $MANAGER ]]; then cp -a "$MANAGER" "$temp/old-manager"; had_manager=1; fi
+  if [[ -e $LEGACY_MANAGER || -L $LEGACY_MANAGER ]]; then cp -a "$LEGACY_MANAGER" "$temp/old-legacy-manager"; had_legacy_manager=1; fi
   if [[ -f $BRUTALCTL ]]; then cp -a "$BRUTALCTL" "$temp/old-brutalctl"; had_brutalctl=1; fi
   if [[ -f $SERVICE ]]; then cp -a "$SERVICE" "$temp/old-service"; had_service=1; fi
   if [[ -f $MODULES_LOAD ]]; then cp -a "$MODULES_LOAD" "$temp/old-modules-load"; had_modules_load=1; fi
@@ -514,13 +523,14 @@ install_or_update() (
   source="$temp/source"
   VERSION=$(source_version "$source" "$sha")
   if custom_version_installed "$VERSION"; then
-    note "当前提交已安装：${sha:0:7}"
+    note "当前版本已安装：$VERSION"
+    [[ $old_version == "$VERSION" ]] || COMMIT=""
   else
     build_dkms "$source"
     needs_install=1
+    COMMIT=$sha
   fi
   make -C "$source/tools"
-  COMMIT=$sha
   if (( ! old_managed )); then
     MODE=auto
     IPV4_RATE=$(ask_rate IPv4 "$IPV4_RATE")
@@ -629,7 +639,7 @@ view() {
         sleep 2
       done
       ;;
-    *) die "用法: brutal-manager view [--watch]" ;;
+    *) die "用法: tbc view [--watch]" ;;
   esac
 }
 
@@ -660,7 +670,7 @@ uninstall() (
   rm -f "$SERVICE" "$MODULES_LOAD" "$BRUTALCTL"
   rm -rf "$STATE_DIR" "$CONFIG"
   systemctl daemon-reload
-  rm -f "$MANAGER"
+  rm -f "$MANAGER" "$LEGACY_MANAGER"
   complete=1
   note "卸载完成。系统编译依赖和上游 TCP Brutal 安装未删除。"
 )
@@ -678,9 +688,9 @@ run_menu_action() {
 
 menu() {
   while :; do
-    cat <<'EOF'
+    cat <<EOF
 
-TCP Brutal Custom 管理器
+TCP Brutal Custom 管理器 v$MANAGER_VERSION
 1. 安装 / 更新
 2. 设置 IPv4 / IPv6 速率
 3. 开启开机启动

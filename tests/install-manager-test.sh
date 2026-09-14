@@ -33,6 +33,18 @@ export BRUTAL_MANAGER_LIB=1
 source "$repo/install.sh"
 
 ! grep -Eqi 'x-ui|xray|3x-ui|vless|xhttp' "$repo/install.sh"
+[[ $MANAGER_VERSION == 2.3.1 ]]
+[[ $(source_version "$repo" ignored) == 2.3.1 ]]
+header_version=$(sed -nE 's/^#define BRUTAL_VERSION_(MAJOR|MINOR|PATCH)[[:space:]]+([0-9]+).*/\2/p' "$repo/brutal.h" | paste -sd.)
+[[ $header_version == "$MANAGER_VERSION" ]]
+
+dkms_version=$("$repo/scripts/mkdkmsconf.sh" | sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p')
+[[ $dkms_version == 2.3.1 ]]
+mkdir -p "$tmp/no-git/scripts"
+cp "$repo/brutal.h" "$tmp/no-git/brutal.h"
+cp "$repo/scripts/mkdkmsconf.sh" "$tmp/no-git/scripts/mkdkmsconf.sh"
+[[ $(cd "$tmp/no-git" && ./scripts/mkdkmsconf.sh | sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p') == 2.3.1 ]]
+! (cd "$repo" && PACKAGE_VERSION=2.3.1.custom.abcdef0 ./scripts/mkdkmsconf.sh >/dev/null 2>&1)
 
 (
   need_root() { return 0; }
@@ -66,7 +78,7 @@ read_tty() { printf -v "$2" n; }
 ! confirm "cancel"
 read_tty() { printf -v "$2" 0; }
 menu_output=$(menu)
-grep -q 'TCP Brutal Custom 管理器' <<<"$menu_output"
+grep -q 'TCP Brutal Custom 管理器 v2.3.1' <<<"$menu_output"
 
 (
   have() { return 0; }
@@ -138,6 +150,11 @@ EOF
 load_config
 [[ $IPV4_RATE == 120 && $IPV6_RATE == 60 && $MODE == dual && $MANAGED == 1 ]]
 
+sed 's/^VERSION=.*/VERSION=2.3.1/' "$CONFIG" >"$tmp/current-config"
+CONFIG="$tmp/current-config"
+load_config
+[[ $VERSION == 2.3.1 ]]
+
 cat >"$tmp/bad-config" <<'EOF'
 IPV4_RATE=fast
 IPV6_RATE=60
@@ -147,6 +164,10 @@ VERSION=
 MANAGED=1
 EOF
 CONFIG="$tmp/bad-config"
+! (load_config)
+
+sed 's/^VERSION=.*/VERSION=41a9ce9/' "$tmp/current-config" >"$tmp/bad-version-config"
+CONFIG="$tmp/bad-version-config"
 ! (load_config)
 
 commands=()
@@ -173,7 +194,8 @@ dkms() {
   if [[ $1 == status ]]; then
     printf '%s\n' \
       'tcp-brutal-custom/2.1.0.custom.1111111, 6.1.0, x86_64: installed' \
-      'tcp-brutal-custom/2.1.0.custom.2222222, 6.1.0, x86_64: installed'
+      'tcp-brutal-custom/2.1.0.custom.2222222, 6.1.0, x86_64: installed' \
+      'tcp-brutal-custom/2.3.1, 6.1.0, x86_64: installed'
   else
     dkms_calls+=("$*")
   fi
@@ -186,14 +208,15 @@ PENDING_REBOOT="$STATE_DIR/reboot-required"
 VERSION=2.1.0.custom.2222222
 remove_custom_dkms
 [[ ${dkms_calls[0]} == 'remove -m tcp-brutal-custom -v 2.1.0.custom.1111111 --all' ]]
-[[ ${dkms_calls[1]} == 'remove -m tcp-brutal-custom -v 2.1.0.custom.2222222 --all' ]]
+[[ ${dkms_calls[1]} == 'remove -m tcp-brutal-custom -v 2.3.1 --all' ]]
+[[ ${dkms_calls[2]} == 'remove -m tcp-brutal-custom -v 2.1.0.custom.2222222 --all' ]]
 unset -f rm dkms
 
 (
   STATE_DIR="$tmp/finalize-state"
   PENDING_REBOOT="$STATE_DIR/reboot-required"
   CLEANUP_REQUIRED="$STATE_DIR/cleanup-required"
-  VERSION=2.3.0.custom.2222222
+  VERSION=2.3.1
   finalize_log="$tmp/finalize.log"
   MATCH_OK=1
   CLEAN_FAIL=0
@@ -231,15 +254,61 @@ unset -f rm dkms
   [[ ! -e $CLEANUP_REQUIRED ]]
 )
 
+(
+  source="$tmp/manager-source"
+  MANAGER="$tmp/manager-install/tbc"
+  LEGACY_MANAGER="$tmp/manager-install/brutal-manager"
+  BRUTALCTL="$tmp/manager-install/brutalctl"
+  STATE_DIR="$tmp/manager-state"
+  VERSION=2.3.1
+  mkdir -p "$source/tools"
+  cp "$repo/install.sh" "$source/install.sh"
+  printf '#!/usr/bin/env bash\n' >"$source/tools/brutalctl"
+  chmod +x "$source/tools/brutalctl"
+  install_manager "$source"
+  [[ -x $MANAGER && -x $BRUTALCTL && -e $LEGACY_MANAGER ]]
+  cmp "$MANAGER" "$LEGACY_MANAGER"
+  [[ ! -L $LEGACY_MANAGER ]] || [[ $(readlink "$LEGACY_MANAGER") == "$MANAGER" ]]
+  SERVICE="$tmp/manager-install/service"
+  systemctl() { return 0; }
+  write_service
+  grep -qx "ExecStart=$MANAGER apply" "$SERVICE"
+)
+
+(
+  root="$tmp/uninstall"
+  MANAGER="$root/tbc"
+  LEGACY_MANAGER="$root/brutal-manager"
+  BRUTALCTL="$root/brutalctl"
+  SERVICE="$root/tcp-brutal-custom.service"
+  MODULES_LOAD="$root/modules-load.conf"
+  STATE_DIR="$root/state"
+  CONFIG="$root/config"
+  mkdir -p "$STATE_DIR"
+  touch "$MANAGER" "$LEGACY_MANAGER" "$BRUTALCTL" "$SERVICE" "$MODULES_LOAD" "$CONFIG"
+  need_root() { return 0; }
+  load_config() { MANAGED=1; VERSION=2.3.1; }
+  confirm() { return 0; }
+  module_loaded() { return 1; }
+  remove_custom_dkms() { return 0; }
+  disable_boot() { return 0; }
+  systemctl() { return 0; }
+  uninstall
+  [[ ! -e $MANAGER && ! -e $LEGACY_MANAGER && ! -e $BRUTALCTL && ! -e $SERVICE && ! -e $MODULES_LOAD && ! -e $STATE_DIR && ! -e $CONFIG ]]
+)
+
 failure_log="$tmp/install-failure.log"
 CONFIG="$tmp/live-config"
-MANAGER="$tmp/brutal-manager"
+MANAGER="$tmp/tbc"
+LEGACY_MANAGER="$tmp/brutal-manager"
 BRUTALCTL="$tmp/brutalctl"
 SERVICE="$tmp/tcp-brutal-custom.service"
 MODULES_LOAD="$tmp/modules-load.conf"
 STATE_DIR="$tmp/state"
 PENDING_REBOOT="$STATE_DIR/reboot-required"
 PEERS_PROC="$tmp/peers-proc"
+printf 'old tbc\n' >"$MANAGER"
+printf 'old brutal-manager\n' >"$LEGACY_MANAGER"
 load_config() {
   IPV4_RATE=80; IPV6_RATE=80; MODE=auto
   COMMIT=1111111111111111111111111111111111111111
@@ -257,7 +326,7 @@ download_source() {
   mkdir -p "$1/source"
   echo 2222222222222222222222222222222222222222
 }
-source_version() { echo 2.1.0.custom.2222222; }
+source_version() { echo 2.3.1; }
 custom_version_installed() { [[ $1 == 2.1.0.custom.1111111 ]]; }
 dkms() {
   if [[ $1 == status && ${UPSTREAM_PRESENT:-0} == 1 ]]; then
@@ -282,7 +351,10 @@ mark_pending_reboot() {
 module_supports_peers() { [[ ${SUPPORTS_PEERS:-1} == 1 ]]; }
 finalize_pending_update() { rm -f "$PENDING_REBOOT"; return 0; }
 remove_old_custom_dkms() { return 0; }
-save_config() { echo save >>"$failure_log"; }
+save_config() {
+  echo save >>"$failure_log"
+  printf '%s\n' "$COMMIT" >"$tmp/saved-commit"
+}
 build_dkms() { echo build >>"$failure_log"; return "${BUILD_FAILURE:-0}"; }
 apply_configured_rules() { echo apply >>"$failure_log"; return "${APPLY_FAILURE:-0}"; }
 
@@ -318,6 +390,8 @@ grep -q '^enable-deferred$' "$failure_log"
 grep -q '^dkms install -m tcp-brutal-custom -v 2.1.0.custom.1111111 .* --force$' "$failure_log"
 ! grep -q '^mark-pending$' "$failure_log"
 [[ ! -e $PENDING_REBOOT ]]
+grep -qx 'old tbc' "$MANAGER"
+grep -qx 'old brutal-manager' "$LEGACY_MANAGER"
 
 : >"$failure_log"
 DEFER_FAILURE=0
@@ -327,9 +401,9 @@ rc=$?
 set -e
 [[ $rc == 0 ]]
 [[ $(grep -c '^rmmod$' "$failure_log") == 1 ]]
-[[ $(grep -E '^(build|dkms install|install-manager|write-service|rmmod|save|mark-pending|enable-deferred)' "$failure_log" | paste -sd' ') == 'build dkms install -m tcp-brutal-custom -v 2.1.0.custom.2222222 install-manager write-service rmmod save enable-deferred mark-pending' ]]
-[[ $(cat "$PENDING_REBOOT") == 2.1.0.custom.2222222 ]]
-grep -q '^dkms install -m tcp-brutal-custom -v 2.1.0.custom.2222222$' "$failure_log"
+[[ $(grep -E '^(build|dkms install|install-manager|write-service|rmmod|save|mark-pending|enable-deferred)' "$failure_log" | paste -sd' ') == 'build dkms install -m tcp-brutal-custom -v 2.3.1 install-manager write-service rmmod save enable-deferred mark-pending' ]]
+[[ $(cat "$PENDING_REBOOT") == 2.3.1 ]]
+grep -q '^dkms install -m tcp-brutal-custom -v 2.3.1$' "$failure_log"
 ! grep -q '^apply$' "$failure_log"
 ! grep -q '^enable$' "$failure_log"
 
@@ -369,11 +443,19 @@ grep -q '^rmmod$' "$failure_log"
 
 : >"$failure_log"
 ENABLE_FAILURE=0
+source_version() { echo 2.3.1; }
+custom_version_installed() { [[ $1 == 2.3.1 ]]; }
+install_or_update
+[[ -f $tmp/saved-commit && -z $(cat "$tmp/saved-commit") ]]
+
+: >"$failure_log"
 source_version() { echo 2.1.0.custom.1111111; }
+custom_version_installed() { [[ $1 == 2.1.0.custom.1111111 ]]; }
 install_or_update
 ! grep -q '^build$' "$failure_log"
 ! grep -q '^rmmod$' "$failure_log"
 grep -q '^save$' "$failure_log"
+grep -qx '1111111111111111111111111111111111111111' "$tmp/saved-commit"
 
 mkdir -p "$STATE_DIR"
 printf '%s\n' 2.1.0.custom.2222222 >"$PENDING_REBOOT"

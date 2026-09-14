@@ -55,8 +55,8 @@ sudo brutalctl add ::/0 80 noroute perip
 brutalctl list
 brutalctl peers
 brutalctl peers --family 4 --limit 1000
-sudo brutal-manager view
-sudo brutal-manager view --watch
+sudo tbc view
+sudo tbc view --watch
 ```
 
 `view --watch` 每两秒刷新一次，按 Ctrl+C 退出。IP 行只在对应 `perip` 连接存活期间显示。
@@ -135,18 +135,20 @@ sudo -E bash install.sh
 安装后使用交互菜单：
 
 ```bash
-sudo brutal-manager
+sudo tbc
 ```
+
+旧命令 `sudo brutal-manager` 保留为兼容入口。
 
 也可以直接执行：
 
 ```bash
-sudo brutal-manager install
-sudo brutal-manager rate
-sudo brutal-manager enable
-sudo brutal-manager disable
-sudo brutal-manager status
-sudo brutal-manager uninstall
+sudo tbc install
+sudo tbc rate
+sudo tbc enable
+sudo tbc disable
+sudo tbc status
+sudo tbc uninstall
 ```
 
 安装和改速时可分别设置 IPv4、IPv6 的每 IP 速率，并选择 `auto`、`ipv4`、`ipv6` 或 `dual` 地址族模式。`auto` 只会为同时具备全局地址和默认路由的地址族应用规则；暂时不可用的地址族会保留配置，待下次可用时由 systemd 服务恢复。

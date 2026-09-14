@@ -8,7 +8,9 @@
 
   outputs = { self, nixpkgs, flake-utils }:
     let
-      version = self.shortRev or self.dirtyShortRev or "unknown";
+      headerLines = builtins.filter builtins.isString (builtins.split "\n" (builtins.readFile ./brutal.h));
+      versionLines = builtins.filter (line: builtins.match "#define BRUTAL_VERSION_(MAJOR|MINOR|PATCH) +[0-9]+.*" line != null) headerLines;
+      version = builtins.concatStringsSep "." (map (line: builtins.elemAt (builtins.match "#define BRUTAL_VERSION_(MAJOR|MINOR|PATCH) +([0-9]+).*" line) 1) versionLines);
       mkTcpBrutal = pkgs: kernel: pkgs.stdenv.mkDerivation {
         pname = "tcp-brutal";
         inherit version;
