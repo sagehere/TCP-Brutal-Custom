@@ -3,9 +3,7 @@
 // Every connection to a rule's prefix joins the rule's group, without
 // application support. The route must select brutal for the prefix
 // ("ip route ... congctl lock brutal"); brutalctl in tools/ does both.
-#include <linux/hashtable.h>
 #include <linux/inet.h>
-#include <linux/jhash.h>
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/rculist.h>
@@ -24,7 +22,8 @@ struct brutal_rule
     struct list_head list;
     struct list_head prefix_node;
     struct list_head free_list;
-    struct hlist_node exact_node;
+    struct rhash_head exact_node;
+    struct brutal_peer_key exact_key;
     u8 family;
     u8 plen;
     union
@@ -41,8 +40,7 @@ struct brutal_net
     struct list_head rules;
     struct list_head prefix_rules;
     struct mutex rules_mutex;
-    DECLARE_HASHTABLE(exact_v4, 8);
-    DECLARE_HASHTABLE(exact_v6, 8);
+    struct rhashtable exact_hosts;
     struct rhashtable app_groups;
     u32 rule_next_id;
     atomic64_t peer_alloc_failures;
@@ -52,6 +50,25 @@ struct brutal_net
     atomic_t peak_peers;
     struct brutal_rule __rcu *default_v4;
     struct brutal_rule __rcu *default_v6;
+};
+
+struct brutal_peers_seq
+{
+    struct net *net;
+    struct brutal_group *group;
+    struct rhashtable_iter iter;
+    struct brutal_peer *peer;
+    u64 rule_id;
+    loff_t index;
+    bool iter_entered;
+    bool iter_started;
+};
+
+static const struct rhashtable_params brutal_exact_params = {
+    .head_offset = offsetof(struct brutal_rule, exact_node),
+    .key_offset = offsetof(struct brutal_rule, exact_key),
+    .key_len = sizeof(struct brutal_peer_key),
+    .automatic_shrinking = true,
 };
 
 static const struct rhashtable_params brutal_app_params = {
@@ -171,32 +188,41 @@ static bool brutal_rule_match(const struct brutal_rule *r, const struct sock *sk
              (r->plen ? htonl(~0u << (32 - r->plen)) : 0));
 }
 
-static struct brutal_rule *brutal_exact_lookup(struct brutal_net *bn,
-                                               const struct sock *sk)
+static void brutal_sock_exact_key(const struct sock *sk,
+                                  struct brutal_peer_key *key)
 {
-    struct brutal_rule *r;
-
+    memset(key, 0, sizeof(*key));
 #if IS_ENABLED(CONFIG_IPV6)
     if (sk->sk_family == AF_INET6 && !ipv6_addr_v4mapped(&sk->sk_v6_daddr))
     {
-        u32 key = jhash(sk->sk_v6_daddr.s6_addr,
-                        sizeof(sk->sk_v6_daddr.s6_addr), 0);
-
-        hash_for_each_possible_rcu(bn->exact_v6, r, exact_node, key)
-        {
-            if (ipv6_addr_equal(&r->v6, &sk->sk_v6_daddr))
-                return r;
-        }
-        return NULL;
+        key->family = AF_INET6;
+        key->v6 = sk->sk_v6_daddr;
+        return;
     }
 #endif
-    hash_for_each_possible_rcu(bn->exact_v4, r, exact_node,
-                               (__force u32)sk->sk_daddr)
-    {
-        if (r->v4 == sk->sk_daddr)
-            return r;
-    }
-    return NULL;
+    key->family = AF_INET;
+    key->v4 = sk->sk_daddr;
+}
+
+static void brutal_rule_exact_key(const struct brutal_rule *r,
+                                  struct brutal_peer_key *key)
+{
+    memset(key, 0, sizeof(*key));
+    key->family = r->family;
+    if (r->family == AF_INET)
+        key->v4 = r->v4;
+    else
+        key->v6 = r->v6;
+}
+
+static struct brutal_rule *brutal_exact_lookup(struct brutal_net *bn,
+                                               const struct sock *sk)
+{
+    struct brutal_peer_key key;
+
+    brutal_sock_exact_key(sk, &key);
+    return rhashtable_lookup_fast(&bn->exact_hosts, &key,
+                                  brutal_exact_params);
 }
 
 void brutal_apply_rule(struct sock *sk, struct brutal *brutal)
@@ -279,12 +305,35 @@ static int brutal_parse_prefix(char *s, struct brutal_rule *r)
     return -EINVAL;
 }
 
+static bool brutal_rule_is_exact(const struct brutal_rule *r)
+{
+    return r->plen == (r->family == AF_INET ? 32 : 128);
+}
+
 static struct brutal_rule *brutal_rule_find(struct brutal_net *bn,
                                             const struct brutal_rule *key)
 {
-    struct brutal_rule *r;
+    struct brutal_rule *r = NULL;
 
-    list_for_each_entry(r, &bn->rules, list)
+    if (!key->plen)
+    {
+        return rcu_dereference_protected(
+            key->family == AF_INET ? bn->default_v4 : bn->default_v6,
+            lockdep_is_held(&bn->rules_mutex));
+    }
+    if (brutal_rule_is_exact(key))
+    {
+        struct brutal_peer_key exact_key;
+
+        brutal_rule_exact_key(key, &exact_key);
+        rcu_read_lock();
+        r = rhashtable_lookup_fast(&bn->exact_hosts, &exact_key,
+                                   brutal_exact_params);
+        rcu_read_unlock();
+        return r;
+    }
+
+    list_for_each_entry(r, &bn->prefix_rules, prefix_node)
     {
         if (r->family == key->family && r->plen == key->plen &&
             (r->family == AF_INET ? r->v4 == key->v4
@@ -294,12 +343,7 @@ static struct brutal_rule *brutal_rule_find(struct brutal_net *bn,
     return NULL;
 }
 
-static bool brutal_rule_is_exact(const struct brutal_rule *r)
-{
-    return r->plen == (r->family == AF_INET ? 32 : 128);
-}
-
-static void brutal_rule_index_add(struct brutal_net *bn, struct brutal_rule *r)
+static int brutal_rule_index_add(struct brutal_net *bn, struct brutal_rule *r)
 {
     if (!r->plen)
     {
@@ -307,17 +351,17 @@ static void brutal_rule_index_add(struct brutal_net *bn, struct brutal_rule *r)
             rcu_assign_pointer(bn->default_v4, r);
         else
             rcu_assign_pointer(bn->default_v6, r);
+        return 0;
     }
-    else if (brutal_rule_is_exact(r))
+    if (brutal_rule_is_exact(r))
     {
-        if (r->family == AF_INET)
-            hash_add_rcu(bn->exact_v4, &r->exact_node, (__force u32)r->v4);
-        else
-            hash_add_rcu(bn->exact_v6, &r->exact_node,
-                         jhash(r->v6.s6_addr, sizeof(r->v6.s6_addr), 0));
+        brutal_rule_exact_key(r, &r->exact_key);
+        return rhashtable_insert_fast(&bn->exact_hosts, &r->exact_node,
+                                      brutal_exact_params);
     }
-    else
-        list_add_tail_rcu(&r->prefix_node, &bn->prefix_rules);
+
+    list_add_tail_rcu(&r->prefix_node, &bn->prefix_rules);
+    return 0;
 }
 
 static void brutal_rule_index_del(struct brutal_net *bn, struct brutal_rule *r)
@@ -330,7 +374,8 @@ static void brutal_rule_index_del(struct brutal_net *bn, struct brutal_rule *r)
             RCU_INIT_POINTER(bn->default_v6, NULL);
     }
     else if (brutal_rule_is_exact(r))
-        hash_del_rcu(&r->exact_node);
+        rhashtable_remove_fast(&bn->exact_hosts, &r->exact_node,
+                               brutal_exact_params);
     else
         list_del_rcu(&r->prefix_node);
 }
@@ -406,8 +451,16 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         INIT_LIST_HEAD(&r->prefix_node);
         INIT_LIST_HEAD(&r->free_list);
         brutal_group_set_config(&g->pacer, rate, gain, lock);
+        ret = brutal_rule_index_add(bn, r);
+        if (ret)
+        {
+            brutal_group_release_fallbacks(g);
+            brutal_group_put(g);
+            mutex_unlock(&bn->rules_mutex);
+            kfree(r);
+            return ret;
+        }
         list_add_tail_rcu(&r->list, &bn->rules);
-        brutal_rule_index_add(bn, r);
         created = true;
     }
     else if (r->perip != perip)
@@ -540,31 +593,233 @@ static const struct proc_ops brutal_rules_proc_ops = {
     .proc_release = single_release,
 };
 
-static int brutal_peers_show(struct seq_file *m, void *v)
+static struct brutal_group *brutal_peers_next_group(struct brutal_net *bn,
+                                                     u64 after_id)
 {
-    struct brutal_net *bn = brutal_pernet(m->private);
     struct brutal_rule *r;
+    struct brutal_group *g = NULL;
 
     rcu_read_lock();
     list_for_each_entry_rcu(r, &bn->rules, list)
     {
-        if (r->perip)
-            brutal_group_dump_peers(m, r->group);
+        if (!r->perip || r->group->id <= after_id)
+            continue;
+        brutal_pacer_get(&r->group->pacer);
+        g = r->group;
+        break;
     }
     rcu_read_unlock();
+    return g;
+}
+
+static void brutal_peers_pause(struct brutal_peers_seq *ctx)
+{
+    if (ctx->iter_started)
+    {
+        rhashtable_walk_stop(&ctx->iter);
+        ctx->iter_started = false;
+    }
+}
+
+static void brutal_peers_close_group(struct brutal_peers_seq *ctx)
+{
+    brutal_peers_pause(ctx);
+    if (ctx->iter_entered)
+    {
+        rhashtable_walk_exit(&ctx->iter);
+        ctx->iter_entered = false;
+    }
+    if (ctx->group)
+    {
+        brutal_group_put(ctx->group);
+        ctx->group = NULL;
+    }
+}
+
+static void brutal_peers_reset(struct brutal_peers_seq *ctx)
+{
+    if (ctx->peer)
+    {
+        brutal_pacer_put(&ctx->peer->pacer);
+        ctx->peer = NULL;
+    }
+    brutal_peers_close_group(ctx);
+    ctx->rule_id = 0;
+    ctx->index = -1;
+}
+
+static bool brutal_peers_open_group(struct brutal_peers_seq *ctx)
+{
+    struct brutal_net *bn = brutal_pernet(ctx->net);
+    struct brutal_rule_stats *stats;
+
+    for (;;)
+    {
+        ctx->group = brutal_peers_next_group(bn, ctx->rule_id);
+        if (!ctx->group)
+            return false;
+        ctx->rule_id = ctx->group->id;
+        stats = READ_ONCE(ctx->group->rule_stats);
+        if (stats && stats->peers_initialized)
+            break;
+        brutal_group_put(ctx->group);
+        ctx->group = NULL;
+    }
+
+    rhashtable_walk_enter(&stats->peers, &ctx->iter);
+    ctx->iter_entered = true;
+    rhashtable_walk_start(&ctx->iter);
+    ctx->iter_started = true;
+    return true;
+}
+
+static void brutal_peers_resume(struct brutal_peers_seq *ctx)
+{
+    if (ctx->iter_entered && !ctx->iter_started)
+    {
+        rhashtable_walk_start(&ctx->iter);
+        ctx->iter_started = true;
+    }
+}
+
+static struct brutal_peer *brutal_peers_advance(struct brutal_peers_seq *ctx)
+{
+    struct brutal_peer *peer;
+
+    if (ctx->peer)
+    {
+        brutal_pacer_put(&ctx->peer->pacer);
+        ctx->peer = NULL;
+    }
+
+    for (;;)
+    {
+        if (!ctx->group && !brutal_peers_open_group(ctx))
+            return NULL;
+        brutal_peers_resume(ctx);
+
+        peer = rhashtable_walk_next(&ctx->iter);
+        if (IS_ERR(peer))
+        {
+            if (PTR_ERR(peer) == -EAGAIN)
+                continue;
+            brutal_peers_close_group(ctx);
+            continue;
+        }
+        if (!peer)
+        {
+            brutal_peers_close_group(ctx);
+            continue;
+        }
+        if (!brutal_peer_try_get(peer))
+            continue;
+        if (!atomic_read(&peer->pacer.members))
+        {
+            brutal_pacer_put(&peer->pacer);
+            continue;
+        }
+
+        ctx->peer = peer;
+        ctx->index++;
+        return peer;
+    }
+}
+
+static void *brutal_peers_seq_start(struct seq_file *m, loff_t *pos)
+{
+    struct brutal_peers_seq *ctx = m->private;
+
+    if (*pos < 0)
+        return NULL;
+    if (ctx->peer && ctx->index == *pos)
+    {
+        brutal_peers_resume(ctx);
+        return ctx->peer;
+    }
+    if (*pos <= ctx->index)
+        brutal_peers_reset(ctx);
+
+    while (ctx->index < *pos)
+    {
+        if (!brutal_peers_advance(ctx))
+            return NULL;
+    }
+    brutal_peers_resume(ctx);
+    return ctx->peer;
+}
+
+static void *brutal_peers_seq_next(struct seq_file *m, void *v, loff_t *pos)
+{
+    struct brutal_peers_seq *ctx = m->private;
+
+    ++*pos;
+    return brutal_peers_advance(ctx);
+}
+
+static void brutal_peers_seq_stop(struct seq_file *m, void *v)
+{
+    struct brutal_peers_seq *ctx = m->private;
+
+    brutal_peers_pause(ctx);
+}
+
+static int brutal_peers_seq_show(struct seq_file *m, void *v)
+{
+    struct brutal_peers_seq *ctx = m->private;
+    struct brutal_peer *peer = v;
+    u64 rate;
+    u32 gain;
+
+    brutal_group_get_config(&peer->pacer, &rate, &gain, NULL, NULL);
+    if (peer->key.family == AF_INET)
+        seq_printf(m, "ip=%pI4 family=4", &peer->key.v4);
+    else
+        seq_printf(m, "ip=%pI6c family=6", &peer->key.v6);
+    seq_printf(m, " rule=%llu rate=%llu gain=%u members=%u sent=%llu\n",
+               ctx->group->id, rate, gain,
+               atomic_read(&peer->pacer.members),
+               atomic64_read(&peer->pacer.sent_bytes));
     return 0;
 }
 
+static const struct seq_operations brutal_peers_seq_ops = {
+    .start = brutal_peers_seq_start,
+    .next = brutal_peers_seq_next,
+    .stop = brutal_peers_seq_stop,
+    .show = brutal_peers_seq_show,
+};
+
 static int brutal_peers_open(struct inode *inode, struct file *file)
 {
-    return single_open(file, brutal_peers_show, pde_data(inode));
+    struct seq_file *m;
+    struct brutal_peers_seq *ctx;
+    int ret;
+
+    ret = seq_open_private(file, &brutal_peers_seq_ops, sizeof(*ctx));
+    if (ret)
+        return ret;
+    m = file->private_data;
+    ctx = m->private;
+    ctx->net = get_net(pde_data(inode));
+    ctx->index = -1;
+    return 0;
+}
+
+static int brutal_peers_release(struct inode *inode, struct file *file)
+{
+    struct seq_file *m = file->private_data;
+    struct brutal_peers_seq *ctx = m->private;
+
+    brutal_peers_reset(ctx);
+    put_net(ctx->net);
+    return seq_release_private(inode, file);
 }
 
 static const struct proc_ops brutal_peers_proc_ops = {
     .proc_open = brutal_peers_open,
     .proc_read = seq_read,
     .proc_lseek = seq_lseek,
-    .proc_release = single_release,
+    .proc_release = brutal_peers_release,
 };
 
 static int brutal_stats_show(struct seq_file *m, void *v)
@@ -591,17 +846,21 @@ static int __net_init brutal_net_init(struct net *net)
     INIT_LIST_HEAD(&bn->rules);
     INIT_LIST_HEAD(&bn->prefix_rules);
     mutex_init(&bn->rules_mutex);
-    hash_init(bn->exact_v4);
-    hash_init(bn->exact_v6);
     atomic64_set(&bn->peer_alloc_failures, 0);
     atomic64_set(&bn->peer_insert_failures, 0);
     atomic64_set(&bn->peer_fallback_connections, 0);
     atomic_set(&bn->active_peers, 0);
     atomic_set(&bn->peak_peers, 0);
 
-    ret = rhashtable_init(&bn->app_groups, &brutal_app_params);
+    ret = rhashtable_init(&bn->exact_hosts, &brutal_exact_params);
     if (ret)
         return ret;
+    ret = rhashtable_init(&bn->app_groups, &brutal_app_params);
+    if (ret)
+    {
+        rhashtable_destroy(&bn->exact_hosts);
+        return ret;
+    }
 
     dir = proc_net_mkdir(net, "tcp_brutal", net->proc_net);
     if (!dir ||
@@ -611,6 +870,7 @@ static int __net_init brutal_net_init(struct net *net)
     {
         remove_proc_subtree("tcp_brutal", net->proc_net);
         rhashtable_destroy(&bn->app_groups);
+        rhashtable_destroy(&bn->exact_hosts);
         return -ENOMEM;
     }
     return 0;
@@ -623,6 +883,7 @@ static void __net_exit brutal_net_exit(struct net *net)
     brutal_rules_flush(bn);
     remove_proc_subtree("tcp_brutal", net->proc_net);
     rhashtable_destroy(&bn->app_groups);
+    rhashtable_destroy(&bn->exact_hosts);
 }
 
 static struct pernet_operations brutal_net_ops = {
