@@ -18,15 +18,6 @@ static struct kmem_cache *brutal_peer_cache;
 static mempool_t *brutal_peer_pool;
 static struct workqueue_struct *brutal_free_wq;
 
-struct brutal_rule_stats
-{
-    struct percpu_counter sent_bytes;
-    struct rhashtable peers;
-    struct work_struct destroy_work;
-    struct brutal_group *group;
-    bool peers_initialized;
-};
-
 static const struct rhashtable_params brutal_perip_params = {
     .head_offset = offsetof(struct brutal_peer, node),
     .key_offset = offsetof(struct brutal_peer, key),
@@ -80,6 +71,7 @@ static struct brutal_peer *brutal_peer_alloc(void)
         return NULL;
     memset(peer, 0, sizeof(*peer));
     brutal_pacer_init(&peer->pacer, BRUTAL_PACER_PEER, NULL);
+    spin_lock_init(&peer->lifecycle_lock);
     return peer;
 }
 
@@ -96,6 +88,16 @@ static struct brutal_rule_stats *brutal_group_rule_stats(struct brutal_group *g)
 void brutal_pacer_get(struct brutal_pacer *p)
 {
     refcount_inc(&p->refcnt);
+}
+
+bool brutal_peer_try_get(struct brutal_peer *peer)
+{
+    bool ok;
+
+    spin_lock_bh(&peer->lifecycle_lock);
+    ok = refcount_inc_not_zero(&peer->pacer.refcnt);
+    spin_unlock_bh(&peer->lifecycle_lock);
+    return ok;
 }
 
 u64 brutal_pacer_id(struct brutal_pacer *p)
@@ -343,7 +345,7 @@ struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group
     brutal_perip_key(sk, &key);
     rcu_read_lock();
     peer = rhashtable_lookup_fast(&stats->peers, &key, brutal_perip_params);
-    if (peer && !refcount_inc_not_zero(&peer->pacer.refcnt))
+    if (peer && !brutal_peer_try_get(peer))
         peer = NULL;
     rcu_read_unlock();
     if (peer)
@@ -362,25 +364,27 @@ struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group
     new_peer->net = net;
     new_peer->key = key;
 
-    peer = rhashtable_lookup_get_insert_fast(&stats->peers, &new_peer->node,
-                                             brutal_perip_params);
-    if (IS_ERR(peer))
+    for (;;)
     {
-        brutal_net_peer_insert_failed(net);
-        mempool_free(new_peer, brutal_peer_pool);
-        return brutal_fallback_group_get(&key, parent, net);
-    }
-    if (peer)
-    {
-        if (refcount_inc_not_zero(&peer->pacer.refcnt))
+        peer = rhashtable_lookup_get_insert_fast(&stats->peers, &new_peer->node,
+                                                 brutal_perip_params);
+        if (IS_ERR(peer))
+        {
+            brutal_net_peer_insert_failed(net);
+            mempool_free(new_peer, brutal_peer_pool);
+            return brutal_fallback_group_get(&key, parent, net);
+        }
+        if (!peer)
+            break;
+        if (brutal_peer_try_get(peer))
         {
             brutal_group_put(parent);
             mempool_free(new_peer, brutal_peer_pool);
             return &peer->pacer;
         }
-        mempool_free(new_peer, brutal_peer_pool);
-        return brutal_fallback_group_get(&key, parent, net);
+        cpu_relax();
     }
+
     atomic_inc(&parent->ip_groups);
     brutal_net_peer_added(net);
     return &new_peer->pacer;
@@ -408,30 +412,41 @@ static void brutal_rule_group_free_work(struct work_struct *work)
 
 void brutal_pacer_put(struct brutal_pacer *p)
 {
-    if (!refcount_dec_and_test(&p->refcnt))
-        return;
-
-    switch (p->type)
-    {
-    case BRUTAL_PACER_PEER:
+    if (p->type == BRUTAL_PACER_PEER)
     {
         struct brutal_peer *peer = container_of(p, struct brutal_peer, pacer);
         struct brutal_group *parent = p->parent;
-        struct brutal_rule_stats *stats = brutal_group_rule_stats(parent);
+        struct brutal_rule_stats *stats;
 
+        spin_lock_bh(&peer->lifecycle_lock);
+        if (!refcount_dec_and_test(&p->refcnt))
+        {
+            spin_unlock_bh(&peer->lifecycle_lock);
+            return;
+        }
+        stats = brutal_group_rule_stats(parent);
         if (WARN_ON_ONCE(!stats || !stats->peers_initialized))
         {
+            spin_unlock_bh(&peer->lifecycle_lock);
             brutal_group_put(parent);
             mempool_free(peer, brutal_peer_pool);
             return;
         }
         rhashtable_remove_fast(&stats->peers, &peer->node,
                                brutal_perip_params);
+        spin_unlock_bh(&peer->lifecycle_lock);
+
         atomic_dec(&parent->ip_groups);
         brutal_net_peer_removed(peer->net);
         call_rcu(&peer->rcu, brutal_peer_free_rcu);
         return;
     }
+
+    if (!refcount_dec_and_test(&p->refcnt))
+        return;
+
+    switch (p->type)
+    {
     case BRUTAL_PACER_FALLBACK:
     {
         struct brutal_group *parent = p->parent;

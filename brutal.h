@@ -3,10 +3,12 @@
 
 #include <linux/version.h>
 #include <linux/gfp.h>
+#include <linux/percpu_counter.h>
 #include <linux/refcount.h>
 #include <linux/rhashtable.h>
 #include <linux/seqlock.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include <net/tcp.h>
 
 struct seq_file;
@@ -66,6 +68,7 @@ struct brutal_app_key
 };
 
 struct brutal_group;
+struct brutal_rule_stats;
 
 enum brutal_pacer_type
 {
@@ -104,7 +107,7 @@ struct brutal_group
     u64 id;
     struct net *net; // non-NULL only for application groups
 
-    void *rule_stats;
+    struct brutal_rule_stats *rule_stats;
     struct brutal_pacer **fallbacks;
     atomic_t ip_groups;
 
@@ -113,10 +116,20 @@ struct brutal_group
     struct brutal_app_key app_key;
 };
 
+struct brutal_rule_stats
+{
+    struct percpu_counter sent_bytes;
+    struct rhashtable peers;
+    struct work_struct destroy_work;
+    struct brutal_group *group;
+    bool peers_initialized;
+};
+
 /* Lightweight per-IP object; it does not carry rule/app configuration fields. */
 struct brutal_peer
 {
     struct brutal_pacer pacer;
+    spinlock_t lifecycle_lock; // serializes live ref acquisition vs final removal
     struct rhash_head node;
     struct rcu_head rcu;
     struct brutal_peer_key key;
@@ -158,6 +171,7 @@ struct brutal_group *brutal_group_alloc(u64 id, gfp_t gfp);
 void brutal_group_put(struct brutal_group *g);
 void brutal_pacer_get(struct brutal_pacer *p);
 void brutal_pacer_put(struct brutal_pacer *p);
+bool brutal_peer_try_get(struct brutal_peer *peer);
 u64 brutal_pacer_id(struct brutal_pacer *p);
 void brutal_group_join(struct brutal *brutal, struct brutal_pacer *p);
 void brutal_group_leave(struct sock *sk);
