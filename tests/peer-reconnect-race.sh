@@ -63,6 +63,11 @@ def worker():
         for _ in range(iterations):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect(("10.206.0.1", port))
+            # Let the server perform the active close so the client does not
+            # accumulate TIME_WAIT sockets and exhaust ephemeral ports during
+            # long reconnect stress runs.
+            while s.recv(1):
+                pass
             s.close()
     except Exception as exc:
         errors.append(exc)
