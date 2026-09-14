@@ -1,0 +1,54 @@
+name: Publish v2.3.0
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/release-v2.3.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create v2.3.0 tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TARGET: 31ee60cd35200acfb78fa4a2334a10e97c2f0e2a
+        run: |
+          set -euo pipefail
+          if gh release view v2.3.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v2.3.0 already exists; nothing to do"
+            exit 0
+          fi
+
+          cat > /tmp/release-notes.md <<'EOF'
+          ## TCP Brutal Custom v2.3.0
+
+          This release completes the 2.3 structural optimization and hardening work while preserving the configured-rate behavior and existing socket ABI.
+
+          Highlights:
+          - hardened per-IP peer lifecycle against same-IP reconnect/final-close races
+          - automatically resizing per-rule peer indexes and per-netns exact-host index
+          - true paginated `/proc/net/tcp_brutal/peers` seq iterator
+          - namespace-scoped application groups and rule/index state
+          - dedicated peer slab/mempool and explicit allocation/fallback diagnostics
+          - expanded reconnect, exact-host scale, pagination, namespace and churn tests
+
+          Release validation on ARM64/Linux 6.17 included 10,000 peer churn, 80,000 same-IP reconnects, 10,000 IPv4 `/32` plus 256 IPv6 `/128` exact-host rules, 1,000 simultaneous paginated peers, and five 60-second 16-stream 200 Mbps benchmark runs.
+
+          Final throughput median: 199.820 Mbps versus 199.787 Mbps saved baseline; no measurable throughput regression. The consistent iperf3 sender/server CPU comparison also showed no CPU regression (0.5512% baseline median versus 0.5413% final median).
+
+          Full release evidence, raw benchmark archive, reconstruction instructions and SHA-256 checksums are committed under `benchmark-results/arm64-6.17/2.3.0-final/`.
+
+          Release target commit: `31ee60cd35200acfb78fa4a2334a10e97c2f0e2a`.
+          EOF
+
+          gh release create v2.3.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$RELEASE_TARGET" \
+            --title "TCP Brutal Custom v2.3.0" \
+            --notes-file /tmp/release-notes.md
