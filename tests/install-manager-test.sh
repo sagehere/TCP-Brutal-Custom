@@ -189,6 +189,48 @@ remove_custom_dkms
 [[ ${dkms_calls[1]} == 'remove -m tcp-brutal-custom -v 2.1.0.custom.2222222 --all' ]]
 unset -f rm dkms
 
+(
+  STATE_DIR="$tmp/finalize-state"
+  PENDING_REBOOT="$STATE_DIR/reboot-required"
+  CLEANUP_REQUIRED="$STATE_DIR/cleanup-required"
+  VERSION=2.3.0.custom.2222222
+  finalize_log="$tmp/finalize.log"
+  MATCH_OK=1
+  CLEAN_FAIL=0
+  module_matches_installed() { (( MATCH_OK )); }
+  remove_old_custom_dkms() { echo "custom $1" >>"$finalize_log"; return "$CLEAN_FAIL"; }
+  remove_upstream_dkms() { echo upstream >>"$finalize_log"; return 0; }
+  dkms() { echo "dkms $*" >>"$finalize_log"; return 0; }
+  depmod() { echo depmod >>"$finalize_log"; return 0; }
+
+  mark_pending_reboot 1
+  [[ $(cat "$PENDING_REBOOT") == "$VERSION" ]]
+  grep -qx 'CUSTOM=1' "$CLEANUP_REQUIRED"
+  grep -qx 'UPSTREAM=1' "$CLEANUP_REQUIRED"
+
+  MATCH_OK=0
+  ! finalize_pending_update
+  [[ -f $PENDING_REBOOT && -f $CLEANUP_REQUIRED ]]
+  [[ ! -e $finalize_log ]]
+
+  MATCH_OK=1
+  finalize_pending_update
+  [[ ! -e $PENDING_REBOOT && ! -e $CLEANUP_REQUIRED ]]
+  [[ $(paste -sd' ' "$finalize_log") == "custom $VERSION upstream dkms install -m tcp-brutal-custom -v $VERSION -k $(uname -r) --force depmod" ]]
+
+  : >"$finalize_log"
+  mark_pending_reboot 0
+  CLEAN_FAIL=1
+  finalize_pending_update
+  [[ ! -e $PENDING_REBOOT && -f $CLEANUP_REQUIRED ]]
+  grep -qx "custom $VERSION" "$finalize_log"
+  ! grep -q '^upstream$' "$finalize_log"
+
+  CLEAN_FAIL=0
+  retry_pending_cleanup
+  [[ ! -e $CLEANUP_REQUIRED ]]
+)
+
 failure_log="$tmp/install-failure.log"
 CONFIG="$tmp/live-config"
 MANAGER="$tmp/brutal-manager"
@@ -238,6 +280,7 @@ mark_pending_reboot() {
   echo mark-pending >>"$failure_log"
 }
 module_supports_peers() { [[ ${SUPPORTS_PEERS:-1} == 1 ]]; }
+finalize_pending_update() { rm -f "$PENDING_REBOOT"; return 0; }
 remove_old_custom_dkms() { return 0; }
 save_config() { echo save >>"$failure_log"; }
 build_dkms() { echo build >>"$failure_log"; return "${BUILD_FAILURE:-0}"; }
