@@ -4,6 +4,10 @@ TCP Brutal 的独立自定义版，提供按对端 IP 分组的速率控制、�
 
 本项目基于 [HyNetworks/tcp-brutal](https://github.com/HyNetworks/tcp-brutal)，将 Hysteria 的 Brutal 拥塞控制算法实现为 Linux TCP 内核模块，并新增 `perip` 规则模式：每个对端 IP 独立拥有一份带宽，而同一 IP 建立的多条 TCP 连接仍共享该带宽。
 
+## 2.4.0
+
+2.4.0 新增按本地 TCP 监听端口自动启用 Brutal 的模式。管理器可通过 `tbc ports` 配置单端口、多端口或端口范围，并自动为 IPv4/IPv6 建立策略路由；未命中的端口继续使用系统默认拥塞控制算法。该模式适合 VLESS Reality、Xray、sing-box、nginx 等普通 TCP 服务，无需应用层适配。
+
 ## 为什么需要 `perip`
 
 上游普通规则将所有命中同一前缀的连接放进一个共享组：
@@ -30,6 +34,7 @@ TCP Brutal 的独立自定义版，提供按对端 IP 分组的速率控制、�
 - Linux 5.10+ TCP 拥塞控制模块，支持 x86_64 与 ARM64。
 - 对普通 TCP 应用生效，不要求客户端安装模块或改造协议。
 - `perip`：按对端公网 IP 隔离速率；同一 IP 连接动态共享。
+- 可按本地 TCP 监听端口自动启用 Brutal；未配置端口继续使用系统默认拥塞算法。
 - IPv4、IPv6 和 IPv4-mapped IPv6 支持；IPv4 与 IPv6 分别计组。
 - `brutalctl` 管理规则，并可查看每个活跃 IP 的速率、连接数与累计发送流量。
 - 保留上游应用 `group_id` 接口与普通共享规则行为。
@@ -60,6 +65,36 @@ sudo tbc view --watch
 ```
 
 `view --watch` 每两秒刷新一次，按 Ctrl+C 退出。IP 行只在对应 `perip` 连接存活期间显示。
+
+## 按监听端口自动启用 Brutal
+
+管理器可以让指定的本地 TCP 监听端口自动使用 Brutal，应用本身无需支持 TCP Brutal。典型用途是在 s-ui/Xray 中把 VLESS Reality 入站监听在 `443`，然后只为 `443` 开启 Brutal；SSH、APT、Xray outbound 和其他端口继续使用系统默认的 BBR/CUBIC。
+
+```bash
+sudo tbc ports
+```
+
+交互输入支持单端口、多端口和范围：
+
+```text
+443
+443,8443
+10000-10100
+443,8443,10000-10100
+```
+
+输入 `none`、`off`、`clear` 或 `0` 可清除端口配置。管理器会为 IPv4/IPv6 建立独立策略路由，匹配服务端发送方向的本地 `sport`，并在对应路由上锁定 `congctl brutal`。规则仅影响新建 TCP 连接；已经存在的连接继续使用原来的拥塞算法直到关闭。
+
+示例：
+
+```text
+VLESS Reality 监听 :443  -> Brutal
+SSH :22                 -> 系统默认 CC
+Xray outbound :随机端口 -> 系统默认 CC
+UDP / QUIC              -> 不受影响
+```
+
+端口策略会随 `tcp-brutal-custom.service` 在开机时自动恢复。`sudo tbc status` 可查看当前 Brutal TCP 端口。
 
 ## 规则说明
 
@@ -145,6 +180,7 @@ sudo tbc
 ```bash
 sudo tbc install
 sudo tbc rate
+sudo tbc ports
 sudo tbc enable
 sudo tbc disable
 sudo tbc status

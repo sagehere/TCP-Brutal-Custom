@@ -16,11 +16,15 @@ STATE_DIR="/var/lib/tcp-brutal-custom"
 PENDING_REBOOT="$STATE_DIR/reboot-required"
 CLEANUP_REQUIRED="$STATE_DIR/cleanup-required"
 PEERS_PROC="/proc/net/tcp_brutal/peers"
-MANAGER_VERSION="2.3.1"
+PORT_TABLE=233
+PORT_RULE_PREF_BASE=12000
+PORT_RULE_PREF_MAX=12127
+MANAGER_VERSION="2.4.0"
 
 IPV4_RATE=80
 IPV6_RATE=80
 MODE=auto
+TCP_PORTS=""
 COMMIT=""
 VERSION=""
 MANAGED=0
@@ -53,16 +57,17 @@ check_platform() {
 }
 
 load_config() {
-  IPV4_RATE=80; IPV6_RATE=80; MODE=auto; COMMIT=""; VERSION=""; MANAGED=0
+  IPV4_RATE=80; IPV6_RATE=80; MODE=auto; TCP_PORTS=""; COMMIT=""; VERSION=""; MANAGED=0
   [[ -f $CONFIG ]] || return 0
   local key value
   while IFS='=' read -r key value; do
     case $key in
-      IPV4_RATE|IPV6_RATE|MODE|COMMIT|VERSION|MANAGED) printf -v "$key" '%s' "$value" ;;
+      IPV4_RATE|IPV6_RATE|MODE|TCP_PORTS|COMMIT|VERSION|MANAGED) printf -v "$key" '%s' "$value" ;;
     esac
   done <"$CONFIG"
   valid_rate "$IPV4_RATE" && valid_rate "$IPV6_RATE" || die "配置文件中的速率无效：$CONFIG"
   [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "配置文件中的地址族模式无效：$CONFIG"
+  TCP_PORTS=$(normalize_ports "$TCP_PORTS") || die "配置文件中的 TCP 端口无效：$CONFIG"
   [[ $MANAGED == 1 ]] || die "配置文件中的管理标记无效：$CONFIG"
   [[ -z $COMMIT || $COMMIT =~ ^[0-9a-f]{40}$ ]] || die "配置文件中的提交号无效：$CONFIG"
   [[ -z $VERSION ]] || valid_custom_version "$VERSION" || die "配置文件中的版本号无效：$CONFIG"
@@ -75,6 +80,7 @@ save_config() {
 IPV4_RATE=$IPV4_RATE
 IPV6_RATE=$IPV6_RATE
 MODE=$MODE
+TCP_PORTS=$TCP_PORTS
 COMMIT=$COMMIT
 VERSION=$VERSION
 MANAGED=1
@@ -85,6 +91,31 @@ EOF
 
 valid_rate() {
   [[ $1 =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] && awk -v r="$1" 'BEGIN { exit !(r >= .5 && r <= 1000000) }'
+}
+
+normalize_ports() {
+  local raw=${1//[[:space:]]/}
+  [[ -n $raw ]] || { printf '\n'; return 0; }
+  awk -v spec="$raw" 'BEGIN {
+    n=split(spec,a,",");
+    for(i=1;i<=n;i++) {
+      if(a[i] ~ /^[0-9]+$/) { lo=a[i]+0; hi=lo }
+      else if(a[i] ~ /^[0-9]+-[0-9]+$/) { split(a[i],r,"-"); lo=r[1]+0; hi=r[2]+0 }
+      else exit 2
+      if(lo < 1 || hi > 65535 || lo > hi) exit 2
+      for(p=lo;p<=hi;p++) used[p]=1
+    }
+    out=""; p=1
+    while(p<=65535) {
+      if(!used[p]) { p++; continue }
+      first=p
+      while(p<65535 && used[p+1]) p++
+      token=(first==p ? first : first "-" p)
+      out=(out=="" ? token : out "," token)
+      p++
+    }
+    print out
+  }'
 }
 
 valid_custom_version() {
@@ -388,10 +419,126 @@ apply_configured_rules() {
   fi
 }
 
+sanitize_route_line() {
+  local line=$1
+  sed -E 's/(^|[[:space:]])linkdown([[:space:]]|$)/ /g; s/[[:space:]]+expires[[:space:]]+[^[:space:]]+//g; s/[[:space:]]+/ /g; s/^ //; s/ $//' <<<"$line"
+}
+
+clone_port_route() {
+  local family=$1 line=$2 clean
+  local -a args=()
+  clean=$(sanitize_route_line "$line")
+  [[ -n $clean ]] || return 0
+  read -r -a args <<<"$clean"
+  case $clean in
+    blackhole*|unreachable*|prohibit*|throw*)
+      ip "-$family" route replace table "$PORT_TABLE" "${args[@]}"
+      ;;
+    *)
+      ip "-$family" route replace table "$PORT_TABLE" "${args[@]}" congctl lock brutal
+      ;;
+  esac
+}
+
+sync_port_table_family() {
+  local family=$1 line
+  ip "-$family" route flush table "$PORT_TABLE" >/dev/null 2>&1 || true
+  while IFS= read -r line; do
+    [[ -n $line && $line != default\ * ]] || continue
+    clone_port_route "$family" "$line" || return 1
+  done < <(ip "-$family" route show table main)
+  while IFS= read -r line; do
+    [[ $line == default\ * ]] || continue
+    clone_port_route "$family" "$line" || return 1
+  done < <(ip "-$family" route show table main)
+}
+
+clear_managed_port_rules_family() {
+  local family=$1 pref sport
+  while read -r pref sport; do
+    [[ -n ${pref:-} && -n ${sport:-} ]] || continue
+    ip "-$family" rule del priority "$pref" ipproto tcp sport "$sport" lookup "$PORT_TABLE" 2>/dev/null ||       ip "-$family" rule del priority "$pref" 2>/dev/null || return 1
+  done < <(ip "-$family" rule show | awk -v t="$PORT_TABLE" -v b="$PORT_RULE_PREF_BASE" -v m="$PORT_RULE_PREF_MAX" '
+    {
+      pref=$1; sub(/:$/, "", pref); sport=""; table=""; proto=""
+      for(i=1;i<=NF;i++) {
+        if($i=="sport") sport=$(i+1)
+        if($i=="lookup") table=$(i+1)
+        if($i=="ipproto") proto=$(i+1)
+      }
+      if(pref>=b && pref<=m && table==t && proto=="tcp" && sport!="") print pref, sport
+    }')
+}
+
+check_port_policy_conflicts_family() {
+  local family=$1 bad managed_count route_count
+  bad=$(ip "-$family" rule show | awk -v t="$PORT_TABLE" -v b="$PORT_RULE_PREF_BASE" -v m="$PORT_RULE_PREF_MAX" '
+    {
+      pref=$1; sub(/:$/, "", pref); sport=""; table=""; proto=""
+      for(i=1;i<=NF;i++) {
+        if($i=="sport") sport=$(i+1)
+        if($i=="lookup") table=$(i+1)
+        if($i=="ipproto") proto=$(i+1)
+      }
+      ours=(pref>=b && pref<=m && table==t && proto=="tcp" && sport!="")
+      if((table==t || (pref>=b && pref<=m)) && !ours) print
+    }')
+  [[ -z $bad ]] || { echo "错误: IPv$family 端口策略保留区域存在非受管规则：$bad" >&2; return 1; }
+  managed_count=$(ip "-$family" rule show | awk -v t="$PORT_TABLE" -v b="$PORT_RULE_PREF_BASE" -v m="$PORT_RULE_PREF_MAX" '
+    { pref=$1; sub(/:$/, "", pref); if(pref>=b && pref<=m && $0 ~ ("lookup " t) && $0 ~ /ipproto tcp/ && $0 ~ /sport /) n++ } END {print n+0}')
+  route_count=$(ip "-$family" route show table "$PORT_TABLE" 2>/dev/null | awk 'END {print NR+0}')
+  if (( route_count > 0 && managed_count == 0 )); then
+    echo "错误: IPv$family 路由表 $PORT_TABLE 已被其他配置占用。" >&2
+    return 1
+  fi
+}
+
+reset_port_policy() {
+  clear_managed_port_rules_family 4 || return 1
+  clear_managed_port_rules_family 6 || return 1
+  ip -4 route flush table "$PORT_TABLE" >/dev/null 2>&1 || true
+  ip -6 route flush table "$PORT_TABLE" >/dev/null 2>&1 || true
+}
+
+apply_port_rules() {
+  local normalized applied=0 family pref spec
+  local -a specs=()
+  normalized=$(normalize_ports "$TCP_PORTS") || { echo "错误: TCP 端口配置无效。" >&2; return 1; }
+  TCP_PORTS=$normalized
+  check_port_policy_conflicts_family 4 || return 1
+  check_port_policy_conflicts_family 6 || return 1
+  reset_port_policy || return 1
+  [[ -n $TCP_PORTS ]] || return 0
+  IFS=, read -r -a specs <<<"$TCP_PORTS"
+  ((${#specs[@]} <= PORT_RULE_PREF_MAX - PORT_RULE_PREF_BASE + 1)) || {
+    echo "错误: 端口规则过多；最多支持 $((PORT_RULE_PREF_MAX - PORT_RULE_PREF_BASE + 1)) 个合并区间。" >&2
+    return 1
+  }
+  for family in 4 6; do
+    family_enabled "$family" || continue
+    if ! sync_port_table_family "$family"; then reset_port_policy || true; return 1; fi
+    pref=$PORT_RULE_PREF_BASE
+    for spec in "${specs[@]}"; do
+      if ! ip "-$family" rule add priority "$pref" ipproto tcp sport "$spec" lookup "$PORT_TABLE"; then
+        reset_port_policy || true
+        return 1
+      fi
+      ((pref+=1))
+    done
+    applied=1
+  done
+  if (( ! applied )); then
+    reset_port_policy || true
+    echo "错误: 未检测到可用地址族，无法应用端口策略。" >&2
+    return 1
+  fi
+}
+
 apply_rules() {
   load_config
   [[ $MANAGED == 1 ]] || die "尚未完成安装。"
   apply_configured_rules || die "恢复规则失败。"
+  apply_port_rules || die "恢复端口策略失败。"
   module_supports_peers || die "当前加载的模块不支持活跃 IP 视图；请重启服务器完成更新。"
   finalize_pending_update || die "更新收尾验证失败；请检查当前加载模块后重试。"
 }
@@ -399,7 +546,7 @@ apply_rules() {
 write_service() {
   cat >"$SERVICE" <<EOF
 [Unit]
-Description=TCP Brutal Custom per-IP rules
+Description=TCP Brutal Custom per-IP and TCP-port rules
 Wants=network-online.target
 After=network-online.target
 
@@ -443,7 +590,7 @@ disable_boot() {
 install_or_update() (
   set -Eeuo pipefail
   need_root; check_platform; load_config
-  local old_version=$VERSION old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE old_managed=$MANAGED
+  local old_version=$VERSION old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE old_tcp_ports=$TCP_PORTS old_managed=$MANAGED
   local temp="" sha source has_upstream=0 needs_migration=0 needs_install=0 switch_needed=0 switch_complete=0
   local disk_module_changed=0 artifacts_changed=0
   local had_config=0 had_manager=0 had_legacy_manager=0 had_brutalctl=0 had_service=0 had_modules_load=0 was_boot_enabled=0
@@ -467,10 +614,11 @@ install_or_update() (
       if [[ -n $old_version || ${#upstream_versions[@]} -gt 0 ]]; then
         modprobe brutal >/dev/null 2>&1 || echo "警告: 无法重新加载原 brutal 模块。" >&2
       fi
-      MODE=$old_mode; IPV4_RATE=$old_ipv4; IPV6_RATE=$old_ipv6; MANAGED=$old_managed
+      MODE=$old_mode; IPV4_RATE=$old_ipv4; IPV6_RATE=$old_ipv6; TCP_PORTS=$old_tcp_ports; MANAGED=$old_managed
       ALLOW_RULE_REPLACE=0
-      if (( old_managed )) && ! apply_configured_rules >/dev/null 2>&1; then
-        echo "警告: 无法恢复原 TCP Brutal 规则。" >&2
+      if (( old_managed )); then
+        apply_configured_rules >/dev/null 2>&1 || echo "警告: 无法恢复原 TCP Brutal 规则。" >&2
+        apply_port_rules >/dev/null 2>&1 || echo "警告: 无法恢复原端口策略。" >&2
       fi
     elif (( disk_module_changed && ! switch_complete )); then
       if [[ -n $old_version ]] && custom_version_installed "$old_version"; then
@@ -572,6 +720,9 @@ install_or_update() (
   if ! apply_configured_rules; then
     die "新规则应用失败；已保留 DKMS 构建。"
   fi
+  if ! apply_port_rules; then
+    die "端口策略应用失败；已保留 DKMS 构建。"
+  fi
   module_supports_peers || die "新模块缺少活跃 IP 视图接口。"
   save_config
   enable_boot
@@ -590,13 +741,33 @@ set_rate() {
   [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "无效模式。"
   IPV4_RATE=$(ask_rate IPv4 "$IPV4_RATE")
   IPV6_RATE=$(ask_rate IPv6 "$IPV6_RATE")
-  if ! apply_configured_rules; then
+  if ! apply_configured_rules || ! apply_port_rules; then
     MODE=$old_mode; IPV4_RATE=$old_ipv4; IPV6_RATE=$old_ipv6
     apply_configured_rules || true
-    die "应用新速率失败，已尝试恢复原规则。"
+    apply_port_rules || true
+    die "应用新速率失败，已尝试恢复原规则和端口策略。"
   fi
   save_config
   note "速率已更新。"
+}
+
+set_ports() {
+  need_root; load_config
+  [[ $MANAGED == 1 ]] || die "请先安装。"
+  local answer normalized old_ports=$TCP_PORTS
+  read_tty "Brutal TCP 端口 [$TCP_PORTS]（如 443,8443,10000-10100；输入 none 清除）: " answer
+  answer=${answer:-$TCP_PORTS}
+  case ${answer,,} in none|off|clear|0) answer="" ;; esac
+  normalized=$(normalize_ports "$answer") || die "端口格式无效；支持单端口、逗号分隔和端口范围。"
+  [[ $normalized != "$TCP_PORTS" ]] || { note "端口配置未变化。"; return 0; }
+  TCP_PORTS=$normalized
+  if ! apply_port_rules; then
+    TCP_PORTS=$old_ports
+    apply_port_rules || true
+    die "应用端口策略失败，已尝试恢复原配置。"
+  fi
+  save_config
+  note "Brutal TCP 端口已更新：${TCP_PORTS:-未配置}"
 }
 
 status() {
@@ -605,6 +776,7 @@ status() {
   echo "提交: ${COMMIT:-未安装}"
   echo "DKMS: ${VERSION:-未安装}"
   echo "配置速率: IPv4 ${IPV4_RATE} Mbps，IPv6 ${IPV6_RATE} Mbps"
+  echo "Brutal TCP 端口: ${TCP_PORTS:-未配置}"
   show_stack
   systemctl is-enabled --quiet tcp-brutal-custom.service && echo "开机启动: 已启用" || echo "开机启动: 未启用"
   module_loaded && echo "模块: 已加载" || echo "模块: 未加载"
@@ -655,16 +827,22 @@ uninstall() (
     if (( changed && ! complete )); then
       modprobe brutal >/dev/null 2>&1 || echo "警告: 无法重新加载 brutal 模块。" >&2
       apply_configured_rules >/dev/null 2>&1 || echo "警告: 无法恢复卸载前的规则。" >&2
+      apply_port_rules >/dev/null 2>&1 || echo "警告: 无法恢复卸载前的端口策略。" >&2
     fi
     exit "$rc"
   }
   trap cleanup_uninstall EXIT
   trap 'exit 130' INT TERM
   confirm "确认卸载 TCP Brutal Custom？" || return 0
+  changed=1
+  if [[ -n $TCP_PORTS ]]; then
+    check_port_policy_conflicts_family 4 || die "端口策略存在冲突，拒绝卸载。"
+    check_port_policy_conflicts_family 6 || die "端口策略存在冲突，拒绝卸载。"
+    reset_port_policy || die "清理端口策略失败。"
+  fi
   if module_loaded && ! rmmod brutal; then
     die "Brutal 模块正在使用，无法安全卸载；请结束使用该模块的连接后重试。"
   fi
-  changed=1
   remove_custom_dkms || die "DKMS 移除失败，已保留安装记录。"
   disable_boot
   rm -f "$SERVICE" "$MODULES_LOAD" "$BRUTALCTL"
@@ -693,12 +871,13 @@ menu() {
 TCP Brutal Custom 管理器 v$MANAGER_VERSION
 1. 安装 / 更新
 2. 设置 IPv4 / IPv6 速率
-3. 开启开机启动
-4. 关闭开机启动
-5. 查看状态
-6. 查看活跃 IP
-7. 实时查看活跃 IP
-8. 卸载
+3. 设置 Brutal TCP 端口
+4. 开启开机启动
+5. 关闭开机启动
+6. 查看状态
+7. 查看活跃 IP
+8. 实时查看活跃 IP
+9. 卸载
 0. 退出
 EOF
     local choice
@@ -706,12 +885,13 @@ EOF
     case $choice in
       1) run_menu_action install_or_update ;;
       2) run_menu_action set_rate ;;
-      3) run_menu_action enable_boot ;;
-      4) run_menu_action disable_boot ;;
-      5) run_menu_action status ;;
-      6) run_menu_action view ;;
-      7) run_menu_action view --watch ;;
-      8) run_menu_action uninstall ;;
+      3) run_menu_action set_ports ;;
+      4) run_menu_action enable_boot ;;
+      5) run_menu_action disable_boot ;;
+      6) run_menu_action status ;;
+      7) run_menu_action view ;;
+      8) run_menu_action view --watch ;;
+      9) run_menu_action uninstall ;;
       0) return ;;
       *) echo "无效选择。" ;;
     esac
@@ -726,11 +906,12 @@ case ${1:-menu} in
   menu) menu ;;
   install|update) install_or_update ;;
   rate) set_rate ;;
+  ports) set_ports ;;
   apply) apply_rules ;;
   enable) enable_boot ;;
   disable) disable_boot ;;
   status) status ;;
   view) shift; view "$@" ;;
   uninstall) uninstall ;;
-  *) echo "用法: $0 {install|update|rate|apply|enable|disable|status|view [--watch]|uninstall}" >&2; exit 2 ;;
+  *) echo "用法: $0 {install|update|rate|ports|apply|enable|disable|status|view [--watch]|uninstall}" >&2; exit 2 ;;
 esac
