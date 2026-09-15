@@ -10,6 +10,7 @@ sdev="tps-$suffix"
 cdev="tpc-$suffix"
 server_py=$(mktemp)
 client_py=$(mktemp)
+test_cc=${TBC_TEST_CC:-brutal}
 
 cleanup() {
   ip netns pids "$server" 2>/dev/null | xargs -r kill 2>/dev/null || true
@@ -20,7 +21,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-modprobe brutal
+if [[ $test_cc == brutal ]]; then
+  modprobe brutal
+else
+  sysctl -n net.ipv4.tcp_available_congestion_control | tr ' ' '\n' | grep -qx "$test_cc" || {
+    echo "unsupported test CC: $test_cc" >&2
+    exit 1
+  }
+fi
 ip netns add "$server"
 ip netns add "$client"
 ip link add "$sdev" type veth peer name "$cdev"
@@ -40,15 +48,29 @@ ip -n "$server" -6 route add default via 2001:db8:204::2 dev "$sdev"
 ip netns exec "$server" bash -c '
   export BRUTAL_MANAGER_LIB=1
   source "$1"
+  test_cc=$2
+  if [[ $test_cc != brutal ]]; then
+    clone_port_route() {
+      local family=$1 line=$2 clean
+      local -a args=()
+      clean=$(sanitize_route_line "$line")
+      [[ -n $clean ]] || return 0
+      read -r -a args <<<"$clean"
+      case $clean in
+        blackhole*|unreachable*|prohibit*|throw*) ip "-$family" route replace table "$PORT_TABLE" "${args[@]}" ;;
+        *) ip "-$family" route replace table "$PORT_TABLE" "${args[@]}" congctl lock "$test_cc" ;;
+      esac
+    }
+  fi
   MODE=auto
   TCP_PORTS=5211
   apply_port_rules
-' _ "$repo/install.sh"
+' _ "$repo/install.sh" "$test_cc"
 
 ip -n "$server" -4 rule show | grep -q 'sport 5211 lookup 233'
 ip -n "$server" -6 rule show | grep -q 'sport 5211 lookup 233'
-ip -n "$server" -4 route show table 233 | grep -q '10.204.0.0/24.*congctl lock brutal'
-ip -n "$server" -6 route show table 233 | grep -q '2001:db8:204::/64.*congctl lock brutal'
+ip -n "$server" -4 route show table 233 | grep -q "10.204.0.0/24.*congctl lock $test_cc"
+ip -n "$server" -6 route show table 233 | grep -q "2001:db8:204::/64.*congctl lock $test_cc"
 cat >"$server_py" <<'PY'
 import socket, threading, time
 socks=[]
@@ -83,8 +105,8 @@ port_5211=$(ip netns exec "$server" ss -tin '( sport = :5211 )')
 port_5212=$(ip netns exec "$server" ss -tin '( sport = :5212 )')
 [[ $(grep -c '^ESTAB' <<<"$port_5211") == 2 ]]
 [[ $(grep -c '^ESTAB' <<<"$port_5212") == 2 ]]
-grep -q ' brutal ' <<<" $port_5211 "
-! grep -q ' brutal ' <<<" $port_5212 "
+grep -q " $test_cc " <<<" $port_5211 "
+! grep -q " $test_cc " <<<" $port_5212 "
 wait "$client_pid"
 wait "$server_pid"
 echo "port-mode netns test passed"
