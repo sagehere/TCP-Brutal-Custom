@@ -1,45 +1,13 @@
-name: "Build release"
+name: Legacy release workflow disabled
 
 on:
-  push:
-    tags:
-      - v*.*.*
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    env:
-      ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-
+  notice:
+    runs-on: ubuntu-24.04
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
-
-      - name: Check that the tag matches the version in brutal.c
-        run: |
-          version=$(./scripts/mkdkmsconf.sh | sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p')
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "brutal.c version is $version but the tag is $GITHUB_REF_NAME"
-            exit 1
-          fi
-
-      - name: Run build script
-        run: |
-          make dkms-tarball
-          mkdir -p build/
-          mv dkms.tar.gz build/tcp-brutal.dkms.tar.gz
-
-      - name: Generate hashes
-        run: |
-          for file in build/*; do
-            sha256sum $file >> build/hashes.txt
-          done
-
-      - name: Upload GitHub
-        uses: softprops/action-gh-release@v1
-        with:
-          files: build/*
+      - run: echo "Use the Publish immutable release workflow."

@@ -44,7 +44,7 @@ TCP Brutal 的独立自定义版，提供按对端 IP 分组的速率控制、�
 使用管理器安装后，会按设置的 IPv4、IPv6 每 IP 速率创建 `perip` 规则并设置开机恢复：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh | sudo -E bash
+curl -fsSL https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh | sudo -E bash
 ```
 
 也可以直接用 `brutalctl` 添加规则；`80` 是每个 IP 的目标总速率，单位为 Mbps：
@@ -154,16 +154,16 @@ brutalctl list
 
 ## 一键安装与管理
 
-仅支持 Debian/Ubuntu、systemd、Linux 5.10+ 的 x86_64/ARM64 服务器。以下命令会下载当前 `master` 提交、通过 DKMS 构建模块、设置每 IP 速率并启用开机恢复：
+仅支持 Debian/Ubuntu、systemd、Linux 5.10+ 的 x86_64/ARM64 服务器。以下命令会从最新的不可变 Release 下载安装器；安装器随后验证 Release 元数据、摘要与源码身份，再通过 DKMS 构建模块、设置每 IP 速率并启用开机恢复：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh | sudo -E bash
+curl -fsSL https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh | sudo -E bash
 ```
 
 脚本的交互输入会直接从终端读取，因此上述管道方式可以正常使用。如果当前环境没有交互终端，请先下载再运行：
 
 ```bash
-curl -fsSLo install.sh https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh
+curl -fsSLo install.sh https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh
 sudo -E bash install.sh
 ```
 

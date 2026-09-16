@@ -17,6 +17,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,8 +42,8 @@ static int usage(void)
           "       brutalctl flush\n"
           "\n"
           "All connections to the prefix share the rate as one group. add also installs\n"
-          "the route that makes the kernel use brutal for the prefix (ip route replace\n"
-          "<prefix> ... congctl lock brutal proto " ROUTE_PROTO "); del and flush remove it.\n"
+          "a dedicated proto " ROUTE_PROTO " route when no foreign exact route exists;\n"
+          "del and flush remove only routes owned by brutalctl.\n"
           "perip gives each peer IP its own shared rate (and requires the default lock).\n"
           "nolock lets applications set their own params on these connections.\n",
           stderr);
@@ -117,12 +119,78 @@ static int route_lookup(const char *prefix, char *via, size_t vsize, char *dev, 
     return dev[0] ? 0 : -1;
 }
 
+enum route_owner
+{
+    ROUTE_NONE = 0,
+    ROUTE_OURS,
+    ROUTE_FOREIGN,
+    ROUTE_CHECK_ERROR,
+};
+
+static int route_line_is_ours(char *line)
+{
+    char *tok, *save;
+
+    for (tok = strtok_r(line, " \t", &save); tok; tok = strtok_r(NULL, " \t", &save))
+    {
+        if (!strcmp(tok, "proto"))
+        {
+            tok = strtok_r(NULL, " \t", &save);
+            return tok && !strcmp(tok, ROUTE_PROTO);
+        }
+    }
+    return 0;
+}
+
+static enum route_owner route_owner(const char *prefix)
+{
+    char out[16384], copy[16384], *line, *save;
+    char *argv[] = {"ip", "-N", ip_family(prefix), "route", "show", "exact", (char *)prefix, NULL};
+    int saw_route = 0;
+
+    if (run(argv, out, sizeof(out), 1) != 0)
+    {
+        fprintf(stderr, "brutalctl: cannot inspect existing route for %s\n", prefix);
+        return ROUTE_CHECK_ERROR;
+    }
+    if (strlen(out) == sizeof(out) - 1)
+    {
+        fprintf(stderr, "brutalctl: route inspection output is too large for %s\n", prefix);
+        return ROUTE_CHECK_ERROR;
+    }
+    if (!out[0])
+        return ROUTE_NONE;
+    snprintf(copy, sizeof(copy), "%s", out);
+    for (line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+    {
+        char route[16384];
+
+        if (!*line)
+            continue;
+        saw_route = 1;
+        snprintf(route, sizeof(route), "%s", line);
+        if (!route_line_is_ours(route))
+        {
+            fprintf(stderr,
+                    "brutalctl: refusing to replace existing route for %s; "
+                    "use noroute or remove the conflicting route explicitly\n",
+                    prefix);
+            return ROUTE_FOREIGN;
+        }
+    }
+    return saw_route ? ROUTE_OURS : ROUTE_NONE;
+}
+
 static int route_add(const char *prefix, int lock)
 {
     char via[64], dev[32];
     char *argv[16];
-    int n = 0, r = route_lookup(prefix, via, sizeof(via), dev, sizeof(dev));
+    enum route_owner owner = route_owner(prefix);
+    int n = 0, r;
 
+    if (owner == ROUTE_FOREIGN || owner == ROUTE_CHECK_ERROR)
+        return 1;
+    r = route_lookup(prefix, via, sizeof(via), dev, sizeof(dev));
     if (r)
     {
         fprintf(stderr, "brutalctl: rule added, but no route installed: %s\n",
@@ -132,7 +200,7 @@ static int route_add(const char *prefix, int lock)
     argv[n++] = "ip";
     argv[n++] = ip_family(prefix);
     argv[n++] = "route";
-    argv[n++] = "replace";
+    argv[n++] = owner == ROUTE_OURS ? "replace" : "add";
     argv[n++] = (char *)prefix;
     if (via[0])
     {
@@ -150,7 +218,8 @@ static int route_add(const char *prefix, int lock)
     argv[n] = NULL;
     if (run(argv, NULL, 0, 0) != 0)
     {
-        fprintf(stderr, "brutalctl: rule added, but ip route replace failed\n");
+        fprintf(stderr, "brutalctl: rule added, but ip route %s failed\n",
+                owner == ROUTE_OURS ? "replace" : "add");
         return 1;
     }
     return 0;
@@ -217,6 +286,22 @@ static int open_proc(const char *path, int flags)
 static int open_rules(int flags)
 {
     return open_proc(RULES_PATH, flags);
+}
+
+static int appendf(char *buf, size_t size, size_t *used, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    if (*used >= size)
+        return -1;
+    va_start(ap, fmt);
+    n = vsnprintf(buf + *used, size - *used, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= size - *used)
+        return -1;
+    *used += (size_t)n;
+    return 0;
 }
 
 static int send_cmd(const char *cmd)
@@ -424,19 +509,30 @@ static int add_rule(int argc, char **argv)
     char cmd[256];
     char *end;
     double mbps;
-    int n, i, lock = 1, route = 1, ret;
+    size_t used = 0;
+    int i, lock = 1, route = 1, ret;
 
     if (argc < 4)
         return usage();
+    if (strlen(argv[2]) >= 80)
+    {
+        fprintf(stderr, "brutalctl: prefix is too long\n");
+        return 1;
+    }
+    errno = 0;
     mbps = strtod(argv[3], &end);
-    if (*end || mbps <= 0)
+    if (errno || *end || !isfinite(mbps) || mbps <= 0 || mbps > 1000000.0)
     {
         fprintf(stderr, "brutalctl: invalid rate '%s' (Mbps)\n", argv[3]);
         return 1;
     }
-    n = snprintf(cmd, sizeof(cmd), "add %s rate=%llu", argv[2],
-                 (unsigned long long)(mbps * 1e6 / 8 + 0.5));
-    for (i = 4; i < argc && n < (int)sizeof(cmd) - 16; i++)
+    if (appendf(cmd, sizeof(cmd), &used, "add %s rate=%llu", argv[2],
+                (unsigned long long)(mbps * 1e6 / 8 + 0.5)))
+    {
+        fprintf(stderr, "brutalctl: command is too long\n");
+        return 1;
+    }
+    for (i = 4; i < argc; i++)
     {
         if (!strcmp(argv[i], "noroute"))
         {
@@ -454,13 +550,26 @@ static int add_rule(int argc, char **argv)
             lock = 1;
         else if (strncmp(argv[i], "gain=", 5))
             return usage();
-        n += snprintf(cmd + n, sizeof(cmd) - n, " %s", argv[i]);
+        if (appendf(cmd, sizeof(cmd), &used, " %s", argv[i]))
+        {
+            fprintf(stderr, "brutalctl: command is too long\n");
+            return 1;
+        }
     }
-    if (i < argc)
-        return usage();
     if (!lock && strstr(cmd, " perip"))
         return usage();
-    strcat(cmd, "\n");
+    if (route)
+    {
+        enum route_owner owner = route_owner(argv[2]);
+
+        if (owner == ROUTE_FOREIGN || owner == ROUTE_CHECK_ERROR)
+            return 1;
+    }
+    if (appendf(cmd, sizeof(cmd), &used, "\n"))
+    {
+        fprintf(stderr, "brutalctl: command is too long\n");
+        return 1;
+    }
     ret = send_cmd(cmd);
     if (ret)
         return ret;
@@ -485,7 +594,12 @@ int main(int argc, char **argv)
         return add_rule(argc, argv);
     if (!strcmp(argv[1], "del") && argc == 3)
     {
-        snprintf(cmd, sizeof(cmd), "del %s\n", argv[2]);
+        int n = snprintf(cmd, sizeof(cmd), "del %s\n", argv[2]);
+        if (n < 0 || (size_t)n >= sizeof(cmd))
+        {
+            fprintf(stderr, "brutalctl: prefix is too long\n");
+            return 1;
+        }
         ret = send_cmd(cmd);
         if (!ret)
             route_del(argv[2]);

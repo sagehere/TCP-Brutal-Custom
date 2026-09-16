@@ -3,8 +3,12 @@
 set -Eeuo pipefail
 
 REPO="sagehere/TCP-Brutal-Custom"
-API="https://api.github.com/repos/$REPO/commits/master"
-TARBALL="https://github.com/$REPO/archive"
+RELEASES_API="https://api.github.com/repos/$REPO/releases"
+RELEASE_SOURCE_ASSET="tcp-brutal-custom-source.tar.gz"
+RELEASE_SUMS_ASSET="SHA256SUMS"
+RELEASE_MANIFEST_ASSET="release-manifest.txt"
+TBC_RELEASE_TAG=${TBC_RELEASE_TAG:-}
+TBC_ALLOW_DOWNGRADE=${TBC_ALLOW_DOWNGRADE:-0}
 PACKAGE="tcp-brutal-custom"
 CONFIG="/etc/tcp-brutal-custom.conf"
 MANAGER="/usr/local/bin/tbc"
@@ -13,18 +17,23 @@ BRUTALCTL="/usr/local/bin/brutalctl"
 SERVICE="/etc/systemd/system/tcp-brutal-custom.service"
 MODULES_LOAD="/etc/modules-load.d/brutal.conf"
 STATE_DIR="/var/lib/tcp-brutal-custom"
+DKMS_SOURCE_ROOT=${DKMS_SOURCE_ROOT:-/usr/src}
 PENDING_REBOOT="$STATE_DIR/reboot-required"
 CLEANUP_REQUIRED="$STATE_DIR/cleanup-required"
 PEERS_PROC="/proc/net/tcp_brutal/peers"
 PORT_TABLE=233
 PORT_RULE_PREF_BASE=12000
 PORT_RULE_PREF_MAX=12127
-MANAGER_VERSION="2.4.0"
+AGGREGATE_FILTER_PREF=23300
+AGGREGATE_FILTER_HANDLE=0x233
+AGGREGATE_STATE="$STATE_DIR/aggregate-egress.state"
+MANAGER_VERSION="2.5.0"
 
 IPV4_RATE=80
 IPV6_RATE=80
 MODE=auto
 TCP_PORTS=""
+AGGREGATE_RATE=0
 COMMIT=""
 VERSION=""
 MANAGED=0
@@ -57,17 +66,18 @@ check_platform() {
 }
 
 load_config() {
-  IPV4_RATE=80; IPV6_RATE=80; MODE=auto; TCP_PORTS=""; COMMIT=""; VERSION=""; MANAGED=0
+  IPV4_RATE=80; IPV6_RATE=80; MODE=auto; TCP_PORTS=""; AGGREGATE_RATE=0; COMMIT=""; VERSION=""; MANAGED=0
   [[ -f $CONFIG ]] || return 0
   local key value
   while IFS='=' read -r key value; do
     case $key in
-      IPV4_RATE|IPV6_RATE|MODE|TCP_PORTS|COMMIT|VERSION|MANAGED) printf -v "$key" '%s' "$value" ;;
+      IPV4_RATE|IPV6_RATE|MODE|TCP_PORTS|AGGREGATE_RATE|COMMIT|VERSION|MANAGED) printf -v "$key" '%s' "$value" ;;
     esac
   done <"$CONFIG"
   valid_rate "$IPV4_RATE" && valid_rate "$IPV6_RATE" || die "配置文件中的速率无效：$CONFIG"
   [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "配置文件中的地址族模式无效：$CONFIG"
   TCP_PORTS=$(normalize_ports "$TCP_PORTS") || die "配置文件中的 TCP 端口无效：$CONFIG"
+  [[ $AGGREGATE_RATE == 0 ]] || valid_rate "$AGGREGATE_RATE" || die "配置文件中的总出口速率无效：$CONFIG"
   [[ $MANAGED == 1 ]] || die "配置文件中的管理标记无效：$CONFIG"
   [[ -z $COMMIT || $COMMIT =~ ^[0-9a-f]{40}$ ]] || die "配置文件中的提交号无效：$CONFIG"
   [[ -z $VERSION ]] || valid_custom_version "$VERSION" || die "配置文件中的版本号无效：$CONFIG"
@@ -81,6 +91,7 @@ IPV4_RATE=$IPV4_RATE
 IPV6_RATE=$IPV6_RATE
 MODE=$MODE
 TCP_PORTS=$TCP_PORTS
+AGGREGATE_RATE=$AGGREGATE_RATE
 COMMIT=$COMMIT
 VERSION=$VERSION
 MANAGED=1
@@ -190,6 +201,7 @@ install_dependencies() {
   have curl || packages+=(curl)
   ca_certificates_installed || packages+=(ca-certificates)
   have ip || packages+=(iproute2)
+  have tc || packages+=(iproute2)
   have make || packages+=(make)
   have tar || packages+=(tar)
   if clang_kernel; then
@@ -216,7 +228,7 @@ install_dependencies() {
     note "所需依赖已安装，跳过软件包安装"
   fi
 
-  have dkms && have curl && have ip && have make && have tar || die "必要工具安装不完整。"
+  have dkms && have curl && have ip && have tc && have make && have tar || die "必要工具安装不完整。"
   if clang_kernel; then
     have clang && have ld.lld && have llvm-objcopy || die "当前内核需要完整的 LLVM 工具链。"
   else
@@ -247,24 +259,134 @@ pending_reboot_message() {
   printf '更新已暂存%s，请重启服务器以加载新模块。\n' "${pending:+（$pending）}"
 }
 
-download_source() {
-  local temp=$1 sha archive metadata
-  metadata="$temp/commit.json"
-  curl -fsSL "$API" -o "$metadata"
-  sha=$(sed -nE 's/.*"sha": "([0-9a-f]{40})".*/\1/p' "$metadata" | sed -n '1p')
-  [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "无法解析 GitHub master 提交。"
-  archive="$temp/source.tar.gz"
-  curl -fsSL "$TARBALL/$sha.tar.gz" -o "$archive"
-  mkdir -p "$temp/source"
-  tar -xzf "$archive" --strip-components=1 -C "$temp/source"
-  printf '%s\n' "$sha"
+release_asset_digest() {
+  local metadata=$1 asset=$2
+  awk -v asset="\"$asset\"" 'BEGIN { RS="\"name\":" } index($0, asset)==1 { print; exit }' "$metadata" |
+    grep -oE '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' |
+    sed -nE 's/.*sha256:([0-9a-f]{64}).*/\1/p' | sed -n '1p'
 }
 
-source_version() {
+release_field() {
+  local metadata=$1 field=$2
+  grep -oE "\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$metadata" |
+    sed -nE 's/^[^:]+:[[:space:]]*"([^"]*)"$/\1/p' | sed -n '1p'
+}
+
+release_immutable() {
+  local metadata=$1
+  grep -oE '"immutable"[[:space:]]*:[[:space:]]*(true|false)' "$metadata" |
+    sed -nE 's/.*:[[:space:]]*(true|false)/\1/p' | sed -n '1p'
+}
+
+version_lt() {
+  local a=$1 b=$2 first
+  [[ $a != "$b" ]] || return 1
+  first=$(printf '%s\n%s\n' "$a" "$b" | sort -V | sed -n '1p')
+  [[ $first == "$a" ]]
+}
+
+release_manifest_value() {
+  local file=$1 key=$2
+  sed -nE "s/^${key}=([A-Za-z0-9._:\/-]+)$/\\1/p" "$file" | sed -n '1p'
+}
+
+verify_release_asset_digest() {
+  local metadata=$1 file=$2 asset=$3 expected actual
+  expected=$(release_asset_digest "$metadata" "$asset")
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] || { echo "错误: Release 缺少 $asset 的可信 SHA256 digest。" >&2; return 1; }
+  actual=$(sha256sum "$file" | awk '{print $1}')
+  [[ $actual == "$expected" ]] || {
+    echo "错误: Release 资产 $asset 的 GitHub digest 校验失败。" >&2
+    return 1
+  }
+}
+
+download_source() {
+  local temp=$1 metadata tag immutable target product archive sums manifest
+  local manifest_tag manifest_version manifest_commit source_tag source_version source_commit
+  metadata="$temp/release.json"
+  if [[ -n $TBC_RELEASE_TAG ]]; then
+    [[ $TBC_RELEASE_TAG =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || die "TBC_RELEASE_TAG 格式无效。"
+    curl -fsSL -H 'Accept: application/vnd.github+json' "$RELEASES_API/tags/$TBC_RELEASE_TAG" -o "$metadata"
+  else
+    curl -fsSL -H 'Accept: application/vnd.github+json' "$RELEASES_API/latest" -o "$metadata"
+  fi
+  tag=$(release_field "$metadata" tag_name)
+  immutable=$(release_immutable "$metadata")
+  target=$(release_field "$metadata" target_commitish)
+  [[ $tag =~ ^v([0-9]+[.][0-9]+[.][0-9]+)$ ]] || die "无法解析可信 Release 版本。"
+  product=${BASH_REMATCH[1]}
+  [[ $immutable == true ]] || die "Release $tag 不是 Immutable Release；拒绝作为安装/更新源。"
+  [[ $target =~ ^[0-9a-f]{40}$ ]] || die "Release $tag 未绑定到固定 40 位提交；拒绝继续。"
+  if have gh && gh release verify --help >/dev/null 2>&1 && gh release verify-asset --help >/dev/null 2>&1; then
+    GH_PROMPT_DISABLED=1 gh release verify "$tag" -R "$REPO" >/dev/null || die "Release $tag 的 GitHub attestation 验证失败。"
+    local verify_attestation=1
+  else
+    local verify_attestation=0
+    echo "警告: 当前 GitHub CLI 不支持 release attestation 本地验证；继续使用 immutable Release + GitHub asset digest + SHA256 + manifest 校验。" >&2
+  fi
+  if version_lt "$product" "$MANAGER_VERSION" && [[ $TBC_ALLOW_DOWNGRADE != 1 ]]; then
+    die "Release $tag 低于当前管理器最低可信版本 v$MANAGER_VERSION；拒绝降级。"
+  fi
+  if [[ -n $VERSION && $VERSION =~ ^([0-9]+[.][0-9]+[.][0-9]+) ]] &&
+     version_lt "$product" "${BASH_REMATCH[1]}" && [[ $TBC_ALLOW_DOWNGRADE != 1 ]]; then
+    die "Release $tag 低于当前已安装版本 ${BASH_REMATCH[1]}；如确需降级请显式设置 TBC_ALLOW_DOWNGRADE=1。"
+  fi
+
+  sums="$temp/$RELEASE_SUMS_ASSET"
+  manifest="$temp/$RELEASE_MANIFEST_ASSET"
+  archive="$temp/$RELEASE_SOURCE_ASSET"
+  curl -fsSL "https://github.com/$REPO/releases/download/$tag/$RELEASE_SUMS_ASSET" -o "$sums"
+  verify_release_asset_digest "$metadata" "$sums" "$RELEASE_SUMS_ASSET" || die "Release 校验文件不可信。"
+  curl -fsSL "https://github.com/$REPO/releases/download/$tag/$RELEASE_MANIFEST_ASSET" -o "$manifest"
+  curl -fsSL "https://github.com/$REPO/releases/download/$tag/$RELEASE_SOURCE_ASSET" -o "$archive"
+  if (( verify_attestation )); then
+    GH_PROMPT_DISABLED=1 gh release verify-asset "$tag" "$sums" -R "$REPO" >/dev/null || die "$RELEASE_SUMS_ASSET attestation 验证失败。"
+    GH_PROMPT_DISABLED=1 gh release verify-asset "$tag" "$manifest" -R "$REPO" >/dev/null || die "$RELEASE_MANIFEST_ASSET attestation 验证失败。"
+    GH_PROMPT_DISABLED=1 gh release verify-asset "$tag" "$archive" -R "$REPO" >/dev/null || die "$RELEASE_SOURCE_ASSET attestation 验证失败。"
+  fi
+  (cd "$temp" && sha256sum -c "$RELEASE_SUMS_ASSET" --ignore-missing) >/dev/null || die "Release SHA256 校验失败。"
+  verify_release_asset_digest "$metadata" "$manifest" "$RELEASE_MANIFEST_ASSET" || die "Release manifest digest 校验失败。"
+  verify_release_asset_digest "$metadata" "$archive" "$RELEASE_SOURCE_ASSET" || die "Release source digest 校验失败。"
+
+  manifest_tag=$(release_manifest_value "$manifest" TAG)
+  manifest_version=$(release_manifest_value "$manifest" VERSION)
+  manifest_commit=$(release_manifest_value "$manifest" COMMIT)
+  [[ $manifest_tag == "$tag" && $manifest_version == "$product" && $manifest_commit == "$target" ]] ||
+    die "Release manifest 与 GitHub Release 元数据不一致。"
+
+  if tar -tzf "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+    die "Release source archive 包含不安全路径。"
+  fi
+  mkdir -p "$temp/source"
+  tar -xzf "$archive" --strip-components=1 -C "$temp/source"
+  [[ -r $temp/source/.tbc-release ]] || die "Release source 缺少 .tbc-release 身份文件。"
+  source_tag=$(release_manifest_value "$temp/source/.tbc-release" TAG)
+  source_version=$(release_manifest_value "$temp/source/.tbc-release" VERSION)
+  source_commit=$(release_manifest_value "$temp/source/.tbc-release" COMMIT)
+  [[ $source_tag == "$manifest_tag" && $source_version == "$manifest_version" && $source_commit == "$manifest_commit" ]] ||
+    die "Release source 身份与 manifest 不一致。"
+  printf '%s\n' "$manifest_commit"
+}
+
+source_product_version() {
   local source=$1 version
   version=$(sed -nE 's/^#define BRUTAL_VERSION_(MAJOR|MINOR|PATCH)[[:space:]]+([0-9]+).*/\2/p' "$source/brutal.h" | paste -sd.)
   [[ $version =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] || die "无法读取模块版本。"
   printf '%s\n' "$version"
+}
+
+source_version() {
+  local source=$1 sha=$2 product
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "无法生成 DKMS 构建身份：提交号无效。"
+  product=$(source_product_version "$source")
+  printf '%s.custom.%s\n' "$product" "${sha:0:7}"
+}
+
+build_commit_marker() {
+  local version=$1
+  [[ -r $DKMS_SOURCE_ROOT/$PACKAGE-$version/.tbc-commit ]] || return 1
+  cat "$DKMS_SOURCE_ROOT/$PACKAGE-$version/.tbc-commit"
 }
 
 install_manager() {
@@ -277,10 +399,12 @@ install_manager() {
 }
 
 build_dkms() {
-  local source=$1 target="/usr/src/$PACKAGE-$VERSION"
+  local source=$1 target="$DKMS_SOURCE_ROOT/$PACKAGE-$VERSION"
+  [[ $COMMIT =~ ^[0-9a-f]{40}$ ]] || die "缺少有效提交号，拒绝构建 DKMS。"
   rm -rf "$target"
   install -d -m 0755 "$target"
   cp -a "$source/." "$target/"
+  printf '%s\n' "$COMMIT" >"$target/.tbc-commit"
   (cd "$target" && PACKAGE_NAME="$PACKAGE" PACKAGE_VERSION="$VERSION" ./scripts/mkdkmsconf.sh >dkms.conf)
   dkms status -m "$PACKAGE" -v "$VERSION" >/dev/null 2>&1 || dkms add -m "$PACKAGE" -v "$VERSION"
   dkms build -m "$PACKAGE" -v "$VERSION"
@@ -301,11 +425,11 @@ remove_custom_dkms() {
     valid_custom_version "$version" || continue
     [[ $version == "$VERSION" ]] && continue
     dkms remove -m "$PACKAGE" -v "$version" --all || return 1
-    rm -rf "/usr/src/$PACKAGE-$version" "$STATE_DIR/source-$version"
+    rm -rf "$DKMS_SOURCE_ROOT/$PACKAGE-$version" "$STATE_DIR/source-$version"
   done < <(dkms status -m "$PACKAGE" 2>/dev/null | sed -nE "s#^$PACKAGE/([^,]+),.*#\1#p" | sort -u)
   if valid_custom_version "$VERSION"; then
     dkms remove -m "$PACKAGE" -v "$VERSION" --all || return 1
-    rm -rf "/usr/src/$PACKAGE-$VERSION" "$STATE_DIR/source-$VERSION"
+    rm -rf "$DKMS_SOURCE_ROOT/$PACKAGE-$VERSION" "$STATE_DIR/source-$VERSION"
   fi
 }
 
@@ -319,7 +443,7 @@ remove_old_custom_dkms() {
     [[ $version == "$keep" ]] && continue
     valid_custom_version "$version" || continue
     dkms remove -m "$PACKAGE" -v "$version" --all || return 1
-    rm -rf "/usr/src/$PACKAGE-$version" "$STATE_DIR/source-$version"
+    rm -rf "$DKMS_SOURCE_ROOT/$PACKAGE-$version" "$STATE_DIR/source-$version"
   done < <(dkms status -m "$PACKAGE" 2>/dev/null | sed -nE "s#^$PACKAGE/([^,]+),.*#\1#p" | sort -u)
 }
 
@@ -470,6 +594,20 @@ clear_managed_port_rules_family() {
     }')
 }
 
+managed_port_rules_family() {
+  local family=$1
+  ip "-$family" rule show | awk -v t="$PORT_TABLE" -v b="$PORT_RULE_PREF_BASE" -v m="$PORT_RULE_PREF_MAX" '
+    {
+      pref=$1; sub(/:$/, "", pref); sport=""; table=""; proto=""
+      for(i=1;i<=NF;i++) {
+        if($i=="sport") sport=$(i+1)
+        if($i=="lookup") table=$(i+1)
+        if($i=="ipproto") proto=$(i+1)
+      }
+      if(pref>=b && pref<=m && table==t && proto=="tcp" && sport!="") print pref, sport
+    }'
+}
+
 check_port_policy_conflicts_family() {
   local family=$1 bad managed_count route_count
   bad=$(ip "-$family" rule show | awk -v t="$PORT_TABLE" -v b="$PORT_RULE_PREF_BASE" -v m="$PORT_RULE_PREF_MAX" '
@@ -484,13 +622,97 @@ check_port_policy_conflicts_family() {
       if((table==t || (pref>=b && pref<=m)) && !ours) print
     }')
   [[ -z $bad ]] || { echo "错误: IPv$family 端口策略保留区域存在非受管规则：$bad" >&2; return 1; }
-  managed_count=$(ip "-$family" rule show | awk -v t="$PORT_TABLE" -v b="$PORT_RULE_PREF_BASE" -v m="$PORT_RULE_PREF_MAX" '
-    { pref=$1; sub(/:$/, "", pref); if(pref>=b && pref<=m && $0 ~ ("lookup " t) && $0 ~ /ipproto tcp/ && $0 ~ /sport /) n++ } END {print n+0}')
+  managed_count=$(managed_port_rules_family "$family" | awk 'END {print NR+0}')
   route_count=$(ip "-$family" route show table "$PORT_TABLE" 2>/dev/null | awk 'END {print NR+0}')
   if (( route_count > 0 && managed_count == 0 )); then
     echo "错误: IPv$family 路由表 $PORT_TABLE 已被其他配置占用。" >&2
     return 1
   fi
+}
+
+check_port_policy_complex_family() {
+  local family=$1 bad defaults routes
+  bad=$(ip "-$family" rule show | awk -v t="$PORT_TABLE" -v b="$PORT_RULE_PREF_BASE" -v m="$PORT_RULE_PREF_MAX" '
+    {
+      pref=$1; sub(/:$/, "", pref); sport=""; table=""; proto=""
+      for(i=1;i<=NF;i++) {
+        if($i=="sport") sport=$(i+1)
+        if($i=="lookup") table=$(i+1)
+        if($i=="ipproto") proto=$(i+1)
+      }
+      ours=(pref>=b && pref<=m && table==t && proto=="tcp" && sport!="")
+      standard=(pref==0 && table=="local") || (pref==32766 && table=="main") || (pref==32767 && table=="default")
+      if(!ours && !standard) print
+    }')
+  [[ -z $bad ]] || {
+    echo "错误: IPv$family 检测到自定义策略路由规则；端口模式不会自动接管复杂策略路由：$bad" >&2
+    return 1
+  }
+  routes=$(ip "-$family" route show table main)
+  if grep -Eq '(^|[[:space:]])(nexthop|nhid|encap)([[:space:]]|$)' <<<"$routes"; then
+    echo "错误: IPv$family main 路由表包含 multipath/nhid/encap，端口模式拒绝自动克隆。" >&2
+    return 1
+  fi
+  defaults=$(awk '$1=="default" {n++} END {print n+0}' <<<"$routes")
+  if (( defaults > 1 )); then
+    echo "错误: IPv$family main 路由表存在多个默认路由，端口模式拒绝自动选择。" >&2
+    return 1
+  fi
+}
+
+port_policy_preflight() {
+  local normalized=$1 family
+  check_port_policy_conflicts_family 4 || return 1
+  check_port_policy_conflicts_family 6 || return 1
+  [[ -n $normalized ]] || return 0
+  if ip -o link show type vrf 2>/dev/null | grep -q .; then
+    echo "错误: 检测到 VRF；端口模式不会自动修改 VRF/策略路由环境。" >&2
+    return 1
+  fi
+  for family in 4 6; do
+    family_enabled "$family" || continue
+    check_port_policy_complex_family "$family" || return 1
+  done
+}
+
+port_route_fingerprint_family() {
+  local family=$1
+  ip "-$family" -N route show table main | cksum | awk '{print $1 ":" $2}'
+}
+
+snapshot_port_policy_family() {
+  local family=$1 dir=$2
+  ip "-$family" -N route show table "$PORT_TABLE" >"$dir/routes$family" 2>/dev/null || : >"$dir/routes$family"
+  managed_port_rules_family "$family" >"$dir/rules$family"
+}
+
+snapshot_port_policy() {
+  local dir=$1
+  snapshot_port_policy_family 4 "$dir" || return 1
+  snapshot_port_policy_family 6 "$dir" || return 1
+}
+
+restore_port_policy_family() {
+  local family=$1 dir=$2 line pref sport clean
+  local -a args=()
+  clear_managed_port_rules_family "$family" || return 1
+  ip "-$family" route flush table "$PORT_TABLE" >/dev/null 2>&1 || true
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    clean=$(sanitize_route_line "$line")
+    read -r -a args <<<"$clean"
+    ip "-$family" route add table "$PORT_TABLE" "${args[@]}" || return 1
+  done <"$dir/routes$family"
+  while read -r pref sport; do
+    [[ -n ${pref:-} && -n ${sport:-} ]] || continue
+    ip "-$family" rule add priority "$pref" ipproto tcp sport "$sport" lookup "$PORT_TABLE" || return 1
+  done <"$dir/rules$family"
+}
+
+restore_port_policy() {
+  local dir=$1
+  restore_port_policy_family 4 "$dir" || return 1
+  restore_port_policy_family 6 "$dir" || return 1
 }
 
 reset_port_policy() {
@@ -501,26 +723,68 @@ reset_port_policy() {
 }
 
 apply_port_rules() {
-  local normalized applied=0 family pref spec
+  local dry_run=${1:-0} normalized applied=0 family pref spec snapshot="" current_fingerprint
   local -a specs=()
+  local -A route_fingerprint=()
   normalized=$(normalize_ports "$TCP_PORTS") || { echo "错误: TCP 端口配置无效。" >&2; return 1; }
   TCP_PORTS=$normalized
-  check_port_policy_conflicts_family 4 || return 1
-  check_port_policy_conflicts_family 6 || return 1
-  reset_port_policy || return 1
-  [[ -n $TCP_PORTS ]] || return 0
-  IFS=, read -r -a specs <<<"$TCP_PORTS"
-  ((${#specs[@]} <= PORT_RULE_PREF_MAX - PORT_RULE_PREF_BASE + 1)) || {
-    echo "错误: 端口规则过多；最多支持 $((PORT_RULE_PREF_MAX - PORT_RULE_PREF_BASE + 1)) 个合并区间。" >&2
-    return 1
-  }
+  if [[ -n $TCP_PORTS ]]; then
+    IFS=, read -r -a specs <<<"$TCP_PORTS"
+    ((${#specs[@]} <= PORT_RULE_PREF_MAX - PORT_RULE_PREF_BASE + 1)) || {
+      echo "错误: 端口规则过多；最多支持 $((PORT_RULE_PREF_MAX - PORT_RULE_PREF_BASE + 1)) 个合并区间。" >&2
+      return 1
+    }
+  fi
+  port_policy_preflight "$TCP_PORTS" || return 1
+  if [[ $dry_run == 1 ]]; then
+    note "端口策略预检通过；未修改任何路由或规则。"
+    return 0
+  fi
   for family in 4 6; do
     family_enabled "$family" || continue
-    if ! sync_port_table_family "$family"; then reset_port_policy || true; return 1; fi
+    route_fingerprint[$family]=$(port_route_fingerprint_family "$family") || return 1
+  done
+  snapshot=$(mktemp -d) || return 1
+  if ! snapshot_port_policy "$snapshot"; then
+    rm -rf "$snapshot"
+    echo "错误: 无法创建端口策略快照，拒绝修改。" >&2
+    return 1
+  fi
+  if ! reset_port_policy; then
+    restore_port_policy "$snapshot" || true
+    rm -rf "$snapshot"
+    return 1
+  fi
+  if [[ -z $TCP_PORTS ]]; then
+    rm -rf "$snapshot"
+    return 0
+  fi
+  for family in 4 6; do
+    family_enabled "$family" || continue
+    current_fingerprint=$(port_route_fingerprint_family "$family") || current_fingerprint=""
+    if [[ $current_fingerprint != "${route_fingerprint[$family]}" ]]; then
+      echo "错误: IPv$family main 路由表在预检后发生变化；已取消端口策略修改。" >&2
+      restore_port_policy "$snapshot" || echo "警告: 端口策略自动回滚失败。" >&2
+      rm -rf "$snapshot"
+      return 1
+    fi
+    if ! sync_port_table_family "$family"; then
+      restore_port_policy "$snapshot" || echo "警告: 端口策略自动回滚失败。" >&2
+      rm -rf "$snapshot"
+      return 1
+    fi
+    current_fingerprint=$(port_route_fingerprint_family "$family") || current_fingerprint=""
+    if [[ $current_fingerprint != "${route_fingerprint[$family]}" ]]; then
+      echo "错误: IPv$family main 路由表在复制过程中发生变化；已回滚端口策略。" >&2
+      restore_port_policy "$snapshot" || echo "警告: 端口策略自动回滚失败。" >&2
+      rm -rf "$snapshot"
+      return 1
+    fi
     pref=$PORT_RULE_PREF_BASE
     for spec in "${specs[@]}"; do
       if ! ip "-$family" rule add priority "$pref" ipproto tcp sport "$spec" lookup "$PORT_TABLE"; then
-        reset_port_policy || true
+        restore_port_policy "$snapshot" || echo "警告: 端口策略自动回滚失败。" >&2
+        rm -rf "$snapshot"
         return 1
       fi
       ((pref+=1))
@@ -528,10 +792,192 @@ apply_port_rules() {
     applied=1
   done
   if (( ! applied )); then
-    reset_port_policy || true
+    restore_port_policy "$snapshot" || echo "警告: 端口策略自动回滚失败。" >&2
+    rm -rf "$snapshot"
     echo "错误: 未检测到可用地址族，无法应用端口策略。" >&2
     return 1
   fi
+  rm -rf "$snapshot"
+}
+
+ports_check() {
+  need_root; load_config
+  [[ $MANAGED == 1 ]] || die "请先安装。"
+  apply_port_rules 1 || die "端口策略预检失败。"
+}
+
+aggregate_filter_owned() {
+  local dev=$1 out
+  out=$(tc filter show dev "$dev" egress pref "$AGGREGATE_FILTER_PREF" 2>/dev/null || true)
+  [[ -n $out && $out == *"handle $AGGREGATE_FILTER_HANDLE"* && $out == *"matchall"* && $out == *"police"* ]]
+}
+
+aggregate_filter_conflicts() {
+  local dev=$1 out
+  out=$(tc filter show dev "$dev" egress pref "$AGGREGATE_FILTER_PREF" 2>/dev/null || true)
+  [[ -z $out ]] && return 1
+  aggregate_filter_owned "$dev" && return 1
+  return 0
+}
+
+aggregate_other_egress_filters() {
+  local dev=$1 out
+  out=$(tc filter show dev "$dev" egress 2>/dev/null || true)
+  [[ -z $out ]] && return 1
+  if aggregate_filter_owned "$dev"; then
+    out=$(awk -v p="$AGGREGATE_FILTER_PREF" '
+      /^filter / {keep=($0 !~ ("pref " p " ") && $0 !~ ("pref " p "$"))}
+      keep {print}
+    ' <<<"$out")
+  fi
+  [[ -n $out ]]
+}
+
+aggregate_resolve_dev() {
+  local family line dev
+  local -a devs=()
+  for family in 4 6; do
+    family_enabled "$family" || continue
+    while IFS= read -r line; do
+      dev=$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<<"$line")
+      [[ -n $dev ]] && devs+=("$dev")
+    done < <(ip "-$family" route show default)
+  done
+  mapfile -t devs < <(printf '%s\n' "${devs[@]}" | sed '/^$/d' | sort -u)
+  ((${#devs[@]} == 1)) || {
+    if ((${#devs[@]} == 0)); then
+      echo "错误: 未检测到唯一出口接口，无法启用总出口保护。" >&2
+    else
+      echo "错误: 检测到多个出口接口（${devs[*]}）；总出口保护拒绝自动拆分限速。" >&2
+    fi
+    return 1
+  }
+  printf '%s\n' "${devs[0]}"
+}
+
+aggregate_burst_bytes() {
+  awk -v r="$1" 'BEGIN { b=int(r*12500); if(b<16384)b=16384; if(b>4194304)b=4194304; print b }'
+}
+
+aggregate_state_load() {
+  AGG_STATE_DEV=""; AGG_STATE_CLSACT=0
+  [[ -r $AGGREGATE_STATE ]] || return 0
+  local key value
+  while IFS='=' read -r key value; do
+    case $key in
+      DEV) AGG_STATE_DEV=$value ;;
+      CLSACT_CREATED) [[ $value == 0 || $value == 1 ]] || return 1; AGG_STATE_CLSACT=$value ;;
+    esac
+  done <"$AGGREGATE_STATE"
+  [[ -z $AGG_STATE_DEV || $AGG_STATE_DEV =~ ^[A-Za-z0-9_.:@-]{1,32}$ ]] || return 1
+}
+
+aggregate_state_save() {
+  local dev=$1 created=$2
+  install -d -m 0755 "$STATE_DIR"
+  {
+    printf 'DEV=%s\n' "$dev"
+    printf 'CLSACT_CREATED=%s\n' "$created"
+  } >"$AGGREGATE_STATE.tmp"
+  mv "$AGGREGATE_STATE.tmp" "$AGGREGATE_STATE"
+}
+
+aggregate_remove_owned_from_dev() {
+  local dev=$1 remove_clsact=${2:-0}
+  [[ -n $dev ]] || return 0
+  if aggregate_filter_owned "$dev"; then
+    tc filter del dev "$dev" egress pref "$AGGREGATE_FILTER_PREF" protocol all handle "$AGGREGATE_FILTER_HANDLE" matchall || return 1
+  elif tc filter show dev "$dev" egress pref "$AGGREGATE_FILTER_PREF" 2>/dev/null | grep -q .; then
+    echo "错误: $dev 的 egress pref $AGGREGATE_FILTER_PREF 不再属于本项目，拒绝删除。" >&2
+    return 1
+  fi
+  if [[ $remove_clsact == 1 ]] && tc qdisc show dev "$dev" | grep -q '^qdisc clsact '; then
+    if ! tc filter show dev "$dev" ingress 2>/dev/null | grep -q . && ! tc filter show dev "$dev" egress 2>/dev/null | grep -q .; then
+      tc qdisc del dev "$dev" clsact || return 1
+    fi
+  fi
+}
+
+aggregate_preflight() {
+  local dev=$1
+  ip link show dev "$dev" >/dev/null 2>&1 || { echo "错误: 出口接口不存在：$dev" >&2; return 1; }
+  if aggregate_filter_conflicts "$dev"; then
+    echo "错误: $dev 的 egress pref $AGGREGATE_FILTER_PREF 已被其他配置占用。" >&2
+    return 1
+  fi
+  if aggregate_other_egress_filters "$dev"; then
+    echo "错误: $dev 已存在其他 egress tc filter；为避免改变宿主流控语义，拒绝自动叠加。" >&2
+    return 1
+  fi
+}
+
+apply_aggregate_cap() {
+  local dry_run=${1:-0} dev old_dev old_created=0 created=0 burst
+  aggregate_state_load || { echo "错误: 总出口保护状态文件损坏。" >&2; return 1; }
+  old_dev=$AGG_STATE_DEV; old_created=$AGG_STATE_CLSACT
+  if [[ $AGGREGATE_RATE == 0 ]]; then
+    if [[ $dry_run == 1 ]]; then
+      note "总出口保护关闭；预检未修改系统。"
+      return 0
+    fi
+    aggregate_remove_owned_from_dev "$old_dev" "$old_created" || return 1
+    rm -f "$AGGREGATE_STATE"
+    return 0
+  fi
+  valid_rate "$AGGREGATE_RATE" || { echo "错误: 总出口速率无效。" >&2; return 1; }
+  dev=$(aggregate_resolve_dev) || return 1
+  aggregate_preflight "$dev" || return 1
+  if [[ $dry_run == 1 ]]; then
+    note "总出口保护预检通过：$dev @ ${AGGREGATE_RATE} Mbps；未修改 root qdisc。"
+    return 0
+  fi
+  if tc qdisc show dev "$dev" | grep -q '^qdisc clsact '; then
+    [[ $old_dev == "$dev" ]] && created=$old_created || created=0
+  else
+    tc qdisc add dev "$dev" clsact || return 1
+    created=1
+  fi
+  burst=$(aggregate_burst_bytes "$AGGREGATE_RATE")
+  if ! tc filter replace dev "$dev" egress pref "$AGGREGATE_FILTER_PREF" protocol all handle "$AGGREGATE_FILTER_HANDLE" matchall \
+      action police rate "${AGGREGATE_RATE}mbit" burst "${burst}b" drop; then
+    (( created )) && tc qdisc del dev "$dev" clsact >/dev/null 2>&1 || true
+    return 1
+  fi
+  aggregate_state_save "$dev" "$created" || {
+    aggregate_remove_owned_from_dev "$dev" "$created" || true
+    return 1
+  }
+  if [[ -n $old_dev && $old_dev != "$dev" ]]; then
+    aggregate_remove_owned_from_dev "$old_dev" "$old_created" || {
+      echo "警告: 新出口保护已启用，但旧接口 $old_dev 的受管 filter 清理失败。" >&2
+      return 1
+    }
+  fi
+}
+
+aggregate_check() {
+  need_root; load_config
+  [[ $MANAGED == 1 ]] || die "请先安装。"
+  apply_aggregate_cap 1 || die "总出口保护预检失败。"
+}
+
+set_aggregate() {
+  need_root; load_config
+  [[ $MANAGED == 1 ]] || die "请先安装。"
+  local answer old=$AGGREGATE_RATE
+  read_tty "总出口上限 Mbps [$AGGREGATE_RATE]（输入 none/off/0 关闭）: " answer
+  answer=${answer:-$AGGREGATE_RATE}
+  case ${answer,,} in none|off|clear|0) answer=0 ;; esac
+  [[ $answer == 0 ]] || valid_rate "$answer" || die "速率必须为 0（关闭）或 0.5 到 1000000 Mbps。"
+  [[ $answer != "$AGGREGATE_RATE" ]] || { note "总出口配置未变化。"; return 0; }
+  AGGREGATE_RATE=$answer
+  if ! apply_aggregate_cap; then
+    AGGREGATE_RATE=$old
+    apply_aggregate_cap || true
+    die "应用总出口保护失败，已尝试恢复原配置。"
+  fi
+  save_config
+  note "总出口保护已更新：$([[ $AGGREGATE_RATE == 0 ]] && echo 已关闭 || echo "${AGGREGATE_RATE} Mbps")"
 }
 
 apply_rules() {
@@ -539,6 +985,7 @@ apply_rules() {
   [[ $MANAGED == 1 ]] || die "尚未完成安装。"
   apply_configured_rules || die "恢复规则失败。"
   apply_port_rules || die "恢复端口策略失败。"
+  apply_aggregate_cap || die "恢复总出口保护失败。"
   module_supports_peers || die "当前加载的模块不支持活跃 IP 视图；请重启服务器完成更新。"
   finalize_pending_update || die "更新收尾验证失败；请检查当前加载模块后重试。"
 }
@@ -590,7 +1037,7 @@ disable_boot() {
 install_or_update() (
   set -Eeuo pipefail
   need_root; check_platform; load_config
-  local old_version=$VERSION old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE old_tcp_ports=$TCP_PORTS old_managed=$MANAGED
+  local old_version=$VERSION old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE old_tcp_ports=$TCP_PORTS old_aggregate=$AGGREGATE_RATE old_managed=$MANAGED
   local temp="" sha source has_upstream=0 needs_migration=0 needs_install=0 switch_needed=0 switch_complete=0
   local disk_module_changed=0 artifacts_changed=0
   local had_config=0 had_manager=0 had_legacy_manager=0 had_brutalctl=0 had_service=0 had_modules_load=0 was_boot_enabled=0
@@ -614,11 +1061,12 @@ install_or_update() (
       if [[ -n $old_version || ${#upstream_versions[@]} -gt 0 ]]; then
         modprobe brutal >/dev/null 2>&1 || echo "警告: 无法重新加载原 brutal 模块。" >&2
       fi
-      MODE=$old_mode; IPV4_RATE=$old_ipv4; IPV6_RATE=$old_ipv6; TCP_PORTS=$old_tcp_ports; MANAGED=$old_managed
+      MODE=$old_mode; IPV4_RATE=$old_ipv4; IPV6_RATE=$old_ipv6; TCP_PORTS=$old_tcp_ports; AGGREGATE_RATE=$old_aggregate; MANAGED=$old_managed
       ALLOW_RULE_REPLACE=0
       if (( old_managed )); then
         apply_configured_rules >/dev/null 2>&1 || echo "警告: 无法恢复原 TCP Brutal 规则。" >&2
         apply_port_rules >/dev/null 2>&1 || echo "警告: 无法恢复原端口策略。" >&2
+        apply_aggregate_cap >/dev/null 2>&1 || echo "警告: 无法恢复原总出口保护。" >&2
       fi
     elif (( disk_module_changed && ! switch_complete )); then
       if [[ -n $old_version ]] && custom_version_installed "$old_version"; then
@@ -670,13 +1118,15 @@ install_or_update() (
   sha=$(download_source "$temp")
   source="$temp/source"
   VERSION=$(source_version "$source" "$sha")
+  COMMIT=$sha
   if custom_version_installed "$VERSION"; then
-    note "当前版本已安装：$VERSION"
-    [[ $old_version == "$VERSION" ]] || COMMIT=""
+    local installed_commit
+    installed_commit=$(build_commit_marker "$VERSION" || true)
+    [[ $installed_commit == "$COMMIT" ]] || die "检测到 DKMS 构建身份冲突：$VERSION 未绑定到目标提交 $COMMIT；拒绝继续。"
+    note "当前构建已安装：$VERSION"
   else
     build_dkms "$source"
     needs_install=1
-    COMMIT=$sha
   fi
   make -C "$source/tools"
   if (( ! old_managed )); then
@@ -723,6 +1173,9 @@ install_or_update() (
   if ! apply_port_rules; then
     die "端口策略应用失败；已保留 DKMS 构建。"
   fi
+  if ! apply_aggregate_cap; then
+    die "总出口保护应用失败；已保留 DKMS 构建。"
+  fi
   module_supports_peers || die "新模块缺少活跃 IP 视图接口。"
   save_config
   enable_boot
@@ -741,11 +1194,12 @@ set_rate() {
   [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "无效模式。"
   IPV4_RATE=$(ask_rate IPv4 "$IPV4_RATE")
   IPV6_RATE=$(ask_rate IPv6 "$IPV6_RATE")
-  if ! apply_configured_rules || ! apply_port_rules; then
+  if ! apply_configured_rules || ! apply_port_rules || ! apply_aggregate_cap; then
     MODE=$old_mode; IPV4_RATE=$old_ipv4; IPV6_RATE=$old_ipv6
     apply_configured_rules || true
     apply_port_rules || true
-    die "应用新速率失败，已尝试恢复原规则和端口策略。"
+    apply_aggregate_cap || true
+    die "应用新速率失败，已尝试恢复原规则、端口策略和总出口保护。"
   fi
   save_config
   note "速率已更新。"
@@ -774,9 +1228,16 @@ status() {
   need_root; load_config
   echo "TCP Brutal Custom"
   echo "提交: ${COMMIT:-未安装}"
-  echo "DKMS: ${VERSION:-未安装}"
+  if [[ -n $VERSION ]]; then
+    echo "产品版本: ${VERSION%%.custom.*}"
+    echo "DKMS 构建: $VERSION"
+  else
+    echo "产品版本: 未安装"
+    echo "DKMS 构建: 未安装"
+  fi
   echo "配置速率: IPv4 ${IPV4_RATE} Mbps，IPv6 ${IPV6_RATE} Mbps"
   echo "Brutal TCP 端口: ${TCP_PORTS:-未配置}"
+  echo "总出口保护: $([[ $AGGREGATE_RATE == 0 ]] && echo 已关闭 || echo "${AGGREGATE_RATE} Mbps")"
   show_stack
   systemctl is-enabled --quiet tcp-brutal-custom.service && echo "开机启动: 已启用" || echo "开机启动: 未启用"
   module_loaded && echo "模块: 已加载" || echo "模块: 未加载"
@@ -819,7 +1280,7 @@ uninstall() (
   set -Eeuo pipefail
   need_root; load_config
   [[ $MANAGED == 1 ]] || die "未找到本项目安装记录。"
-  local complete=0 changed=0
+  local complete=0 changed=0 old_aggregate=$AGGREGATE_RATE
   cleanup_uninstall() {
     local rc=$?
     trap - EXIT INT TERM
@@ -828,6 +1289,8 @@ uninstall() (
       modprobe brutal >/dev/null 2>&1 || echo "警告: 无法重新加载 brutal 模块。" >&2
       apply_configured_rules >/dev/null 2>&1 || echo "警告: 无法恢复卸载前的规则。" >&2
       apply_port_rules >/dev/null 2>&1 || echo "警告: 无法恢复卸载前的端口策略。" >&2
+      AGGREGATE_RATE=$old_aggregate
+      apply_aggregate_cap >/dev/null 2>&1 || echo "警告: 无法恢复卸载前的总出口保护。" >&2
     fi
     exit "$rc"
   }
@@ -840,6 +1303,8 @@ uninstall() (
     check_port_policy_conflicts_family 6 || die "端口策略存在冲突，拒绝卸载。"
     reset_port_policy || die "清理端口策略失败。"
   fi
+  AGGREGATE_RATE=0
+  apply_aggregate_cap || die "清理总出口保护失败。"
   if module_loaded && ! rmmod brutal; then
     die "Brutal 模块正在使用，无法安全卸载；请结束使用该模块的连接后重试。"
   fi
@@ -872,12 +1337,15 @@ TCP Brutal Custom 管理器 v$MANAGER_VERSION
 1. 安装 / 更新
 2. 设置 IPv4 / IPv6 速率
 3. 设置 Brutal TCP 端口
-4. 开启开机启动
-5. 关闭开机启动
-6. 查看状态
-7. 查看活跃 IP
-8. 实时查看活跃 IP
-9. 卸载
+4. 设置总出口带宽保护
+5. 开启开机启动
+6. 关闭开机启动
+7. 查看状态
+8. 查看活跃 IP
+9. 实时查看活跃 IP
+10. 卸载
+11. 端口策略安全预检（不修改系统）
+12. 总出口保护安全预检（不修改系统）
 0. 退出
 EOF
     local choice
@@ -886,12 +1354,15 @@ EOF
       1) run_menu_action install_or_update ;;
       2) run_menu_action set_rate ;;
       3) run_menu_action set_ports ;;
-      4) run_menu_action enable_boot ;;
-      5) run_menu_action disable_boot ;;
-      6) run_menu_action status ;;
-      7) run_menu_action view ;;
-      8) run_menu_action view --watch ;;
-      9) run_menu_action uninstall ;;
+      4) run_menu_action set_aggregate ;;
+      5) run_menu_action enable_boot ;;
+      6) run_menu_action disable_boot ;;
+      7) run_menu_action status ;;
+      8) run_menu_action view ;;
+      9) run_menu_action view --watch ;;
+      10) run_menu_action uninstall ;;
+      11) run_menu_action ports_check ;;
+      12) run_menu_action aggregate_check ;;
       0) return ;;
       *) echo "无效选择。" ;;
     esac
@@ -907,11 +1378,14 @@ case ${1:-menu} in
   install|update) install_or_update ;;
   rate) set_rate ;;
   ports) set_ports ;;
+  ports-check) ports_check ;;
+  aggregate) set_aggregate ;;
+  aggregate-check) aggregate_check ;;
   apply) apply_rules ;;
   enable) enable_boot ;;
   disable) disable_boot ;;
   status) status ;;
   view) shift; view "$@" ;;
   uninstall) uninstall ;;
-  *) echo "用法: $0 {install|update|rate|ports|apply|enable|disable|status|view [--watch]|uninstall}" >&2; exit 2 ;;
+  *) echo "用法: $0 {install|update|rate|ports|ports-check|aggregate|aggregate-check|apply|enable|disable|status|view [--watch]|uninstall}" >&2; exit 2 ;;
 esac

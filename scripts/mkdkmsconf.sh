@@ -11,8 +11,8 @@ module_version() {
 
 PACKAGE_NAME=${PACKAGE_NAME:-tcp-brutal}
 PACKAGE_VERSION=${PACKAGE_VERSION:-$(module_version)}
-[[ $PACKAGE_VERSION =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] || {
-  echo "PACKAGE_VERSION must use X.X.X format" >&2
+[[ $PACKAGE_VERSION =~ ^[0-9]+[.][0-9]+[.][0-9]+([.]custom[.][0-9a-f]{7})?$ ]] || {
+  echo "PACKAGE_VERSION must use X.X.X or X.X.X.custom.<sha7> format" >&2
   exit 1
 }
 

@@ -28,7 +28,7 @@ jobs:
             arch: x86
             compiler: gcc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install kernel build dependencies
         run: |
           sudo apt-get update
@@ -57,10 +57,22 @@ jobs:
   userspace:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build CLI and run user-space tests
         run: |
           make -C tools
           cc -O2 -Wall -Wextra -Werror -o /tmp/app-group-netns tests/app-group-netns.c
           bash tests/install-manager-test.sh
+          bash tests/release-chain-test.sh
+          release_test_dir=$(mktemp -d)
+          ./scripts/build-release-assets.sh v2.5.0 2.5.0 "$(git rev-parse HEAD)" "$release_test_dir"
+          test -x "$release_test_dir/install.sh"
+          grep -Eq '  install[.]sh$' "$release_test_dir/SHA256SUMS"
+          (cd "$release_test_dir" && sha256sum -c SHA256SUMS)
+          rm -rf "$release_test_dir"
+          bash tests/brutalctl-safety.sh
+          bash tests/brutalctl-route-ownership.sh
+          sudo env TBC_TEST_CC=reno bash tests/brutalctl-route-netns.sh
+          sudo env TBC_TEST_CC=reno bash tests/port-mode-preflight-netns.sh
+          sudo bash tests/aggregate-egress-netns.sh
           sudo env TBC_TEST_CC=reno bash tests/port-mode-netns.sh
