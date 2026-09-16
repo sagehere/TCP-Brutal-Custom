@@ -80,17 +80,18 @@ fi
 
 kcsan_reports=$(grep -Eic 'BUG: KCSAN: data-race' <<<"$log" || true)
 if (( kcsan_reports > 0 )); then
-  # Attribute a KCSAN report to this module only when the complete report block
-  # contains a Brutal stack symbol or module marker. This keeps unrelated
-  # virtiofs/filemap KCSAN noise visible without turning it into a project
-  # failure. A real Brutal report still fails the job.
+  # Attribute a KCSAN report to this module only when an actual access stack
+  # frame belongs to [brutal]. Workqueue metadata can name the current Brutal
+  # callback even when both raced accesses are entirely inside core kernel code,
+  # so a bare module marker is not sufficient attribution. A real Brutal stack
+  # frame still fails the job.
   if awk '
     /BUG: KCSAN: data-race/ { in_report=1; report=$0 ORS; next }
     in_report {
       report=report $0 ORS
       if (index($0, "================================") != 0) {
         lower=tolower(report)
-        if (lower ~ /brutal_[[:alnum:]_]*\+/ || lower ~ /\[brutal\]/)
+        if (lower ~ /\+0x[0-9a-f]+\/0x[0-9a-f]+[[:space:]]+\[brutal\]/)
           found=1
         in_report=0
         report=""
@@ -99,16 +100,16 @@ if (( kcsan_reports > 0 )); then
     END {
       if (in_report) {
         lower=tolower(report)
-        if (lower ~ /brutal_[[:alnum:]_]*\+/ || lower ~ /\[brutal\]/)
+        if (lower ~ /\+0x[0-9a-f]+\/0x[0-9a-f]+[[:space:]]+\[brutal\]/)
           found=1
       }
       exit found ? 0 : 1
     }
   ' <<<"$log"; then
-    echo "KCSAN reported a data race involving Brutal" >&2
+    echo "KCSAN reported a data race involving a Brutal stack frame" >&2
     exit 1
   fi
-  echo "KCSAN reported $kcsan_reports unrelated data race(s); no Brutal stack symbols found" >&2
+  echo "KCSAN reported $kcsan_reports unrelated data race(s); no Brutal access stack frames found" >&2
 fi
 
 echo "debug runtime smoke test passed"
