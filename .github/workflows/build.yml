@@ -65,7 +65,7 @@ jobs:
           bash tests/install-manager-test.sh
           bash tests/release-chain-test.sh
           release_test_dir=$(mktemp -d)
-          ./scripts/build-release-assets.sh v2.5.1 2.5.1 "$(git rev-parse HEAD)" "$release_test_dir"
+          ./scripts/build-release-assets.sh v2.5.2 2.5.2 "$(git rev-parse HEAD)" "$release_test_dir"
           test -x "$release_test_dir/install.sh"
           grep -Eq '  install[.]sh$' "$release_test_dir/SHA256SUMS"
           (cd "$release_test_dir" && sha256sum -c SHA256SUMS)
