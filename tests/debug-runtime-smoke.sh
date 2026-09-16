@@ -47,6 +47,8 @@ dmesg -C 2>/dev/null || true
 insmod "$module"
 grep -q '^brutal ' /proc/modules
 
+echo "== info ABI and capability discovery =="
+BRUTALCTL="$ctl" bash "$repo/tests/info-abi.sh"
 echo "== netns rule isolation =="
 BRUTALCTL="$ctl" bash "$repo/tests/netns-integration.sh"
 echo "== application-group netns isolation =="

@@ -10,6 +10,7 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <net/tcp.h>
+#include "brutal_uapi.h"
 
 struct seq_file;
 struct proc_ops;
@@ -27,8 +28,13 @@ struct proc_ops;
 #define BRUTAL_VERSION_PATCH 3
 #define BRUTAL_VERSION ((BRUTAL_VERSION_MAJOR << 16) | (BRUTAL_VERSION_MINOR << 8) | BRUTAL_VERSION_PATCH)
 
-#define TCP_BRUTAL_PARAMS 23301
-#define TCP_BRUTAL_VERSION 23302
+#ifndef BRUTAL_BUILD_ID
+#define BRUTAL_BUILD_ID "0000000000000000000000000000000000000000"
+#endif
+
+#define BRUTAL_CAPABILITIES                                             \
+    (BRUTAL_CAP_PERIP | BRUTAL_CAP_NETNS | BRUTAL_CAP_EXACT_RULE_HASH | \
+     BRUTAL_CAP_PEER_STATS)
 
 #define INIT_PACING_RATE 125000
 #define INIT_CWND_GAIN 20

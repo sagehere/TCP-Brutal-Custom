@@ -837,6 +837,18 @@ static int brutal_stats_show(struct seq_file *m, void *v)
     return 0;
 }
 
+static int brutal_version_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "version=%u.%u.%u\n", BRUTAL_VERSION_MAJOR,
+               BRUTAL_VERSION_MINOR, BRUTAL_VERSION_PATCH);
+    seq_printf(m, "abi=%u\n", BRUTAL_INFO_ABI_V1);
+    seq_puts(m, "vendor=tcp-brutal-custom\n");
+    seq_printf(m, "build=%.*s\n", BRUTAL_BUILD_ID_LEN, BRUTAL_BUILD_ID);
+    seq_printf(m, "capabilities=0x%016llx\n",
+               (unsigned long long)BRUTAL_CAPABILITIES);
+    return 0;
+}
+
 static int __net_init brutal_net_init(struct net *net)
 {
     struct brutal_net *bn = brutal_pernet(net);
@@ -866,6 +878,7 @@ static int __net_init brutal_net_init(struct net *net)
     if (!dir ||
         !proc_create_data("peers", 0444, dir, &brutal_peers_proc_ops, net) ||
         !proc_create_net_single("stats", 0444, dir, brutal_stats_show, NULL) ||
+        !proc_create_net_single("version", 0444, dir, brutal_version_show, NULL) ||
         !proc_create_data("rules", 0644, dir, &brutal_rules_proc_ops, net))
     {
         remove_proc_subtree("tcp_brutal", net->proc_net);

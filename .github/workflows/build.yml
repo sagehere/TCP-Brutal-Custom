@@ -61,6 +61,9 @@ jobs:
       - name: Build CLI and run user-space tests
         run: |
           make -C tools
+          cc -O2 -Wall -Wextra -Werror -std=c99 -o /tmp/brutal-info-abi tests/info-abi.c
+          /tmp/brutal-info-abi
+          bash -n tests/info-abi.sh
           bash -n tests/p2-regression.sh tests/p2-rule-scale.sh \
             tests/p2-peer-scale.sh tests/p2-peer-dump-scale.sh
           P2_DRY_RUN=1 bash tests/p2-regression.sh

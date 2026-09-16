@@ -312,6 +312,8 @@ static int __init brutal_register(void)
 
     BUILD_BUG_ON(sizeof(struct brutal) > ICSK_CA_PRIV_SIZE);
     BUILD_BUG_ON(sizeof(struct brutal_params) != 20);
+    BUILD_BUG_ON(sizeof(struct brutal_info_v1) != 64);
+    BUILD_BUG_ON(sizeof(BRUTAL_BUILD_ID) - 1 != BRUTAL_BUILD_ID_LEN);
 
     ret = brutal_sockopt_init();
     if (ret)

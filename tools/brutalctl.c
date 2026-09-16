@@ -22,8 +22,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
+#include "../brutal_uapi.h"
 
 #ifndef RULES_PATH
 #define RULES_PATH "/proc/net/tcp_brutal/rules"
@@ -35,7 +40,8 @@
 
 static int usage(void)
 {
-    fputs("usage: brutalctl list\n"
+    fputs("usage: brutalctl info\n"
+          "       brutalctl list\n"
           "       brutalctl peers [--rule ID] [--ip ADDRESS] [--family 4|6] [--limit N]\n"
           "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute] [perip]\n"
           "       brutalctl del <prefix>[/<len>]\n"
@@ -50,8 +56,6 @@ static int usage(void)
     return 2;
 }
 
-/* Run argv without a shell; capture stdout into out if given. Returns the exit
- * status, or -1 if the command could not be run. */
 static int run(char *const argv[], char *out, size_t size, int quiet)
 {
     int fds[2], status;
@@ -94,8 +98,6 @@ static char *ip_family(const char *prefix)
     return strchr(prefix, ':') ? "-6" : "-4";
 }
 
-/* How the prefix is reached today. Returns 0 with dev (and via, if any),
- * 1 for a local address, -1 if there is no route or ip failed. */
 static int route_lookup(const char *prefix, char *via, size_t vsize, char *dev, size_t dsize)
 {
     char addr[64], out[512], *tok, *save, *slash;
@@ -229,7 +231,7 @@ static void route_del(const char *prefix)
 {
     char *argv[] = {"ip", ip_family(prefix), "route", "del", (char *)prefix, "proto", ROUTE_PROTO, NULL};
 
-    run(argv, NULL, 0, 1); /* may not exist (noroute) */
+    run(argv, NULL, 0, 1);
 }
 
 static void route_flush(void)
@@ -241,7 +243,6 @@ static void route_flush(void)
     run(v6, NULL, 0, 1);
 }
 
-/* Does the list of brutalctl routes contain dst ("addr/len")? */
 static int route_present(const char *dst, char *routes)
 {
     char canon[80], *line, *save;
@@ -252,7 +253,7 @@ static int route_present(const char *dst, char *routes)
         size_t n = strcspn(line, " ");
 
         snprintf(canon, sizeof(canon), "%.*s", (int)n, line);
-        if (!strchr(canon, '/') && slash) /* ip prints host routes without /len */
+        if (!strchr(canon, '/') && slash)
             snprintf(canon + n, sizeof(canon) - n, "/%d", strchr(canon, ':') ? 128 : 32);
         if (!strcmp(canon, dst))
             return 1;
@@ -332,7 +333,6 @@ static int send_cmd(const char *cmd)
     return 1;
 }
 
-/* Copy the value of "key=" from a line of the rules file into out ("" if absent) */
 static char *field(const char *line, const char *key, char *out, size_t size)
 {
     size_t klen = strlen(key);
@@ -448,14 +448,12 @@ static int list_peers(int argc, char **argv)
     }
 
     fd = open_proc(PEERS_PATH, O_RDONLY);
-
     if (fd < 0)
         return 1;
     f = fdopen(fd, "r");
     if (!f)
     {
         int error = errno;
-
         close(fd);
         fprintf(stderr, "brutalctl: cannot read %s: %s\n", PEERS_PATH, strerror(error));
         return 1;
@@ -501,6 +499,75 @@ static int list_peers(int argc, char **argv)
         fprintf(stderr, "brutalctl: output limited to %u peers\n", limit);
     if (!rows)
         puts("当前无活跃 perip 连接");
+    return 0;
+}
+
+static int show_info(void)
+{
+    static const struct
+    {
+        unsigned long long bit;
+        const char *name;
+    } caps[] = {
+        {BRUTAL_CAP_PERIP, "perip"},
+        {BRUTAL_CAP_NETNS, "netns"},
+        {BRUTAL_CAP_EXACT_RULE_HASH, "exact-rule-hash"},
+        {BRUTAL_CAP_PEER_STATS, "peer-stats"},
+        {BRUTAL_CAP_TC_AGGREGATE_MANAGER, "tc-aggregate-manager"},
+        {BRUTAL_CAP_PEER_BUDGET, "peer-budget"},
+        {BRUTAL_CAP_PREFIX_INDEX, "prefix-index"},
+        {BRUTAL_CAP_KERNEL_AGGREGATE, "kernel-aggregate"},
+        {BRUTAL_CAP_GENL, "genl"},
+    };
+    struct brutal_info_v1 info;
+    socklen_t len = sizeof(info);
+    const char cc[] = "brutal";
+    int fd, i, first = 1;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        perror("brutalctl: socket");
+        return 1;
+    }
+    if (setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, cc, sizeof(cc)) < 0)
+    {
+        perror("brutalctl: cannot select brutal congestion control");
+        close(fd);
+        return 1;
+    }
+    memset(&info, 0, sizeof(info));
+    if (getsockopt(fd, IPPROTO_TCP, TCP_BRUTAL_INFO, &info, &len) < 0)
+    {
+        perror("brutalctl: TCP_BRUTAL_INFO");
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    if (len != sizeof(info) || info.size != sizeof(info) ||
+        info.abi_version != BRUTAL_INFO_ABI_V1)
+    {
+        fprintf(stderr, "brutalctl: unsupported TCP_BRUTAL_INFO response\n");
+        return 1;
+    }
+
+    printf("version=%u.%u.%u\n", (info.version >> 16) & 0xff,
+           (info.version >> 8) & 0xff, info.version & 0xff);
+    printf("vendor=%s\n", info.vendor_id == BRUTAL_VENDOR_CUSTOM
+                              ? "tcp-brutal-custom"
+                              : "unknown");
+    printf("abi=%u\n", info.abi_version);
+    printf("build=%.*s\n", BRUTAL_BUILD_ID_LEN, (char *)info.build_id);
+    printf("capabilities=0x%016llx\n", (unsigned long long)info.capabilities);
+    fputs("capability_names=", stdout);
+    for (i = 0; i < (int)(sizeof(caps) / sizeof(caps[0])); i++)
+    {
+        if (!(info.capabilities & caps[i].bit))
+            continue;
+        printf("%s%s", first ? "" : ",", caps[i].name);
+        first = 0;
+    }
+    putchar('\n');
     return 0;
 }
 
@@ -561,7 +628,6 @@ static int add_rule(int argc, char **argv)
     if (route)
     {
         enum route_owner owner = route_owner(argv[2]);
-
         if (owner == ROUTE_FOREIGN || owner == ROUTE_CHECK_ERROR)
             return 1;
     }
@@ -575,7 +641,7 @@ static int add_rule(int argc, char **argv)
         return ret;
     if (route)
         return route_add(argv[2], lock);
-    route_del(argv[2]); /* the rule was updated to noroute */
+    route_del(argv[2]);
     return 0;
 }
 
@@ -586,6 +652,8 @@ int main(int argc, char **argv)
 
     if (argc < 2)
         return usage();
+    if (!strcmp(argv[1], "info"))
+        return argc == 2 ? show_info() : usage();
     if (!strcmp(argv[1], "list") || !strcmp(argv[1], "ls"))
         return argc == 2 ? list_rules() : usage();
     if (!strcmp(argv[1], "peers"))
