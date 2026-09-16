@@ -67,11 +67,48 @@ trap - EXIT
 
 log=$(dmesg 2>/dev/null || true)
 printf '%s\n' "$log"
+
+# Fatal kernel diagnostics stay global. KCSAN is handled separately below
+# because virtme-ng's shared root uses virtiofs/FUSE and can report unrelated
+# filemap/virtqueue races even in a preflight guest that only runs `uname`.
 if grep -Eiq \
-  'BUG: KASAN|KCSAN: data-race|possible circular locking dependency|inconsistent lock state|bad unlock balance|held lock freed|suspicious RCU usage|sleeping function called from invalid context|deadlock|use-after-free|slab-out-of-bounds|refcount_t:|rcu[^:]*stall|kernel BUG|NULL pointer dereference|general protection fault|Oops:' \
+  'BUG: KASAN|possible circular locking dependency|inconsistent lock state|bad unlock balance|held lock freed|suspicious RCU usage|sleeping function called from invalid context|deadlock|use-after-free|slab-out-of-bounds|refcount_t:|rcu[^:]*stall|kernel BUG|NULL pointer dereference|general protection fault|Oops:' \
   <<<"$log"; then
   echo "debug kernel reported a safety failure" >&2
   exit 1
+fi
+
+kcsan_reports=$(grep -Eic 'BUG: KCSAN: data-race' <<<"$log" || true)
+if (( kcsan_reports > 0 )); then
+  # Attribute a KCSAN report to this module only when the complete report block
+  # contains a Brutal stack symbol or module marker. This keeps unrelated
+  # virtiofs/filemap KCSAN noise visible without turning it into a project
+  # failure. A real Brutal report still fails the job.
+  if awk '
+    /BUG: KCSAN: data-race/ { in_report=1; report=$0 ORS; next }
+    in_report {
+      report=report $0 ORS
+      if (index($0, "================================") != 0) {
+        lower=tolower(report)
+        if (lower ~ /brutal_[[:alnum:]_]*\+/ || lower ~ /\[brutal\]/)
+          found=1
+        in_report=0
+        report=""
+      }
+    }
+    END {
+      if (in_report) {
+        lower=tolower(report)
+        if (lower ~ /brutal_[[:alnum:]_]*\+/ || lower ~ /\[brutal\]/)
+          found=1
+      }
+      exit found ? 0 : 1
+    }
+  ' <<<"$log"; then
+    echo "KCSAN reported a data race involving Brutal" >&2
+    exit 1
+  fi
+  echo "KCSAN reported $kcsan_reports unrelated data race(s); no Brutal stack symbols found" >&2
 fi
 
 echo "debug runtime smoke test passed"
