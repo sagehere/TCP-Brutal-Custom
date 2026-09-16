@@ -40,8 +40,8 @@ ip netns exec "$ns" bash -c '
 ' _ "$repo/install.sh" "$state"
 
 [[ $(root_json) == "$root_before" ]]
-ip netns exec "$ns" tc filter show dev d0 egress pref 23300 | grep -q 'handle 0x233'
-ip netns exec "$ns" tc filter show dev d0 egress pref 23300 | grep -q 'rate 80Mbit'
+ip netns exec "$ns" tc filter show dev d0 egress pref 23300 | grep 'handle 0x233' >/dev/null
+ip netns exec "$ns" tc filter show dev d0 egress pref 23300 | grep 'rate 80Mbit' >/dev/null
 
 ip netns exec "$ns" bash -c '
   set -Eeuo pipefail
@@ -54,11 +54,11 @@ ip netns exec "$ns" bash -c '
   apply_aggregate_cap
 ' _ "$repo/install.sh" "$state"
 
-! ip netns exec "$ns" tc filter show dev d0 egress pref 23300 2>/dev/null | grep -q .
+! ip netns exec "$ns" tc filter show dev d0 egress pref 23300 2>/dev/null | grep . >/dev/null
 [[ $(root_json) == "$root_before" ]]
 
 # Existing egress filters must block automatic aggregate shaping without mutation.
-ip netns exec "$ns" tc qdisc show dev d0 | grep -q '^qdisc clsact ' || ip netns exec "$ns" tc qdisc add dev d0 clsact
+ip netns exec "$ns" tc qdisc show dev d0 | grep '^qdisc clsact ' >/dev/null || ip netns exec "$ns" tc qdisc add dev d0 clsact
 ip netns exec "$ns" tc filter add dev d0 egress pref 100 protocol all matchall action pass
 filters_before=$(ip netns exec "$ns" tc -j filter show dev d0 egress)
 set +e

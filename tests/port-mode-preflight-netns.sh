@@ -56,6 +56,45 @@ table233_json() {
   printf '%s' "$out"
 }
 
+# RA expiry countdowns and route output ordering are not semantic route changes.
+ip_real=$(command -v ip)
+fingerprint_expires=120
+fingerprint_reverse=0
+fingerprint_gateway=2001:db8:18::1
+ip() {
+  if [[ $* == '-6 -N route show table main' ]]; then
+    if [[ $fingerprint_reverse == 0 ]]; then
+      printf '2001:db8:18::/64 dev %s proto 2 metric 256 pref medium\n' "$dev"
+      printf 'default via %s dev %s proto 9 metric 100 expires %ssec hoplimit 64 pref medium\n' "$fingerprint_gateway" "$dev" "$fingerprint_expires"
+    else
+      printf 'default via %s dev %s proto 9 metric 100 expires %ssec hoplimit 64 pref medium\n' "$fingerprint_gateway" "$dev" "$fingerprint_expires"
+      printf '2001:db8:18::/64 dev %s proto 2 metric 256 pref medium\n' "$dev"
+    fi
+  else
+    "$ip_real" "$@"
+  fi
+}
+fp1=$(port_route_fingerprint_family 6)
+fingerprint_expires=119
+fingerprint_reverse=1
+fp2=$(port_route_fingerprint_family 6)
+[[ $fp1 == "$fp2" ]]
+fingerprint_gateway=2001:db8:18::9
+fp3=$(port_route_fingerprint_family 6)
+[[ $fp1 != "$fp3" ]]
+unset -f ip
+
+# Rollback must restore connected routes before a default that depends on them.
+restore_dir=$(mktemp -d)
+printf 'default via 2001:db8:18::1 dev %s\n2001:db8:18::/64 dev %s scope link\n' "$dev" "$dev" >"$restore_dir/routes6"
+: >"$restore_dir/rules6"
+restore_port_policy_family 6 "$restore_dir"
+restored6=$(ip -6 route show table 233)
+grep -q '^2001:db8:18::/64 ' <<<"$restored6"
+grep -q '^default via 2001:db8:18::1 ' <<<"$restored6"
+reset_port_policy
+rm -rf "$restore_dir"
+
 rules4_before=$(ip -4 -j rule show)
 rules6_before=$(ip -6 -j rule show)
 routes4_before=$(table233_json 4)
