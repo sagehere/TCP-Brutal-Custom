@@ -96,8 +96,13 @@ jobs:
           (cd "$GITHUB_WORKSPACE" && make KERNEL_DIR="$kernel_dir")
           test -s "$GITHUB_WORKSPACE/brutal.ko"
       - name: Boot debug kernel and run runtime smoke
+        shell: bash
         run: |
+          set -o pipefail
           cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          log="$RUNNER_TEMP/debug-runtime-${{ matrix.profile }}.log"
+
+          set +e
           timeout --signal=TERM 15m vng -v -m 4G -- \
             sudo -n env \
               PEERS=2000 \
@@ -106,4 +111,15 @@ jobs:
               PAGE_PEERS=2000 \
               EXACT_RULES=1000 \
               bash "$GITHUB_WORKSPACE/tests/debug-runtime-smoke.sh" \
-                "$GITHUB_WORKSPACE/brutal.ko"
+                "$GITHUB_WORKSPACE/brutal.ko" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          if (( rc != 0 )); then
+            echo '::group::virtme-ng failure tail'
+            tail -n 80 "$log" || true
+            echo '::endgroup::'
+            tail_text=$(tail -n 40 "$log" | tr '\r\n' '  ' | cut -c1-3500)
+            echo "::error title=Debug runtime ${{ matrix.profile }} failed::virtme-ng exited with code ${rc}. Tail: ${tail_text}"
+            exit "$rc"
+          fi
