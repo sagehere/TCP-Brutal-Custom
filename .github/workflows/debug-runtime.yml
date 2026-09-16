@@ -31,7 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential busybox-static flex iperf3 iproute2 \
-            libelf-dev libssl-dev qemu-kvm rsync virtme-ng xz-utils zstd
+            libelf-dev libssl-dev qemu-kvm rsync virtiofsd virtme-ng xz-utils zstd
       - name: Enable KVM access
         run: |
           if [[ -e /dev/kvm ]]; then
@@ -95,6 +95,13 @@ jobs:
           make -C "$kernel_dir" -j"$(nproc)"
           (cd "$GITHUB_WORKSPACE" && make KERNEL_DIR="$kernel_dir")
           test -s "$GITHUB_WORKSPACE/brutal.ko"
+      - name: Boot debug kernel preflight
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          log="$RUNNER_TEMP/debug-preflight-${{ matrix.profile }}.log"
+          timeout --signal=TERM 5m vng -v -m 4G -- uname -a 2>&1 | tee "$log"
       - name: Boot debug kernel and run runtime smoke
         shell: bash
         run: |
@@ -123,3 +130,13 @@ jobs:
             echo "::error title=Debug runtime ${{ matrix.profile }} failed::virtme-ng exited with code ${rc}. Tail: ${tail_text}"
             exit "$rc"
           fi
+      - name: Upload debug runtime logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: debug-runtime-${{ matrix.profile }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/debug-preflight-${{ matrix.profile }}.log
+            ${{ runner.temp }}/debug-runtime-${{ matrix.profile }}.log
+          if-no-files-found: warn
+          retention-days: 7
