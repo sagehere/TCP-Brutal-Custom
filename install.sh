@@ -27,7 +27,7 @@ PORT_RULE_PREF_MAX=12127
 AGGREGATE_FILTER_PREF=23300
 AGGREGATE_FILTER_HANDLE=0x233
 AGGREGATE_STATE="$STATE_DIR/aggregate-egress.state"
-MANAGER_VERSION="2.5.0"
+MANAGER_VERSION="2.5.1"
 
 IPV4_RATE=80
 IPV6_RATE=80
@@ -261,7 +261,12 @@ pending_reboot_message() {
 
 release_asset_digest() {
   local metadata=$1 asset=$2
-  awk -v asset="\"$asset\"" 'BEGIN { RS="\"name\":" } index($0, asset)==1 { print; exit }' "$metadata" |
+  if have jq; then
+    jq -r --arg asset "$asset" '[.assets[]? | select(.name == $asset) | .digest // empty][0] // empty' "$metadata" |
+      sed -nE 's/^sha256:([0-9a-f]{64})$/\1/p' | sed -n '1p'
+    return
+  fi
+  awk -v asset="\"$asset\"" 'BEGIN { RS="\"name\":" } { sub(/^[[:space:]]*/, "", $0) } index($0, asset)==1 { print; exit }' "$metadata" |
     grep -oE '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' |
     sed -nE 's/.*sha256:([0-9a-f]{64}).*/\1/p' | sed -n '1p'
 }
