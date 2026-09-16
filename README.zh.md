@@ -19,10 +19,10 @@ bash <(curl -fsSL https://tcp.hy2.sh/)
 本分支的 `perip` 管理器可使用以下命令安装或更新：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh | sudo -E bash
+curl -fsSL https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh | sudo -E bash
 ```
 
-脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://raw.githubusercontent.com/sagehere/TCP-Brutal-Custom/master/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo tbc` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status`、`view [--watch]` 和 `uninstall` 子命令。旧命令 `sudo brutal-manager` 仍作为兼容入口。菜单输入 `0` 退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块与规则。普通 Custom 更新遇到模块被连接占用时，会保留现有连接并暂存新版，随后提示重启；`status` 会显示待启用版本，重启并成功恢复规则后自动清除该状态。迁移上游 TCP Brutal 时仍会安全退出，不进入暂存流程。
+脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo tbc` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status`、`view [--watch]` 和 `uninstall` 子命令。旧命令 `sudo brutal-manager` 仍作为兼容入口。菜单输入 `0` 退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块与规则。普通 Custom 更新遇到模块被连接占用时，会保留现有连接并暂存新版，随后提示重启；`status` 会显示待启用版本，重启并成功恢复规则后自动清除该状态。迁移上游 TCP Brutal 时仍会安全退出，不进入暂存流程。
 
 该脚本会通过 DKMS 安装内核模块，并将 `brutalctl` 工具安装到 `/usr/local/bin`。需要 Linux 5.10 或更高版本。
 

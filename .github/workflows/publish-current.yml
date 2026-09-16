@@ -97,6 +97,6 @@ jobs:
             [[ $attempt == 5 ]] && { echo 'release attestation verification failed'; exit 1; }
             sleep 3
           done
-          for asset in build/SHA256SUMS build/release-manifest.txt build/tcp-brutal-custom-source.tar.gz build/tcp-brutal.dkms.tar.gz; do
+          for asset in build/SHA256SUMS build/install.sh build/release-manifest.txt build/tcp-brutal-custom-source.tar.gz build/tcp-brutal.dkms.tar.gz; do
             gh release verify-asset "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY" >/dev/null
           done
