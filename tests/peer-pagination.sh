@@ -33,7 +33,9 @@ ip -n "$client" link set lo up
 ip -n "$server" link set "$server_dev" up
 ip -n "$client" link set "$client_dev" up
 ip -n "$client" route add local 10.209.0.0/16 dev lo table local
-ip -n "$server" route add 10.209.0.0/16 dev "$server_dev"
+# Route synthetic peer IPs through the client gateway so one L2 neighbor entry
+# can represent thousands of routed peers without overflowing the ARP cache.
+ip -n "$server" route add 10.209.0.0/16 via 10.208.0.2 dev "$server_dev"
 
 ip netns exec "$server" "$ctl" add 10.209.0.0/16 100 noroute perip
 
@@ -74,12 +76,16 @@ while True:
 PY
 client_pid=$!
 
-for _ in $(seq 1 100); do
+wait_steps=${PEER_WAIT_STEPS:-300}
+for _ in $(seq 1 "$wait_steps"); do
   active=$(ip netns exec "$server" awk -F= '/^active_peer_groups=/{print $2}' /proc/net/tcp_brutal/stats)
   [[ $active -eq $peers ]] && break
   sleep 0.1
 done
-[[ ${active:-0} -eq $peers ]]
+if [[ ${active:-0} -ne $peers ]]; then
+  echo "timed out waiting for active peers: expected=$peers actual=${active:-0}" >&2
+  exit 1
+fi
 
 ip netns exec "$server" python3 - "$peers" <<'PY'
 import os, sys
