@@ -27,11 +27,14 @@ ip -n "$client" link set lo up
 ip -n "$server" link set "$server_dev" up
 ip -n "$client" link set "$client_dev" up
 if [[ ${SKIP_RULE_SETUP:-0} != 1 ]]; then
-  ip netns exec "$server" "$ctl" add 10.204.0.0/24 "${RATE_MBPS}" perip
+  ip netns exec "$server" "$ctl" add 10.204.0.0/24 "${RATE_MBPS}" perip noroute
+  ip -n "$server" route change 10.204.0.0/24 dev "$server_dev" congctl lock brutal
 else
   # Baseline releases keep rules in init_net, but route congctl is per netns.
   ip -n "$server" route change 10.204.0.0/24 dev "$server_dev" congctl lock brutal
 fi
 ip netns exec "$server" iperf3 -s -D >/dev/null 2>&1
-ip netns exec "$client" iperf3 -c 10.204.0.1 -R -P "${STREAMS}" \
-  -t "${RUN_SECONDS}" -J >"${OUTPUT}"
+iperf_args=(-c 10.204.0.1 -R -P "${STREAMS}" -t "${RUN_SECONDS}" -J)
+[[ ${IPERF_ZEROCOPY:-0} == 1 ]] && iperf_args+=(-Z)
+[[ ${IPERF_REPEATING_PAYLOAD:-0} == 1 ]] && iperf_args+=(--repeating-payload)
+ip netns exec "$client" iperf3 "${iperf_args[@]}" >"${OUTPUT}"

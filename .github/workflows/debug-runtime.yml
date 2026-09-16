@@ -1,0 +1,171 @@
+name: Debug runtime
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'brutal*.c'
+      - 'brutal.h'
+      - 'tests/**'
+      - '.github/workflows/debug-runtime.yml'
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  debug-kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [kasan-lockdep, kcsan-lockdep]
+    env:
+      KERNEL_VERSION: 6.12.109
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install debug runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential busybox-static flex iperf3 iproute2 \
+            libelf-dev libssl-dev qemu-kvm rsync virtiofsd virtme-ng xz-utils zstd
+      - name: Enable KVM access
+        run: |
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 0666 /dev/kvm
+          else
+            echo '/dev/kvm is unavailable' >&2
+            exit 1
+          fi
+      - name: Prepare debug kernel source
+        run: |
+          cd "$RUNNER_TEMP"
+          major=${KERNEL_VERSION%%.*}
+          curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KERNEL_VERSION}.tar.xz"
+          tar -xf "linux-${KERNEL_VERSION}.tar.xz"
+      - name: Configure ${{ matrix.profile }} kernel
+        run: |
+          cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          vng --kconfig
+          scripts/config --disable WERROR
+          scripts/config --enable MODULES
+          scripts/config --enable MODULE_UNLOAD
+          scripts/config --enable NET_NS
+          scripts/config --enable VETH
+          scripts/config --enable INET
+          scripts/config --enable IPV6
+          scripts/config --enable NET_SCHED
+          scripts/config --enable NET_SCH_NETEM
+          scripts/config --enable DEBUG_KERNEL
+          scripts/config --enable PROVE_LOCKING
+          scripts/config --enable DEBUG_LOCK_ALLOC
+          scripts/config --enable DEBUG_ATOMIC_SLEEP
+          scripts/config --enable IKCONFIG
+          scripts/config --enable IKCONFIG_PROC
+          scripts/config --enable DEBUG_FS
+          scripts/config --enable FAULT_INJECTION
+          scripts/config --enable FAULT_INJECTION_DEBUG_FS
+          scripts/config --enable FAILSLAB
+          scripts/config --enable FAIL_PAGE_ALLOC
+          scripts/config --disable MODULE_SIG_FORCE
+          scripts/config --set-str SYSTEM_TRUSTED_KEYS ''
+          scripts/config --set-str SYSTEM_REVOCATION_KEYS ''
+          if [[ '${{ matrix.profile }}' == kasan-lockdep ]]; then
+            scripts/config --enable KASAN
+            scripts/config --enable KASAN_GENERIC
+            scripts/config --enable KASAN_INLINE
+            scripts/config --disable KCSAN
+          else
+            scripts/config --disable KASAN
+            scripts/config --enable KCSAN
+          fi
+          make olddefconfig
+          grep -q '^CONFIG_PROVE_LOCKING=y' .config
+          grep -q '^CONFIG_FAULT_INJECTION_DEBUG_FS=y' .config
+          if [[ '${{ matrix.profile }}' == kasan-lockdep ]]; then
+            grep -q '^CONFIG_KASAN=y' .config
+            grep -q '^CONFIG_KASAN_GENERIC=y' .config
+          else
+            grep -q '^CONFIG_KCSAN=y' .config
+          fi
+      - name: Build debug kernel and module
+        run: |
+          kernel_dir="$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          make -C "$kernel_dir" -j"$(nproc)"
+          (cd "$GITHUB_WORKSPACE" && make KERNEL_DIR="$kernel_dir")
+          test -s "$GITHUB_WORKSPACE/brutal.ko"
+      - name: Boot debug kernel preflight
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          log="$RUNNER_TEMP/debug-preflight-${{ matrix.profile }}.log"
+          timeout --signal=TERM 5m vng -v -m 4G -- uname -a 2>&1 | tee "$log"
+      - name: Boot debug kernel and run runtime smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          log="$RUNNER_TEMP/debug-runtime-${{ matrix.profile }}.log"
+
+          set +e
+          timeout --signal=TERM 15m vng -v -m 4G -- \
+            sudo -n env \
+              PEERS=2000 \
+              RACE_WORKERS=8 \
+              RACE_ITERATIONS=1000 \
+              PAGE_PEERS=2000 \
+              EXACT_RULES=1000 \
+              bash "$GITHUB_WORKSPACE/tests/debug-runtime-smoke.sh" \
+                "$GITHUB_WORKSPACE/brutal.ko" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          if (( rc != 0 )); then
+            echo '::group::virtme-ng failure tail'
+            tail -n 80 "$log" || true
+            echo '::endgroup::'
+            tail_text=$(tail -n 40 "$log" | tr '\r\n' '  ' | cut -c1-3500)
+            echo "::error title=Debug runtime ${{ matrix.profile }} failed::virtme-ng exited with code ${rc}. Tail: ${tail_text}"
+            exit "$rc"
+          fi
+      - name: Exercise peer allocation fallback under failslab
+        if: matrix.profile == 'kasan-lockdep'
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          log="$RUNNER_TEMP/debug-fault-${{ matrix.profile }}.log"
+          timeout --signal=TERM 10m vng -v -m 4G --append 'slab_nomerge' -- \
+            sudo -n env \
+              PEERS=64 \
+              FAULT_ATTEMPTS=40 \
+              bash "$GITHUB_WORKSPACE/tests/peer-allocation-fault.sh" \
+                "$GITHUB_WORKSPACE/brutal.ko" 2>&1 | tee "$log"
+      - name: Stress module lifecycle under KASAN
+        if: matrix.profile == 'kasan-lockdep'
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          log="$RUNNER_TEMP/debug-lifecycle-${{ matrix.profile }}.log"
+          timeout --signal=TERM 10m vng -v -m 4G -- \
+            sudo -n env \
+              CYCLES=100 \
+              bash "$GITHUB_WORKSPACE/tests/debug-module-lifecycle.sh" \
+                "$GITHUB_WORKSPACE/brutal.ko" 2>&1 | tee "$log"
+      - name: Upload debug runtime logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: debug-runtime-${{ matrix.profile }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/debug-preflight-${{ matrix.profile }}.log
+            ${{ runner.temp }}/debug-runtime-${{ matrix.profile }}.log
+            ${{ runner.temp }}/debug-fault-${{ matrix.profile }}.log
+            ${{ runner.temp }}/debug-lifecycle-${{ matrix.profile }}.log
+          if-no-files-found: warn
+          retention-days: 7

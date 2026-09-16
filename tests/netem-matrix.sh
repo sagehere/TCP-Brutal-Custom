@@ -38,7 +38,8 @@ ip -n "$server" link set lo up
 ip -n "$client" link set lo up
 ip -n "$server" link set "$server_dev" up
 ip -n "$client" link set "$client_dev" up
-ip netns exec "$server" "$ctl" add 10.205.0.0/24 "$rate" perip
+ip netns exec "$server" "$ctl" add 10.205.0.0/24 "$rate" perip noroute
+ip -n "$server" route change 10.205.0.0/24 dev "$server_dev" congctl lock brutal
 ip netns exec "$server" iperf3 -s -D >/dev/null 2>&1
 
 printf 'rtt_ms,loss_percent,throughput_bps,retransmits\n' >"$outdir/results.csv"

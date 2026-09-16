@@ -36,7 +36,9 @@ ip -n "$client" link set "$client_dev" up
 # The client uses arbitrary source addresses without creating thousands of
 # interface aliases. The local route makes return traffic local to the client.
 ip -n "$client" route add local 10.251.0.0/16 dev lo table local
-ip -n "$server" route add 10.251.0.0/16 dev "$server_dev"
+# Route the synthetic addresses through the client gateway so the server does
+# not allocate one ARP neighbor entry for every churned peer.
+ip -n "$server" route add 10.251.0.0/16 via 10.250.0.2 dev "$server_dev"
 ip netns exec "$server" "$ctl" add 10.251.0.0/16 20 noroute perip
 
 ip netns exec "$server" python3 - "$peers" "$port" <<'PY' &
