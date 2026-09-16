@@ -3,6 +3,7 @@
 // Every connection to a rule's prefix joins the rule's group, without
 // application support. The route must select brutal for the prefix
 // ("ip route ... congctl lock brutal"); brutalctl in tools/ does both.
+#include <linux/capability.h>
 #include <linux/inet.h>
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
@@ -46,8 +47,12 @@ struct brutal_net
     atomic64_t peer_alloc_failures;
     atomic64_t peer_insert_failures;
     atomic64_t peer_fallback_connections;
+    atomic64_t peer_budget_fallbacks;
+    atomic_t peer_slots;
+    atomic_t peak_peer_slots;
     atomic_t active_peers;
     atomic_t peak_peers;
+    u32 max_peers;
     struct brutal_rule __rcu *default_v4;
     struct brutal_rule __rcu *default_v6;
 };
@@ -158,6 +163,70 @@ void brutal_net_peer_insert_failed(struct net *net)
 void brutal_net_peer_fallback(struct net *net)
 {
     atomic64_inc(&brutal_pernet(net)->peer_fallback_connections);
+}
+
+static bool brutal_slot_try_reserve(atomic_t *slots, u32 limit)
+{
+    int old;
+
+    for (;;)
+    {
+        old = atomic_read(slots);
+        if (old == INT_MAX || (limit && old >= limit))
+            return false;
+        if (atomic_cmpxchg(slots, old, old + 1) == old)
+            return true;
+        cpu_relax();
+    }
+}
+
+static void brutal_peak_update(atomic_t *peak, int value)
+{
+    int old = atomic_read(peak);
+
+    while (value > old && atomic_cmpxchg(peak, old, value) != old)
+        old = atomic_read(peak);
+}
+
+bool brutal_peer_budget_try_reserve(struct net *net, struct brutal_group *parent)
+{
+    struct brutal_net *bn = brutal_pernet(net);
+    struct brutal_rule_stats *stats = READ_ONCE(parent->rule_stats);
+    int slots;
+
+    if (WARN_ON_ONCE(!stats))
+        return false;
+    if (!brutal_slot_try_reserve(&bn->peer_slots, READ_ONCE(bn->max_peers)))
+        return false;
+    if (!brutal_slot_try_reserve(&stats->peer_slots, READ_ONCE(stats->max_peers)))
+    {
+        atomic_dec(&bn->peer_slots);
+        return false;
+    }
+    slots = atomic_read(&bn->peer_slots);
+    brutal_peak_update(&bn->peak_peer_slots, slots);
+    slots = atomic_read(&stats->peer_slots);
+    brutal_peak_update(&stats->peak_peer_slots, slots);
+    return true;
+}
+
+void brutal_peer_budget_release(struct net *net, struct brutal_group *parent)
+{
+    struct brutal_rule_stats *stats = READ_ONCE(parent->rule_stats);
+
+    if (WARN_ON_ONCE(!stats))
+        return;
+    atomic_dec(&stats->peer_slots);
+    atomic_dec(&brutal_pernet(net)->peer_slots);
+}
+
+void brutal_net_peer_budget_fallback(struct net *net, struct brutal_group *parent)
+{
+    struct brutal_rule_stats *stats = READ_ONCE(parent->rule_stats);
+
+    atomic64_inc(&brutal_pernet(net)->peer_budget_fallbacks);
+    if (stats)
+        atomic64_inc(&stats->peer_budget_fallbacks);
 }
 
 void brutal_net_peer_added(struct net *net)
@@ -396,6 +465,8 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     u32 gain = INIT_CWND_GAIN;
     bool lock = true;
     bool perip = false, created = false;
+    bool maxpeers_set = false;
+    u32 maxpeers = 0;
     char *tok = strsep(&args, " ");
     int ret = 0;
 
@@ -415,6 +486,13 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
             lock = true;
         else if (!strcmp(tok, "perip"))
             perip = true;
+        else if (!strncmp(tok, "maxpeers=", 9))
+        {
+            ret = kstrtou32(tok + 9, 10, &maxpeers);
+            if (!ret && maxpeers > INT_MAX)
+                ret = -ERANGE;
+            maxpeers_set = true;
+        }
         else
             ret = -EINVAL;
         if (ret)
@@ -424,6 +502,8 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         gain < MIN_CWND_GAIN || gain > MAX_CWND_GAIN)
         return -EINVAL;
     if (perip && !lock)
+        return -EINVAL;
+    if (maxpeers_set && !perip)
         return -EINVAL;
 
     mutex_lock(&bn->rules_mutex);
@@ -448,6 +528,7 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         }
         r->group = g;
         r->perip = perip;
+        WRITE_ONCE(g->rule_stats->max_peers, maxpeers);
         INIT_LIST_HEAD(&r->prefix_node);
         INIT_LIST_HEAD(&r->free_list);
         brutal_group_set_config(&g->pacer, rate, gain, lock);
@@ -470,7 +551,11 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     }
     g = r->group;
     if (!created)
+    {
+        if (maxpeers_set)
+            WRITE_ONCE(g->rule_stats->max_peers, maxpeers);
         brutal_group_set_config(&g->pacer, rate, gain, lock);
+    }
     mutex_unlock(&bn->rules_mutex);
     return 0;
 }
@@ -542,10 +627,17 @@ static int brutal_rules_show(struct seq_file *m, void *v)
             seq_printf(m, "dst=%pI4/%u", &r->v4, r->plen);
         else
             seq_printf(m, "dst=%pI6c/%u", &r->v6, r->plen);
-        seq_printf(m, " rate=%llu gain=%u lock=%u group=%s id=%llu members=%u ips=%u sent=%llu\n",
+        seq_printf(m, " rate=%llu gain=%u lock=%u group=%s id=%llu members=%u ips=%u sent=%llu",
                    rate, gain, locked, r->perip ? "perip" : "shared", g->id,
                    atomic_read(&g->pacer.members), atomic_read(&g->ip_groups),
                    brutal_group_sent(g));
+        if (r->perip && g->rule_stats)
+            seq_printf(m, " maxpeers=%u peer_slots=%d peak_peer_slots=%d budget_fallbacks=%lld",
+                       READ_ONCE(g->rule_stats->max_peers),
+                       atomic_read(&g->rule_stats->peer_slots),
+                       atomic_read(&g->rule_stats->peak_peer_slots),
+                       atomic64_read(&g->rule_stats->peer_budget_fallbacks));
+        seq_putc(m, '\n');
     }
     rcu_read_unlock();
     return 0;
@@ -832,10 +924,70 @@ static int brutal_stats_show(struct seq_file *m, void *v)
                atomic64_read(&bn->peer_insert_failures));
     seq_printf(m, "peer_fallback_connections=%lld\n",
                atomic64_read(&bn->peer_fallback_connections));
+    seq_printf(m, "peer_budget_fallbacks=%lld\n",
+               atomic64_read(&bn->peer_budget_fallbacks));
+    seq_printf(m, "peer_slots=%d\n", atomic_read(&bn->peer_slots));
+    seq_printf(m, "peak_peer_slots=%d\n", atomic_read(&bn->peak_peer_slots));
+    seq_printf(m, "max_peers=%u\n", READ_ONCE(bn->max_peers));
     seq_printf(m, "active_peer_groups=%d\n", atomic_read(&bn->active_peers));
     seq_printf(m, "peak_peer_groups=%d\n", atomic_read(&bn->peak_peers));
     return 0;
 }
+
+static int brutal_limits_show(struct seq_file *m, void *v)
+{
+    struct brutal_net *bn = brutal_pernet(m->private);
+
+    seq_printf(m, "max_peers=%u\n", READ_ONCE(bn->max_peers));
+    seq_puts(m, "overflow=hashed_fallback\n");
+    return 0;
+}
+
+static int brutal_limits_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, brutal_limits_show, pde_data(inode));
+}
+
+static ssize_t brutal_limits_write(struct file *file, const char __user *ubuf,
+                                   size_t len, loff_t *off)
+{
+    struct net *net = pde_data(file_inode(file));
+    struct brutal_net *bn = brutal_pernet(net);
+    char *buf, *value;
+    u32 max_peers;
+    int ret;
+
+    if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
+        return -EPERM;
+    if (!len || len > 64)
+        return -EINVAL;
+    buf = memdup_user_nul(ubuf, len);
+    if (IS_ERR(buf))
+        return PTR_ERR(buf);
+    value = strim(buf);
+    if (strncmp(value, "max_peers=", 10))
+        ret = -EINVAL;
+    else
+        ret = kstrtou32(value + 10, 10, &max_peers);
+    if (!ret && max_peers > INT_MAX)
+        ret = -ERANGE;
+    if (!ret)
+    {
+        mutex_lock(&bn->rules_mutex);
+        WRITE_ONCE(bn->max_peers, max_peers);
+        mutex_unlock(&bn->rules_mutex);
+    }
+    kfree(buf);
+    return ret ?: len;
+}
+
+static const struct proc_ops brutal_limits_proc_ops = {
+    .proc_open = brutal_limits_open,
+    .proc_read = seq_read,
+    .proc_write = brutal_limits_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
 
 static int brutal_version_show(struct seq_file *m, void *v)
 {
@@ -861,6 +1013,9 @@ static int __net_init brutal_net_init(struct net *net)
     atomic64_set(&bn->peer_alloc_failures, 0);
     atomic64_set(&bn->peer_insert_failures, 0);
     atomic64_set(&bn->peer_fallback_connections, 0);
+    atomic64_set(&bn->peer_budget_fallbacks, 0);
+    atomic_set(&bn->peer_slots, 0);
+    atomic_set(&bn->peak_peer_slots, 0);
     atomic_set(&bn->active_peers, 0);
     atomic_set(&bn->peak_peers, 0);
 
@@ -878,6 +1033,7 @@ static int __net_init brutal_net_init(struct net *net)
     if (!dir ||
         !proc_create_data("peers", 0444, dir, &brutal_peers_proc_ops, net) ||
         !proc_create_net_single("stats", 0444, dir, brutal_stats_show, NULL) ||
+        !proc_create_data("limits", 0644, dir, &brutal_limits_proc_ops, net) ||
         !proc_create_net_single("version", 0444, dir, brutal_version_show, NULL) ||
         !proc_create_data("rules", 0644, dir, &brutal_rules_proc_ops, net))
     {

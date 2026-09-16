@@ -75,6 +75,8 @@ brutalctl flush
 ```bash
 brutalctl add 0.0.0.0/0 80 noroute perip
 brutalctl add ::/0 80 noroute perip
+# 可选：单条规则最多保留 4096 个独立 peer 组
+brutalctl add 0.0.0.0/0 80 noroute perip maxpeers=4096
 ```
 
 查看当前使用 `perip` 规则的对端 IP、配置速率、连接数和累计发送量：
@@ -89,7 +91,7 @@ sudo tbc view --watch  # 每两秒刷新，Ctrl+C 退出
 `brutalctl peers` 还支持 `--rule ID` 和 `--ip ADDRESS`。管理器默认显示前
 1000 条并在截断时提示；不指定 `--limit` 可完整导出。规则、peer 和统计均按
 network namespace 隔离，因此容器需要在自己的 namespace 中配置规则。分配
-失败、fallback、当前及峰值 peer 数见 `/proc/net/tcp_brutal/stats`。
+失败、fallback、当前及峰值 peer 数见 `/proc/net/tcp_brutal/stats`。`maxpeers=N` 可限制单条 `perip` 规则的 peer 组数；`maxpeers=0` 表示不限。还可向 `/proc/net/tcp_brutal/limits` 写入 `max_peers=N` 设置整个 network namespace 的 peer 总预算。达到预算不会拒绝 TCP 连接，新 peer 会进入固定哈希 fallback pacer；读取 `limits` 可查看当前上限和 `overflow=hashed_fallback` 策略。
 
 所有连接关闭后，对应 IP 行立即消失；这里不保存历史统计。
 
@@ -289,12 +291,20 @@ ip=203.0.113.5 family=4 rule=1 rate=12500000 gain=20 members=3 sent=1834021376
 写入时，每次 write 接受一条命令，其中速率单位为 bytes/s：
 
 ```text
-add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock] [perip]
+add <prefix>[/<len>] rate=<bytes/s> [gain=<tenths>] [nolock] [perip] [maxpeers=<N>]
 del <prefix>[/<len>]
 flush
 ```
 
-`perip` 只能用于锁定规则。如果对已有前缀再次执行 `add`，会直接更新原规则；但在普通共享规则与 `perip` 规则之间切换时，必须先删除再重新创建规则。
+`perip` 只能用于锁定规则。`maxpeers` 只适用于 `perip`；省略时，新规则默认不限，更新已有规则时则保留原限制，显式 `maxpeers=0` 才会解除限制。如果对已有前缀再次执行 `add`，会直接更新原规则；但在普通共享规则与 `perip` 规则之间切换时，必须先删除再重新创建规则。
+
+namespace 总预算由 `/proc/net/tcp_brutal/limits` 控制：
+
+```text
+max_peers=4096
+```
+
+读取该文件会同时显示 `overflow=hashed_fallback`。降低预算不会驱逐已经存在的 peer；在当前占用降到新上限以下之前，只会阻止创建新的独立 peer 对象并让这些连接使用 fallback。
 
 需要注意的是，路由配置是独立的一步。`brutalctl` 除了管理这里的规则文件之外，还会自动负责添加对应路由。
 
