@@ -66,7 +66,7 @@ jobs:
           bash tests/release-chain-test.sh
           bash tests/brutalctl-safety.sh
           bash tests/brutalctl-route-ownership.sh
-          sudo bash tests/brutalctl-route-netns.sh
+          sudo env TBC_TEST_CC=reno bash tests/brutalctl-route-netns.sh
           sudo bash tests/port-mode-preflight-netns.sh
           sudo bash tests/aggregate-egress-netns.sh
           sudo env TBC_TEST_CC=reno bash tests/port-mode-netns.sh
