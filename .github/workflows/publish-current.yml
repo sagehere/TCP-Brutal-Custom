@@ -1,66 +1,102 @@
-name: Publish current release
+name: Publish immutable release
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
-    paths:
-      - .github/workflows/publish-current.yml
 
 permissions:
   contents: write
 
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - name: Resolve release target
-        id: target
-        shell: bash
-        run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "sha=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check out release target
-        uses: actions/checkout@v4
+      - name: Check out exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ steps.target.outputs.sha }}
+          fetch-depth: 0
 
-      - name: Resolve version
-        id: version
+      - name: Resolve and validate release identity
+        id: release
         shell: bash
         run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REF" == refs/heads/master ]] || { echo "releases must be published from master"; exit 1; }
+          remote_master=$(git ls-remote origin refs/heads/master | awk '{print $1}')
+          [[ $remote_master == "$GITHUB_SHA" ]] || { echo "master moved or this run is not current master"; exit 1; }
           version=$(./scripts/mkdkmsconf.sh | sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p')
           [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid version: $version"; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure tag is new
-        shell: bash
-        run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "tag already exists: ${{ steps.version.outputs.tag }}"
+          tag="v$version"
+          sha=$(git rev-parse HEAD)
+          [[ $sha == "${GITHUB_SHA}" ]] || { echo "checkout SHA mismatch"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "tag already exists: $tag"
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Build release assets
-        run: |
-          make dkms-tarball
-          mkdir -p build/
-          mv dkms.tar.gz build/tcp-brutal.dkms.tar.gz
-          for file in build/*; do
-            sha256sum "$file" >> build/hashes.txt
-          done
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.sha }}
+        run: ./scripts/build-release-assets.sh "$RELEASE_TAG" "$RELEASE_VERSION" "$RELEASE_COMMIT" build
 
-      - name: Create GitHub release and tag
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          target_commitish: ${{ steps.target.outputs.sha }}
-          name: TCP Brutal Custom ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          files: build/*
+      - name: Create draft release with all assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gh release create "$RELEASE_TAG" build/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$RELEASE_SHA" \
+            --title "TCP Brutal Custom $RELEASE_TAG" \
+            --generate-notes \
+            --draft
+          remote_sha=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')
+          [[ -z $remote_sha || $remote_sha == "$RELEASE_SHA" ]] || {
+            echo "release tag moved unexpectedly: $remote_sha"
+            exit 1
+          }
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Verify published release and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          metadata=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
+          if [[ $(jq -r '.immutable' <<<"$metadata") != true || $(jq -r '.target_commitish' <<<"$metadata") != "$RELEASE_SHA" ]]; then
+            echo 'published release is not immutable or is bound to the wrong commit; deleting it'
+            gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+            exit 1
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh release verify "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              break
+            fi
+            [[ $attempt == 5 ]] && { echo 'release attestation verification failed'; exit 1; }
+            sleep 3
+          done
+          for asset in build/SHA256SUMS build/release-manifest.txt build/tcp-brutal-custom-source.tar.gz build/tcp-brutal.dkms.tar.gz; do
+            gh release verify-asset "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY" >/dev/null
+          done
