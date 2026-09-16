@@ -7,6 +7,14 @@ ns="tbc-preflight-$$"
 dev="tpf-$$"
 cleanup() { ip netns del "$ns" 2>/dev/null || true; }
 trap cleanup EXIT
+test_cc=${TBC_TEST_CC:-brutal}
+
+if [[ $test_cc != brutal ]]; then
+  sysctl -n net.ipv4.tcp_available_congestion_control | tr ' ' '\n' | grep -qx "$test_cc" || {
+    echo "unsupported test CC: $test_cc" >&2
+    exit 1
+  }
+fi
 
 ip netns add "$ns"
 ip -n "$ns" link set lo up
@@ -17,11 +25,25 @@ ip -n "$ns" link set "$dev" up
 ip -n "$ns" route add default via 198.18.0.1 dev "$dev"
 ip -n "$ns" -6 route add default via 2001:db8:18::1 dev "$dev"
 
-ip netns exec "$ns" bash -s -- "$repo/install.sh" "$dev" <<'INNER'
+ip netns exec "$ns" bash -s -- "$repo/install.sh" "$dev" "$test_cc" <<'INNER'
 set -Eeuo pipefail
 export BRUTAL_MANAGER_LIB=1
 source "$1"
 dev=$2
+test_cc=$3
+if [[ $test_cc != brutal ]]; then
+  clone_port_route() {
+    local family=$1 line=$2 clean
+    local -a args=()
+    clean=$(sanitize_route_line "$line")
+    [[ -n $clean ]] || return 0
+    read -r -a args <<<"$clean"
+    case $clean in
+      blackhole*|unreachable*|prohibit*|throw*) ip "-$family" route replace table "$PORT_TABLE" "${args[@]}" ;;
+      *) ip "-$family" route replace table "$PORT_TABLE" "${args[@]}" congctl lock "$test_cc" ;;
+    esac
+  }
+fi
 MODE=auto
 TCP_PORTS=5211
 
