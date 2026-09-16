@@ -163,6 +163,10 @@ int brutal_group_enable_rule_stats(struct brutal_group *g, bool perip)
         }
     }
     stats->group = g;
+    atomic_set(&stats->peer_slots, 0);
+    atomic_set(&stats->peak_peer_slots, 0);
+    atomic64_set(&stats->peer_budget_fallbacks, 0);
+    stats->max_peers = 0;
     g->fallbacks = fallbacks;
     g->rule_stats = stats;
     return 0;
@@ -354,9 +358,16 @@ struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group
         return &peer->pacer;
     }
 
+    if (!brutal_peer_budget_try_reserve(net, parent))
+    {
+        brutal_net_peer_budget_fallback(net, parent);
+        return brutal_fallback_group_get(&key, parent, net);
+    }
+
     new_peer = brutal_peer_alloc();
     if (!new_peer)
     {
+        brutal_peer_budget_release(net, parent);
         brutal_net_peer_alloc_failed(net);
         return brutal_fallback_group_get(&key, parent, net);
     }
@@ -372,12 +383,14 @@ struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group
         {
             brutal_net_peer_insert_failed(net);
             mempool_free(new_peer, brutal_peer_pool);
+            brutal_peer_budget_release(net, parent);
             return brutal_fallback_group_get(&key, parent, net);
         }
         if (!peer)
             break;
         if (brutal_peer_try_get(peer))
         {
+            brutal_peer_budget_release(net, parent);
             brutal_group_put(parent);
             mempool_free(new_peer, brutal_peer_pool);
             return &peer->pacer;
@@ -437,6 +450,7 @@ void brutal_pacer_put(struct brutal_pacer *p)
         spin_unlock_bh(&peer->lifecycle_lock);
 
         atomic_dec(&parent->ip_groups);
+        brutal_peer_budget_release(peer->net, parent);
         brutal_net_peer_removed(peer->net);
         call_rcu(&peer->rcu, brutal_peer_free_rcu);
         return;

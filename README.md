@@ -99,7 +99,7 @@ UDP / QUIC              -> 不受影响
 ## 规则说明
 
 ```bash
-brutalctl add <prefix> <Mbps> [gain=<tenths>] [noroute] [perip]
+brutalctl add <prefix> <Mbps> [gain=<tenths>] [noroute] [perip] [maxpeers=N]
 brutalctl list
 brutalctl peers
 brutalctl del <prefix>
@@ -109,6 +109,7 @@ brutalctl flush
 - 不带 `perip` 时，保持上游行为：所有命中规则的连接共享一份速率。
 - 带 `perip` 时，每个对端 IP 各自拥有一份速率；同一 IP 的所有连接合计共享。
 - `perip` 必须使用默认锁定规则，不能与 `nolock` 一起使用。
+- `maxpeers=N` 可限制单条 `perip` 规则同时存在的 peer 组数量；达到上限后新 IP 使用固定哈希 fallback pacer。`maxpeers=0` 表示不限。
 - 修改同一模式规则的速率会立即影响已有连接。普通共享规则与 `perip` 规则之间切换时，先删除再重新添加规则。
 - 规则只匹配新建连接；删除规则后，旧连接会继续使用原速率直到关闭。
 - 规则和统计按 network namespace 隔离；需要在对应容器或 namespace 内配置规则。
@@ -116,7 +117,7 @@ brutalctl flush
 
 `brutalctl peers` 支持 `--rule ID`、`--ip ADDRESS`、`--family 4|6` 和
 `--limit N`。`/proc/net/tcp_brutal/stats` 提供 peer 分配失败、fallback、
-当前及峰值 peer 组数。
+当前及峰值 peer 组数。P2 还提供 `/proc/net/tcp_brutal/limits`：写入 `max_peers=N` 可设置当前 network namespace 的 peer 总预算；`0` 表示不限。达到规则或 namespace 预算时不会拒绝 TCP 连接，而是使用 `hashed_fallback` 保持可用性。
 
 ## 边界与建议
 

@@ -43,7 +43,7 @@ static int usage(void)
     fputs("usage: brutalctl info\n"
           "       brutalctl list\n"
           "       brutalctl peers [--rule ID] [--ip ADDRESS] [--family 4|6] [--limit N]\n"
-          "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute] [perip]\n"
+          "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute] [perip] [maxpeers=N]\n"
           "       brutalctl del <prefix>[/<len>]\n"
           "       brutalctl flush\n"
           "\n"
@@ -51,6 +51,7 @@ static int usage(void)
           "a dedicated proto " ROUTE_PROTO " route when no foreign exact route exists;\n"
           "del and flush remove only routes owned by brutalctl.\n"
           "perip gives each peer IP its own shared rate (and requires the default lock).\n"
+          "maxpeers=N bounds per-IP peer groups for that rule; 0 means unlimited.\n"
           "nolock lets applications set their own params on these connections.\n",
           stderr);
     return 2;
@@ -577,7 +578,7 @@ static int add_rule(int argc, char **argv)
     char *end;
     double mbps;
     size_t used = 0;
-    int i, lock = 1, route = 1, ret;
+    int i, lock = 1, route = 1, perip = 0, maxpeers_set = 0, ret;
 
     if (argc < 4)
         return usage();
@@ -610,11 +611,28 @@ static int add_rule(int argc, char **argv)
             lock = 0;
         else if (!strcmp(argv[i], "perip"))
         {
+            perip = 1;
             if (!lock)
                 return usage();
         }
         else if (!strcmp(argv[i], "lock"))
             lock = 1;
+        else if (!strncmp(argv[i], "maxpeers=", 9))
+        {
+            char *limit_end;
+            unsigned long long limit;
+
+            if (maxpeers_set)
+                return usage();
+            errno = 0;
+            limit = strtoull(argv[i] + 9, &limit_end, 10);
+            if (errno || *limit_end || limit > INT_MAX)
+            {
+                fprintf(stderr, "brutalctl: invalid maxpeers '%s'\n", argv[i] + 9);
+                return 1;
+            }
+            maxpeers_set = 1;
+        }
         else if (strncmp(argv[i], "gain=", 5))
             return usage();
         if (appendf(cmd, sizeof(cmd), &used, " %s", argv[i]))
@@ -623,8 +641,13 @@ static int add_rule(int argc, char **argv)
             return 1;
         }
     }
-    if (!lock && strstr(cmd, " perip"))
+    if (!lock && perip)
         return usage();
+    if (maxpeers_set && !perip)
+    {
+        fprintf(stderr, "brutalctl: maxpeers requires perip\n");
+        return 1;
+    }
     if (route)
     {
         enum route_owner owner = route_owner(argv[2]);

@@ -34,7 +34,7 @@ struct proc_ops;
 
 #define BRUTAL_CAPABILITIES                                             \
     (BRUTAL_CAP_PERIP | BRUTAL_CAP_NETNS | BRUTAL_CAP_EXACT_RULE_HASH | \
-     BRUTAL_CAP_PEER_STATS)
+     BRUTAL_CAP_PEER_STATS | BRUTAL_CAP_PEER_BUDGET)
 
 #define INIT_PACING_RATE 125000
 #define INIT_CWND_GAIN 20
@@ -128,6 +128,10 @@ struct brutal_rule_stats
     struct rhashtable peers;
     struct work_struct destroy_work;
     struct brutal_group *group;
+    atomic_t peer_slots;
+    atomic_t peak_peer_slots;
+    atomic64_t peer_budget_fallbacks;
+    u32 max_peers;
     bool peers_initialized;
 };
 
@@ -203,6 +207,9 @@ void brutal_sockopt_uninstall(struct sock *sk);
 void brutal_net_peer_alloc_failed(struct net *net);
 void brutal_net_peer_insert_failed(struct net *net);
 void brutal_net_peer_fallback(struct net *net);
+void brutal_net_peer_budget_fallback(struct net *net, struct brutal_group *parent);
+bool brutal_peer_budget_try_reserve(struct net *net, struct brutal_group *parent);
+void brutal_peer_budget_release(struct net *net, struct brutal_group *parent);
 void brutal_net_peer_added(struct net *net);
 void brutal_net_peer_removed(struct net *net);
 

@@ -16,7 +16,7 @@ grep -q '^vendor=tcp-brutal-custom$' <<<"$info"
 grep -q '^abi=1$' <<<"$info"
 grep -Eq '^build=[0-9a-f]{40}$' <<<"$info"
 grep -Eq '^capabilities=0x[0-9a-f]{16}$' <<<"$info"
-grep -q '^capability_names=perip,netns,exact-rule-hash,peer-stats$' <<<"$info"
+grep -q '^capability_names=perip,netns,exact-rule-hash,peer-stats,peer-budget$' <<<"$info"
 
 proc_info=$(cat /proc/net/tcp_brutal/version)
 grep -q '^version=2[.]5[.]3$' <<<"$proc_info"
@@ -28,7 +28,7 @@ grep -q '^abi=1$' <<<"$proc_info"
 python3 - <<'PY'
 import errno, socket, struct
 TCP_BRUTAL_INFO = 23303
-EXPECTED_CAPS = 0x0f
+EXPECTED_CAPS = 0x2f
 for family in (socket.AF_INET, socket.AF_INET6):
     if family == socket.AF_INET6 and not socket.has_ipv6:
         continue
