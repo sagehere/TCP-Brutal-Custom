@@ -2,6 +2,20 @@
 set -Eeuo pipefail
 
 [[ $EUID == 0 ]] || { echo "run as root" >&2; exit 1; }
+
+# The active-peer pagination test intentionally holds thousands of sockets open.
+# virtme guests may inherit a conservative soft RLIMIT_NOFILE (commonly 1024),
+# which would make the harness fail before the kernel code is exercised.
+nofile_target=${NOFILE_TARGET:-65536}
+soft_nofile=$(ulimit -Sn)
+if [[ $soft_nofile != unlimited && $soft_nofile -lt $nofile_target ]]; then
+  if ! ulimit -Sn "$nofile_target" 2>/dev/null; then
+    echo "unable to raise RLIMIT_NOFILE: target=$nofile_target soft=$(ulimit -Sn) hard=$(ulimit -Hn)" >&2
+    exit 1
+  fi
+fi
+echo "RLIMIT_NOFILE soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
 module=${1:-$repo/brutal.ko}
 ctl=$repo/tools/brutalctl
