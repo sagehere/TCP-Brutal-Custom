@@ -67,6 +67,7 @@ jobs:
           scripts/config --enable IKCONFIG_PROC
           scripts/config --enable DEBUG_FS
           scripts/config --enable FAULT_INJECTION
+          scripts/config --enable FAULT_INJECTION_DEBUG_FS
           scripts/config --enable FAILSLAB
           scripts/config --enable FAIL_PAGE_ALLOC
           scripts/config --disable MODULE_SIG_FORCE
@@ -83,6 +84,7 @@ jobs:
           fi
           make olddefconfig
           grep -q '^CONFIG_PROVE_LOCKING=y' .config
+          grep -q '^CONFIG_FAULT_INJECTION_DEBUG_FS=y' .config
           if [[ '${{ matrix.profile }}' == kasan-lockdep ]]; then
             grep -q '^CONFIG_KASAN=y' .config
             grep -q '^CONFIG_KASAN_GENERIC=y' .config
@@ -130,6 +132,19 @@ jobs:
             echo "::error title=Debug runtime ${{ matrix.profile }} failed::virtme-ng exited with code ${rc}. Tail: ${tail_text}"
             exit "$rc"
           fi
+      - name: Exercise peer allocation fallback under failslab
+        if: matrix.profile == 'kasan-lockdep'
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          log="$RUNNER_TEMP/debug-fault-${{ matrix.profile }}.log"
+          timeout --signal=TERM 10m vng -v -m 4G --append 'slab_nomerge' -- \
+            sudo -n env \
+              PEERS=64 \
+              FAULT_ATTEMPTS=40 \
+              bash "$GITHUB_WORKSPACE/tests/peer-allocation-fault.sh" \
+                "$GITHUB_WORKSPACE/brutal.ko" 2>&1 | tee "$log"
       - name: Upload debug runtime logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -138,5 +153,6 @@ jobs:
           path: |
             ${{ runner.temp }}/debug-preflight-${{ matrix.profile }}.log
             ${{ runner.temp }}/debug-runtime-${{ matrix.profile }}.log
+            ${{ runner.temp }}/debug-fault-${{ matrix.profile }}.log
           if-no-files-found: warn
           retention-days: 7
