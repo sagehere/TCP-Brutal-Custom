@@ -65,11 +65,16 @@ jobs:
           bash tests/install-manager-test.sh
           bash tests/release-chain-test.sh
           release_test_dir=$(mktemp -d)
-          ./scripts/build-release-assets.sh v2.5.2 2.5.2 "$(git rev-parse HEAD)" "$release_test_dir"
+          release_test_dir_2=$(mktemp -d)
+          ./scripts/build-release-assets.sh v2.5.3 2.5.3 "$(git rev-parse HEAD)" "$release_test_dir"
+          ./scripts/build-release-assets.sh v2.5.3 2.5.3 "$(git rev-parse HEAD)" "$release_test_dir_2"
           test -x "$release_test_dir/install.sh"
           grep -Eq '  install[.]sh$' "$release_test_dir/SHA256SUMS"
           (cd "$release_test_dir" && sha256sum -c SHA256SUMS)
-          rm -rf "$release_test_dir"
+          for asset in install.sh release-manifest.txt SHA256SUMS tcp-brutal-custom-source.tar.gz tcp-brutal.dkms.tar.gz; do
+            cmp "$release_test_dir/$asset" "$release_test_dir_2/$asset"
+          done
+          rm -rf "$release_test_dir" "$release_test_dir_2"
           bash tests/brutalctl-safety.sh
           bash tests/brutalctl-route-ownership.sh
           sudo env TBC_TEST_CC=reno bash tests/brutalctl-route-netns.sh

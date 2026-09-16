@@ -8,23 +8,23 @@ export BRUTAL_MANAGER_LIB=1
 source "$repo/install.sh"
 
 fixture="$tmp/fixture"
-mkdir -p "$fixture/src/TCP-Brutal-Custom-2.5.2"
+mkdir -p "$fixture/src/TCP-Brutal-Custom-2.5.3"
 commit=1234567890abcdef1234567890abcdef12345678
-tag=v2.5.2
-cat >"$fixture/src/TCP-Brutal-Custom-2.5.2/.tbc-release" <<META
+tag=v2.5.3
+cat >"$fixture/src/TCP-Brutal-Custom-2.5.3/.tbc-release" <<META
 TAG=$tag
-VERSION=2.5.2
+VERSION=2.5.3
 COMMIT=$commit
 META
-cat >"$fixture/src/TCP-Brutal-Custom-2.5.2/brutal.h" <<'HDR'
+cat >"$fixture/src/TCP-Brutal-Custom-2.5.3/brutal.h" <<'HDR'
 #define BRUTAL_VERSION_MAJOR 2
 #define BRUTAL_VERSION_MINOR 5
 #define BRUTAL_VERSION_PATCH 2
 HDR
-tar -czf "$fixture/tcp-brutal-custom-source.tar.gz" -C "$fixture/src" TCP-Brutal-Custom-2.5.2
+tar -czf "$fixture/tcp-brutal-custom-source.tar.gz" -C "$fixture/src" TCP-Brutal-Custom-2.5.3
 cat >"$fixture/release-manifest.txt" <<META
 TAG=$tag
-VERSION=2.5.2
+VERSION=2.5.3
 COMMIT=$commit
 META
 printf 'dummy dkms\n' >"$fixture/tcp-brutal.dkms.tar.gz"
@@ -73,7 +73,7 @@ while (($#)); do
   esac
 done
 case $url in
-  */releases/latest|*/releases/tags/v2.5.2) src="$FIXTURE/release.json" ;;
+  */releases/latest|*/releases/tags/v2.5.3) src="$FIXTURE/release.json" ;;
   */SHA256SUMS) src="$FIXTURE/SHA256SUMS" ;;
   */release-manifest.txt) src="$FIXTURE/release-manifest.txt" ;;
   */tcp-brutal-custom-source.tar.gz) src="$FIXTURE/tcp-brutal-custom-source.tar.gz" ;;
@@ -89,8 +89,44 @@ run_good() {
   GH_LOG="$tmp/gh.log" FIXTURE="$fixture" PATH="$fakebin:$PATH" download_source "$work"
 }
 [[ $(run_good) == "$commit" ]]
-grep -q '^release verify v2.5.2 -R sagehere/TCP-Brutal-Custom$' "$tmp/gh.log"
-[[ $(grep -c '^release verify-asset v2.5.2 ' "$tmp/gh.log") == 3 ]]
+grep -q '^release verify v2.5.3 -R sagehere/TCP-Brutal-Custom$' "$tmp/gh.log"
+[[ $(grep -c '^release verify-asset v2.5.3 ' "$tmp/gh.log") == 3 ]]
+
+# An early unsafe member followed by a long listing used to trigger grep -q/SIGPIPE under pipefail.
+cp "$fixture/tcp-brutal-custom-source.tar.gz" "$tmp/source-good.tar.gz"
+cp "$fixture/SHA256SUMS" "$tmp/sums-good"
+cp "$fixture/release.json" "$tmp/release-good.json"
+python3 - "$fixture/tcp-brutal-custom-source.tar.gz" <<'PYTAR'
+import io, sys, tarfile
+path=sys.argv[1]
+with tarfile.open(path, 'w:gz') as tf:
+    data=b'escape'
+    ti=tarfile.TarInfo('../escape')
+    ti.size=len(data)
+    tf.addfile(ti, io.BytesIO(data))
+    for i in range(12000):
+        ti=tarfile.TarInfo(f'TCP-Brutal-Custom-2.5.3/padding/{i:05d}')
+        ti.size=0
+        tf.addfile(ti)
+PYTAR
+(cd "$fixture" && sha256sum tcp-brutal-custom-source.tar.gz tcp-brutal.dkms.tar.gz release-manifest.txt >SHA256SUMS)
+cat >"$fixture/release.json" <<JSON
+{"tag_name":"$tag","target_commitish":"$commit","immutable":true,"assets":[
+$(asset_json SHA256SUMS "$fixture/SHA256SUMS"),
+$(asset_json release-manifest.txt "$fixture/release-manifest.txt"),
+$(asset_json tcp-brutal-custom-source.tar.gz "$fixture/tcp-brutal-custom-source.tar.gz"),
+$(asset_json tcp-brutal.dkms.tar.gz "$fixture/tcp-brutal.dkms.tar.gz")
+]}
+JSON
+set +e
+(run_good >"$tmp/unsafe-out" 2>"$tmp/unsafe-err")
+unsafe_rc=$?
+set -e
+[[ $unsafe_rc -ne 0 ]]
+grep -q '包含不安全路径' "$tmp/unsafe-err"
+cp "$tmp/source-good.tar.gz" "$fixture/tcp-brutal-custom-source.tar.gz"
+cp "$tmp/sums-good" "$fixture/SHA256SUMS"
+cp "$tmp/release-good.json" "$fixture/release.json"
 
 cp "$fixture/release.json" "$tmp/release-good.json"
 sed -i 's/"immutable":true/"immutable":false/' "$fixture/release.json"
@@ -102,7 +138,7 @@ sed -i 's/^COMMIT=.*/COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/' "$fixture
 cp "$tmp/release-good.json" "$fixture/release.json"
 cat >"$fixture/release-manifest.txt" <<META
 TAG=$tag
-VERSION=2.5.2
+VERSION=2.5.3
 COMMIT=$commit
 META
 (cd "$fixture" && sha256sum tcp-brutal-custom-source.tar.gz tcp-brutal.dkms.tar.gz release-manifest.txt >SHA256SUMS)

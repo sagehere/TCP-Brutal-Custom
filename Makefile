@@ -46,7 +46,8 @@ clean-dkms.conf:
 	$(RM) dkms.conf
 
 $(DKMS_TARBALL): dkms.conf Makefile $(SRCS)
-	$(TAR) zcf $(DKMS_TARBALL) \
+	$(TAR) --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+		-zcf $(DKMS_TARBALL) \
 		--transform 's,^,./dkms_source_tree/,' \
 		dkms.conf \
 		Makefile \

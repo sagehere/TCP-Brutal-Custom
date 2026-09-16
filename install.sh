@@ -27,7 +27,7 @@ PORT_RULE_PREF_MAX=12127
 AGGREGATE_FILTER_PREF=23300
 AGGREGATE_FILTER_HANDLE=0x233
 AGGREGATE_STATE="$STATE_DIR/aggregate-egress.state"
-MANAGER_VERSION="2.5.2"
+MANAGER_VERSION="2.5.3"
 
 IPV4_RATE=80
 IPV6_RATE=80
@@ -148,12 +148,15 @@ confirm() {
 }
 
 has_global_address() {
-  local family=$1
-  ip "-$family" -o addr show scope global 2>/dev/null | grep -q .
+  local family=$1 out
+  out=$(ip "-$family" -o addr show scope global 2>/dev/null) || return 1
+  [[ -n $out ]]
 }
 
 has_default_route() {
-  ip "-$1" route show default 2>/dev/null | grep -q .
+  local family=$1 out
+  out=$(ip "-$family" route show default 2>/dev/null) || return 1
+  [[ -n $out ]]
 }
 
 family_enabled() {
@@ -360,7 +363,7 @@ download_source() {
   [[ $manifest_tag == "$tag" && $manifest_version == "$product" && $manifest_commit == "$target" ]] ||
     die "Release manifest 与 GitHub Release 元数据不一致。"
 
-  if tar -tzf "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+  if tar -tzf "$archive" | grep -E '(^/|(^|/)\.\.(/|$))' >/dev/null; then
     die "Release source archive 包含不安全路径。"
   fi
   mkdir -p "$temp/source"
@@ -439,7 +442,7 @@ remove_custom_dkms() {
 }
 
 custom_version_installed() {
-  dkms status -m "$PACKAGE" -v "$1" -k "$(uname -r)" 2>/dev/null | grep -Eq ': installed(,|$)'
+  dkms status -m "$PACKAGE" -v "$1" -k "$(uname -r)" 2>/dev/null | grep -E ': installed(,|$)' >/dev/null
 }
 
 remove_old_custom_dkms() {
@@ -697,7 +700,7 @@ port_policy_preflight() {
   check_port_policy_conflicts_family 4 || return 1
   check_port_policy_conflicts_family 6 || return 1
   [[ -n $normalized ]] || return 0
-  if ip -o link show type vrf 2>/dev/null | grep -q .; then
+  if ip -o link show type vrf 2>/dev/null | grep . >/dev/null; then
     echo "错误: 检测到 VRF；端口模式不会自动修改 VRF/策略路由环境。" >&2
     return 1
   fi
@@ -707,9 +710,18 @@ port_policy_preflight() {
   done
 }
 
+normalize_route_fingerprint_line() {
+  local line=$1
+  sed -E 's/[[:space:]]+expires[[:space:]]+[^[:space:]]+//g; s/[[:space:]]+/ /g; s/^ //; s/ $//' <<<"$line"
+}
+
 port_route_fingerprint_family() {
-  local family=$1
-  ip "-$family" -N route show table main | cksum | awk '{print $1 ":" $2}'
+  local family=$1 routes line
+  routes=$(ip "-$family" -N route show table main 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    normalize_route_fingerprint_line "$line"
+  done <<<"$routes" | LC_ALL=C sort | cksum | awk '{print $1 ":" $2}'
 }
 
 snapshot_port_policy_family() {
@@ -725,16 +737,24 @@ snapshot_port_policy() {
 }
 
 restore_port_policy_family() {
-  local family=$1 dir=$2 line pref sport clean
+  local family=$1 dir=$2 line pref sport clean phase
   local -a args=()
   clear_managed_port_rules_family "$family" || return 1
   ip "-$family" route flush table "$PORT_TABLE" >/dev/null 2>&1 || true
-  while IFS= read -r line; do
-    [[ -n $line ]] || continue
-    clean=$(sanitize_route_line "$line")
-    read -r -a args <<<"$clean"
-    ip "-$family" route add table "$PORT_TABLE" "${args[@]}" || return 1
-  done <"$dir/routes$family"
+  for phase in nondefault default; do
+    while IFS= read -r line; do
+      [[ -n $line ]] || continue
+      if [[ $phase == nondefault ]]; then
+        [[ $line != default\ * ]] || continue
+      else
+        [[ $line == default\ * ]] || continue
+      fi
+      clean=$(sanitize_route_line "$line")
+      [[ -n $clean ]] || continue
+      read -r -a args <<<"$clean"
+      ip "-$family" route add table "$PORT_TABLE" "${args[@]}" || return 1
+    done <"$dir/routes$family"
+  done
   while read -r pref sport; do
     [[ -n ${pref:-} && -n ${sport:-} ]] || continue
     ip "-$family" rule add priority "$pref" ipproto tcp sport "$sport" lookup "$PORT_TABLE" || return 1
@@ -919,12 +939,12 @@ aggregate_remove_owned_from_dev() {
   [[ -n $dev ]] || return 0
   if aggregate_filter_owned "$dev"; then
     tc filter del dev "$dev" egress pref "$AGGREGATE_FILTER_PREF" protocol all handle "$AGGREGATE_FILTER_HANDLE" matchall || return 1
-  elif tc filter show dev "$dev" egress pref "$AGGREGATE_FILTER_PREF" 2>/dev/null | grep -q .; then
+  elif tc filter show dev "$dev" egress pref "$AGGREGATE_FILTER_PREF" 2>/dev/null | grep . >/dev/null; then
     echo "错误: $dev 的 egress pref $AGGREGATE_FILTER_PREF 不再属于本项目，拒绝删除。" >&2
     return 1
   fi
-  if [[ $remove_clsact == 1 ]] && tc qdisc show dev "$dev" | grep -q '^qdisc clsact '; then
-    if ! tc filter show dev "$dev" ingress 2>/dev/null | grep -q . && ! tc filter show dev "$dev" egress 2>/dev/null | grep -q .; then
+  if [[ $remove_clsact == 1 ]] && tc qdisc show dev "$dev" | grep '^qdisc clsact ' >/dev/null; then
+    if ! tc filter show dev "$dev" ingress 2>/dev/null | grep . >/dev/null && ! tc filter show dev "$dev" egress 2>/dev/null | grep . >/dev/null; then
       tc qdisc del dev "$dev" clsact || return 1
     fi
   fi
@@ -963,7 +983,7 @@ apply_aggregate_cap() {
     note "总出口保护预检通过：$dev @ ${AGGREGATE_RATE} Mbps；未修改 root qdisc。"
     return 0
   fi
-  if tc qdisc show dev "$dev" | grep -q '^qdisc clsact '; then
+  if tc qdisc show dev "$dev" | grep '^qdisc clsact ' >/dev/null; then
     [[ $old_dev == "$dev" ]] && created=$old_created || created=0
   else
     tc qdisc add dev "$dev" clsact || return 1
@@ -1130,7 +1150,7 @@ install_or_update() (
   }
   trap cleanup_install EXIT
   trap 'exit 130' INT TERM
-  if dkms status -m tcp-brutal 2>/dev/null | grep -q .; then
+  if dkms status -m tcp-brutal 2>/dev/null | grep . >/dev/null; then
     has_upstream=1
     needs_migration=1
     mapfile -t upstream_versions < <(dkms status -m tcp-brutal 2>/dev/null | sed -nE 's#^tcp-brutal/([^,]+),.*#\1#p' | sort -u)
