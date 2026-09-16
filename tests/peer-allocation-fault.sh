@@ -31,6 +31,7 @@ fault_off() {
     echo 0 >"$failslab/probability" 2>/dev/null || true
     echo 0 >"$failslab/times" 2>/dev/null || true
     echo N >"$failslab/cache-filter" 2>/dev/null || true
+    echo N >"$failslab/task-filter" 2>/dev/null || true
   fi
   if [[ -e $cache/failslab ]]; then
     echo 0 >"$cache/failslab" 2>/dev/null || true
@@ -83,10 +84,14 @@ ip netns exec "$server" "$ctl" add 10.219.0.0/16 100 noroute perip
   exit 1
 }
 [[ -w $cache/failslab ]] || { echo "tcp_brutal_peer failslab selector is unavailable" >&2; exit 1; }
+[[ -w $failslab/task-filter ]] || { echo "failslab task-filter control is unavailable" >&2; exit 1; }
 
 # Mark only the peer cache, then enable deterministic allocation failures. The
 # module's 32-object mempool reserve was populated before injection starts.
+# Disable task filtering explicitly: virtme guests may leave it enabled, which
+# otherwise requires setting /proc/<pid>/make-it-fail for the allocating task.
 echo 0 >"$failslab/probability"
+echo N >"$failslab/task-filter"
 echo 1 >"$cache/failslab"
 echo Y >"$failslab/cache-filter"
 echo 1 >"$failslab/interval"
