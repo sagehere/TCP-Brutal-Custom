@@ -33,35 +33,35 @@ export BRUTAL_MANAGER_LIB=1
 source "$repo/install.sh"
 
 ! grep -Eqi 'x-ui|xray|3x-ui|vless|xhttp' "$repo/install.sh"
-[[ $MANAGER_VERSION == 2.5.1 ]]
-[[ $(source_product_version "$repo") == 2.5.1 ]]
+[[ $MANAGER_VERSION == 2.5.2 ]]
+[[ $(source_product_version "$repo") == 2.5.2 ]]
 sha_a=abcdef0123456789abcdef0123456789abcdef01
 sha_b=1234567890abcdef1234567890abcdef12345678
-[[ $(source_version "$repo" "$sha_a") == 2.5.1.custom.abcdef0 ]]
-[[ $(source_version "$repo" "$sha_b") == 2.5.1.custom.1234567 ]]
+[[ $(source_version "$repo" "$sha_a") == 2.5.2.custom.abcdef0 ]]
+[[ $(source_version "$repo" "$sha_b") == 2.5.2.custom.1234567 ]]
 [[ $(source_version "$repo" "$sha_a") != $(source_version "$repo" "$sha_b") ]]
 ! (source_version "$repo" invalid >/dev/null 2>&1)
 header_version=$(sed -nE 's/^#define BRUTAL_VERSION_(MAJOR|MINOR|PATCH)[[:space:]]+([0-9]+).*/\2/p' "$repo/brutal.h" | paste -sd.)
 [[ $header_version == "$MANAGER_VERSION" ]]
 
 dkms_version=$("$repo/scripts/mkdkmsconf.sh" | sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p')
-[[ $dkms_version == 2.5.1 ]]
+[[ $dkms_version == 2.5.2 ]]
 mkdir -p "$tmp/no-git/scripts"
 cp "$repo/brutal.h" "$tmp/no-git/brutal.h"
 cp "$repo/scripts/mkdkmsconf.sh" "$tmp/no-git/scripts/mkdkmsconf.sh"
-[[ $(cd "$tmp/no-git" && ./scripts/mkdkmsconf.sh | sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p') == 2.5.1 ]]
-(cd "$repo" && PACKAGE_VERSION=2.5.1.custom.abcdef0 ./scripts/mkdkmsconf.sh >/dev/null)
-! (cd "$repo" && PACKAGE_VERSION=2.5.1.custom.abcdef ./scripts/mkdkmsconf.sh >/dev/null 2>&1)
+[[ $(cd "$tmp/no-git" && ./scripts/mkdkmsconf.sh | sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p') == 2.5.2 ]]
+(cd "$repo" && PACKAGE_VERSION=2.5.2.custom.abcdef0 ./scripts/mkdkmsconf.sh >/dev/null)
+! (cd "$repo" && PACKAGE_VERSION=2.5.2.custom.abcdef ./scripts/mkdkmsconf.sh >/dev/null 2>&1)
 
 (
   DKMS_SOURCE_ROOT="$tmp/dkms-source"
   PACKAGE=tcp-brutal-custom
-  VERSION=2.5.1.custom.abcdef0
+  VERSION=2.5.2.custom.abcdef0
   COMMIT=$sha_a
   dkms() { return 0; }
   build_dkms "$repo"
   [[ $(build_commit_marker "$VERSION") == "$sha_a" ]]
-  grep -qx 'PACKAGE_VERSION="2.5.1.custom.abcdef0"' "$DKMS_SOURCE_ROOT/$PACKAGE-$VERSION/dkms.conf"
+  grep -qx 'PACKAGE_VERSION="2.5.2.custom.abcdef0"' "$DKMS_SOURCE_ROOT/$PACKAGE-$VERSION/dkms.conf"
 )
 
 (
@@ -107,7 +107,7 @@ read_tty() { printf -v "$2" n; }
 ! confirm "cancel"
 read_tty() { printf -v "$2" 0; }
 menu_output=$(menu)
-grep -q 'TCP Brutal Custom 管理器 v2.5.1' <<<"$menu_output"
+grep -q 'TCP Brutal Custom 管理器 v2.5.2' <<<"$menu_output"
 
 (
   have() { return 0; }
@@ -371,7 +371,7 @@ download_source() {
   mkdir -p "$1/source"
   echo 2222222222222222222222222222222222222222
 }
-source_version() { echo 2.5.1.custom.2222222; }
+source_version() { echo 2.5.2.custom.2222222; }
 custom_version_installed() { [[ $1 == 2.1.0.custom.1111111 ]]; }
 dkms() {
   if [[ $1 == status && ${UPSTREAM_PRESENT:-0} == 1 ]]; then
@@ -447,9 +447,9 @@ rc=$?
 set -e
 [[ $rc == 0 ]]
 [[ $(grep -c '^rmmod$' "$failure_log") == 1 ]]
-[[ $(grep -E '^(build|dkms install|install-manager|write-service|rmmod|save|mark-pending|enable-deferred)' "$failure_log" | paste -sd' ') == 'build dkms install -m tcp-brutal-custom -v 2.5.1.custom.2222222 install-manager write-service rmmod save enable-deferred mark-pending' ]]
-[[ $(cat "$PENDING_REBOOT") == 2.5.1.custom.2222222 ]]
-grep -q '^dkms install -m tcp-brutal-custom -v 2.5.1.custom.2222222$' "$failure_log"
+[[ $(grep -E '^(build|dkms install|install-manager|write-service|rmmod|save|mark-pending|enable-deferred)' "$failure_log" | paste -sd' ') == 'build dkms install -m tcp-brutal-custom -v 2.5.2.custom.2222222 install-manager write-service rmmod save enable-deferred mark-pending' ]]
+[[ $(cat "$PENDING_REBOOT") == 2.5.2.custom.2222222 ]]
+grep -q '^dkms install -m tcp-brutal-custom -v 2.5.2.custom.2222222$' "$failure_log"
 ! grep -q '^apply$' "$failure_log"
 ! grep -q '^enable$' "$failure_log"
 
@@ -489,8 +489,8 @@ grep -q '^rmmod$' "$failure_log"
 
 : >"$failure_log"
 ENABLE_FAILURE=0
-source_version() { echo 2.5.1.custom.2222222; }
-custom_version_installed() { [[ $1 == 2.5.1.custom.2222222 ]]; }
+source_version() { echo 2.5.2.custom.2222222; }
+custom_version_installed() { [[ $1 == 2.5.2.custom.2222222 ]]; }
 build_commit_marker() { echo 2222222222222222222222222222222222222222; }
 install_or_update
 [[ -f $tmp/saved-commit && $(cat "$tmp/saved-commit") == 2222222222222222222222222222222222222222 ]]

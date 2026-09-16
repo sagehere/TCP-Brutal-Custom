@@ -27,7 +27,7 @@ PORT_RULE_PREF_MAX=12127
 AGGREGATE_FILTER_PREF=23300
 AGGREGATE_FILTER_HANDLE=0x233
 AGGREGATE_STATE="$STATE_DIR/aggregate-egress.state"
-MANAGER_VERSION="2.5.1"
+MANAGER_VERSION="2.5.2"
 
 IPV4_RATE=80
 IPV6_RATE=80
@@ -635,8 +635,29 @@ check_port_policy_conflicts_family() {
   fi
 }
 
+default_route_path_count() {
+  awk '
+    $1=="default" {
+      via="<direct>"; dev=""
+      for(i=2;i<=NF;i++) {
+        if($i=="via" && i<NF) {
+          via=$(i+1)
+          if((via=="inet" || via=="inet6") && i+2<=NF) via=$(i+2)
+        }
+        if($i=="dev" && i<NF) dev=$(i+1)
+      }
+      if(dev=="") { bad=1; next }
+      seen[dev SUBSEP via]=1
+    }
+    END {
+      if(bad) exit 2
+      for(k in seen) n++
+      print n+0
+    }'
+}
+
 check_port_policy_complex_family() {
-  local family=$1 bad defaults routes
+  local family=$1 bad defaults default_paths routes
   bad=$(ip "-$family" rule show | awk -v t="$PORT_TABLE" -v b="$PORT_RULE_PREF_BASE" -v m="$PORT_RULE_PREF_MAX" '
     {
       pref=$1; sub(/:$/, "", pref); sport=""; table=""; proto=""
@@ -660,8 +681,14 @@ check_port_policy_complex_family() {
   fi
   defaults=$(awk '$1=="default" {n++} END {print n+0}' <<<"$routes")
   if (( defaults > 1 )); then
-    echo "错误: IPv$family main 路由表存在多个默认路由，端口模式拒绝自动选择。" >&2
-    return 1
+    if ! default_paths=$(default_route_path_count <<<"$routes"); then
+      echo "错误: IPv$family main 路由表存在无法安全解析的默认路由，端口模式拒绝自动克隆。" >&2
+      return 1
+    fi
+    if (( default_paths > 1 )); then
+      echo "错误: IPv$family main 路由表存在多个默认路由且下一跳路径不同，端口模式拒绝自动选择。" >&2
+      return 1
+    fi
   fi
 }
 

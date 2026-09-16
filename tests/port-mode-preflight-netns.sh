@@ -47,15 +47,24 @@ fi
 MODE=auto
 TCP_PORTS=5211
 
+table233_json() {
+  local family=$1 out
+  if ! out=$(ip "-$family" -j route show table 233 2>/dev/null); then
+    out='[]'
+  fi
+  [[ -n $out ]] || out='[]'
+  printf '%s' "$out"
+}
+
 rules4_before=$(ip -4 -j rule show)
 rules6_before=$(ip -6 -j rule show)
-routes4_before=$(ip -4 -j route show table 233 2>/dev/null || true)
-routes6_before=$(ip -6 -j route show table 233 2>/dev/null || true)
+routes4_before=$(table233_json 4)
+routes6_before=$(table233_json 6)
 apply_port_rules 1
 [[ $(ip -4 -j rule show) == "$rules4_before" ]]
 [[ $(ip -6 -j rule show) == "$rules6_before" ]]
-[[ $(ip -4 -j route show table 233 2>/dev/null || true) == "$routes4_before" ]]
-[[ $(ip -6 -j route show table 233 2>/dev/null || true) == "$routes6_before" ]]
+[[ $(table233_json 4) == "$routes4_before" ]]
+[[ $(table233_json 6) == "$routes6_before" ]]
 
 ip -4 rule add priority 100 fwmark 0x1 lookup 100
 if apply_port_rules 1 >/tmp/tbc-preflight-out 2>/tmp/tbc-preflight-err; then
@@ -73,13 +82,34 @@ fi
 grep -q '保留区域存在非受管规则' /tmp/tbc-preflight-err
 ip -4 rule del priority 12000
 
+# Duplicate defaults that resolve to the same gateway/device are common on cloud VPSes.
 ip -4 route add default via 198.18.0.1 dev "$dev" metric 100
+apply_port_rules 1
+apply_port_rules
+rules4_applied=$(ip -4 rule show)
+routes4_applied=$(ip -4 route show table 233)
+grep -Eq '^12000:.*ipproto tcp.*sport 5211.*lookup 233' <<<"$rules4_applied"
+grep -q '^default ' <<<"$routes4_applied"
+reset_port_policy
+[[ $(ip -4 -j rule show) == "$rules4_before" ]]
+[[ $(ip -6 -j rule show) == "$rules6_before" ]]
+[[ $(table233_json 4) == "$routes4_before" ]]
+[[ $(table233_json 6) == "$routes6_before" ]]
+ip -4 route del default via 198.18.0.1 dev "$dev" metric 100
+
+# Distinct default paths remain fail-closed (dual-WAN / multiple uplinks).
+alt=tbc-alt0
+ip link add "$alt" type dummy
+ip addr add 198.19.0.2/24 dev "$alt"
+ip link set "$alt" up
+ip -4 route add default via 198.19.0.1 dev "$alt" metric 200
 if apply_port_rules 1 >/tmp/tbc-preflight-out 2>/tmp/tbc-preflight-err; then
-  echo "multiple-default preflight unexpectedly succeeded" >&2
+  echo "distinct-default preflight unexpectedly succeeded" >&2
   exit 1
 fi
 grep -q '多个默认路由' /tmp/tbc-preflight-err
-ip -4 route del default via 198.18.0.1 dev "$dev" metric 100
+ip -4 route del default via 198.19.0.1 dev "$alt" metric 200
+ip link del "$alt"
 
 ip -4 route add 203.0.113.0/24 \
   nexthop via 198.18.0.1 dev "$dev" weight 1 \
@@ -105,8 +135,8 @@ fi
 apply_port_rules
 before_rules4=$(ip -4 -j rule show)
 before_rules6=$(ip -6 -j rule show)
-before_routes4=$(ip -4 -j route show table 233)
-before_routes6=$(ip -6 -j route show table 233)
+before_routes4=$(table233_json 4)
+before_routes6=$(table233_json 6)
 
 sync_port_table_family() { return 1; }
 TCP_PORTS=5212
@@ -116,8 +146,8 @@ if apply_port_rules >/tmp/tbc-preflight-out 2>/tmp/tbc-preflight-err; then
 fi
 [[ $(ip -4 -j rule show) == "$before_rules4" ]]
 [[ $(ip -6 -j rule show) == "$before_rules6" ]]
-[[ $(ip -4 -j route show table 233) == "$before_routes4" ]]
-[[ $(ip -6 -j route show table 233) == "$before_routes6" ]]
+[[ $(table233_json 4) == "$before_routes4" ]]
+[[ $(table233_json 6) == "$before_routes6" ]]
 
 echo "port-mode preflight/rollback netns test passed"
 INNER
