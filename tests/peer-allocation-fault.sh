@@ -182,10 +182,10 @@ trap - EXIT
 
 log=$(dmesg 2>/dev/null || true)
 printf '%s\n' "$log"
-grep -q 'FAULT_INJECTION: forcing a failure' <<<"$log" || {
-  echo "failslab did not record a forced allocation failure" >&2
-  exit 1
-}
+# peer_alloc_failures and peer_fallback_connections above are the
+# authoritative proof that failslab exhausted the peer mempool and exercised
+# the fallback path. Do not require a particular fault-injection printk: the
+# debugfs counters are functional even when that diagnostic is not emitted.
 if grep -Eiq \
   'BUG: KASAN|possible circular locking dependency|inconsistent lock state|bad unlock balance|held lock freed|suspicious RCU usage|sleeping function called from invalid context|deadlock|use-after-free|slab-out-of-bounds|refcount_t:|rcu[^:]*stall|kernel BUG|NULL pointer dereference|general protection fault|Oops:' \
   <<<"$log"; then

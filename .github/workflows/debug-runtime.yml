@@ -145,6 +145,18 @@ jobs:
               FAULT_ATTEMPTS=40 \
               bash "$GITHUB_WORKSPACE/tests/peer-allocation-fault.sh" \
                 "$GITHUB_WORKSPACE/brutal.ko" 2>&1 | tee "$log"
+      - name: Stress module lifecycle under KASAN
+        if: matrix.profile == 'kasan-lockdep'
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP/linux-${KERNEL_VERSION}"
+          log="$RUNNER_TEMP/debug-lifecycle-${{ matrix.profile }}.log"
+          timeout --signal=TERM 10m vng -v -m 4G -- \
+            sudo -n env \
+              CYCLES=100 \
+              bash "$GITHUB_WORKSPACE/tests/debug-module-lifecycle.sh" \
+                "$GITHUB_WORKSPACE/brutal.ko" 2>&1 | tee "$log"
       - name: Upload debug runtime logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -154,5 +166,6 @@ jobs:
             ${{ runner.temp }}/debug-preflight-${{ matrix.profile }}.log
             ${{ runner.temp }}/debug-runtime-${{ matrix.profile }}.log
             ${{ runner.temp }}/debug-fault-${{ matrix.profile }}.log
+            ${{ runner.temp }}/debug-lifecycle-${{ matrix.profile }}.log
           if-no-files-found: warn
           retention-days: 7
