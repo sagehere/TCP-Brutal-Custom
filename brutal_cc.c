@@ -142,7 +142,8 @@ static u32 brutal_min_tso_segs(struct sock *sk)
         u64 used_ns;
         u32 stale_ns = clamp_t(u32,
                                max(brutal->resv_duration_ns,
-                                   brutal->resv_parent_duration_ns) / 2,
+                                   brutal->resv_parent_duration_ns) /
+                                   2,
                                RESV_STALE_MIN_NS, RESV_STALE_MAX_NS);
 
         sent = tp->bytes_sent - brutal->resv_bytes_sent;

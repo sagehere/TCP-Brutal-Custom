@@ -51,7 +51,7 @@ static int brutal_genl_put_rule(struct sk_buff *skb,
                                 const struct brutal_rule_info *rule)
 {
     const void *address = rule->family == AF_INET ? (const void *)&rule->v4
-                                                   : (const void *)&rule->v6;
+                                                  : (const void *)&rule->v6;
     int address_len = rule->family == AF_INET ? sizeof(rule->v4)
                                               : sizeof(rule->v6);
 
