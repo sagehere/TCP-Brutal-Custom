@@ -37,7 +37,8 @@ MOCK
 chmod +x "$tmp/bin/ip"
 
 cc -O2 -Wall -Wextra -Werror -std=c99 -pedantic \
-  -DRULES_PATH=\"$rules\" -o "$tmp/brutalctl" "$repo/tools/brutalctl.c"
+  -DRULES_PATH=\"$rules\" -o "$tmp/brutalctl" \
+  "$repo/tools/brutalctl.c" "$repo/tools/brutal_netlink.c"
 export PATH="$tmp/bin:$PATH" IP_LOG="$log"
 
 : >"$rules"; : >"$log"

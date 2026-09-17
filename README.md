@@ -99,7 +99,7 @@ UDP / QUIC              -> 不受影响
 ## 规则说明
 
 ```bash
-brutalctl add <prefix> <Mbps> [gain=<tenths>] [noroute] [perip]
+brutalctl add <prefix> <Mbps> [gain=<tenths>] [noroute] [perip] [maxpeers=N]
 brutalctl list
 brutalctl peers
 brutalctl del <prefix>
@@ -109,6 +109,7 @@ brutalctl flush
 - 不带 `perip` 时，保持上游行为：所有命中规则的连接共享一份速率。
 - 带 `perip` 时，每个对端 IP 各自拥有一份速率；同一 IP 的所有连接合计共享。
 - `perip` 必须使用默认锁定规则，不能与 `nolock` 一起使用。
+- `maxpeers=N` 可限制单条 `perip` 规则同时存在的 peer 组数量；达到上限后新 IP 使用固定哈希 fallback pacer。`maxpeers=0` 表示不限。
 - 修改同一模式规则的速率会立即影响已有连接。普通共享规则与 `perip` 规则之间切换时，先删除再重新添加规则。
 - 规则只匹配新建连接；删除规则后，旧连接会继续使用原速率直到关闭。
 - 规则和统计按 network namespace 隔离；需要在对应容器或 namespace 内配置规则。
@@ -116,7 +117,7 @@ brutalctl flush
 
 `brutalctl peers` 支持 `--rule ID`、`--ip ADDRESS`、`--family 4|6` 和
 `--limit N`。`/proc/net/tcp_brutal/stats` 提供 peer 分配失败、fallback、
-当前及峰值 peer 组数。
+当前及峰值 peer 组数。P2 还提供 `/proc/net/tcp_brutal/limits`：写入 `max_peers=N` 可设置当前 network namespace 的 peer 总预算；`0` 表示不限。达到规则或 namespace 预算时不会拒绝 TCP 连接，而是使用 `hashed_fallback` 保持可用性。
 
 ## 边界与建议
 
@@ -190,3 +191,23 @@ sudo tbc uninstall
 安装和改速时可分别设置 IPv4、IPv6 的每 IP 速率，并选择 `auto`、`ipv4`、`ipv6` 或 `dual` 地址族模式。`auto` 只会为同时具备全局地址和默认路由的地址族应用规则；暂时不可用的地址族会保留配置，待下次可用时由 systemd 服务恢复。
 
 菜单提供状态、活跃 IP 快照和实时刷新，输入 `0` 退出。关闭开机启动也会关闭模块自动加载；再次开启时会恢复两者。安装或更新失败时，管理器会清理临时文件并尝试恢复原模块和规则。普通 Custom 更新遇到模块仍被 TCP 连接占用时，会保留现有连接、安装新版文件并提示重启；`status` 会显示待启用版本，重启并成功恢复规则后自动清除该状态。上游 TCP Brutal 迁移仍会安全退出。暂存期间若旧模块没有 `peers` 接口，活跃 IP 视图会直接提示重启。
+
+## P2 控制与观测接口
+
+支持的模块会通过 `TCP_BRUTAL_INFO` 明确公布能力。`brutalctl` 在发现
+Generic Netlink `tcp_brutal` family 后使用类型化接口，否则自动回退到
+`/proc/net/tcp_brutal`，不会根据版本号猜测功能。
+
+```bash
+brutalctl info
+brutalctl stats
+brutalctl limits
+sudo brutalctl limits 10000
+sudo brutalctl add 0.0.0.0/0 100 perip aggregate=1000 maxpeers=10000
+```
+
+`aggregate=Mbps` 是单条 `perip` 规则内所有子 pacer 的可选总上限；不配置时
+保持原有每 IP 语义。`maxpeers` 和 namespace `limits` 达到上限时使用
+`hashed_fallback` 保持连接可用，它不是严格的租户隔离。架构、威胁边界和
+报告方式见 [架构说明](docs/architecture.md)、[威胁模型](docs/threat-model.md)
+和 [安全策略](SECURITY.md)。

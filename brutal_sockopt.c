@@ -113,6 +113,20 @@ u64 brutal_group_rate(struct brutal_pacer *p)
     return rate;
 }
 
+u64 brutal_group_aggregate_rate(struct brutal_pacer *p)
+{
+    struct brutal_rate_cfg *cfg = &brutal_pacer_config_group(p)->cfg;
+    unsigned int seq;
+    u64 rate;
+
+    do
+    {
+        seq = read_seqcount_begin(&cfg->seq);
+        rate = READ_ONCE(cfg->aggregate_rate);
+    } while (read_seqcount_retry(&cfg->seq, seq));
+    return rate;
+}
+
 u32 brutal_group_cwnd_gain(struct brutal_pacer *p)
 {
     u32 gain;
@@ -163,6 +177,10 @@ int brutal_group_enable_rule_stats(struct brutal_group *g, bool perip)
         }
     }
     stats->group = g;
+    atomic_set(&stats->peer_slots, 0);
+    atomic_set(&stats->peak_peer_slots, 0);
+    atomic64_set(&stats->peer_budget_fallbacks, 0);
+    stats->max_peers = 0;
     g->fallbacks = fallbacks;
     g->rule_stats = stats;
     return 0;
@@ -237,6 +255,22 @@ void brutal_group_set_config(struct brutal_pacer *p, u64 rate, u32 gain,
     spin_lock_bh(&cfg->lock);
     write_seqcount_begin(&cfg->seq);
     WRITE_ONCE(cfg->rate, rate);
+    WRITE_ONCE(cfg->cwnd_gain, gain);
+    WRITE_ONCE(cfg->locked, locked);
+    atomic_inc(&cfg->generation);
+    write_seqcount_end(&cfg->seq);
+    spin_unlock_bh(&cfg->lock);
+}
+
+void brutal_group_set_rule_config(struct brutal_pacer *p, u64 rate, u32 gain,
+                                  bool locked, u64 aggregate_rate)
+{
+    struct brutal_rate_cfg *cfg = &brutal_pacer_config_group(p)->cfg;
+
+    spin_lock_bh(&cfg->lock);
+    write_seqcount_begin(&cfg->seq);
+    WRITE_ONCE(cfg->rate, rate);
+    WRITE_ONCE(cfg->aggregate_rate, aggregate_rate);
     WRITE_ONCE(cfg->cwnd_gain, gain);
     WRITE_ONCE(cfg->locked, locked);
     atomic_inc(&cfg->generation);
@@ -354,9 +388,16 @@ struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group
         return &peer->pacer;
     }
 
+    if (!brutal_peer_budget_try_reserve(net, parent))
+    {
+        brutal_net_peer_budget_fallback(net, parent);
+        return brutal_fallback_group_get(&key, parent, net);
+    }
+
     new_peer = brutal_peer_alloc();
     if (!new_peer)
     {
+        brutal_peer_budget_release(net, parent);
         brutal_net_peer_alloc_failed(net);
         return brutal_fallback_group_get(&key, parent, net);
     }
@@ -372,12 +413,14 @@ struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group
         {
             brutal_net_peer_insert_failed(net);
             mempool_free(new_peer, brutal_peer_pool);
+            brutal_peer_budget_release(net, parent);
             return brutal_fallback_group_get(&key, parent, net);
         }
         if (!peer)
             break;
         if (brutal_peer_try_get(peer))
         {
+            brutal_peer_budget_release(net, parent);
             brutal_group_put(parent);
             mempool_free(new_peer, brutal_peer_pool);
             return &peer->pacer;
@@ -437,6 +480,7 @@ void brutal_pacer_put(struct brutal_pacer *p)
         spin_unlock_bh(&peer->lifecycle_lock);
 
         atomic_dec(&parent->ip_groups);
+        brutal_peer_budget_release(peer->net, parent);
         brutal_net_peer_removed(peer->net);
         call_rcu(&peer->rcu, brutal_peer_free_rcu);
         return;
@@ -626,6 +670,33 @@ static int brutal_get_version(char __user *optval, int __user *optlen)
     return 0;
 }
 
+static void brutal_fill_info(struct brutal_info_v1 *info)
+{
+    memset(info, 0, sizeof(*info));
+    info->size = sizeof(*info);
+    info->abi_version = BRUTAL_INFO_ABI_V1;
+    info->vendor_id = BRUTAL_VENDOR_CUSTOM;
+    info->version = BRUTAL_VERSION;
+    info->capabilities = BRUTAL_CAPABILITIES;
+    memcpy(info->build_id, BRUTAL_BUILD_ID, BRUTAL_BUILD_ID_LEN);
+}
+
+static int brutal_get_info(char __user *optval, int __user *optlen)
+{
+    struct brutal_info_v1 info;
+    int len;
+
+    if (get_user(len, optlen))
+        return -EFAULT;
+    if (len < sizeof(info))
+        return -EINVAL;
+    brutal_fill_info(&info);
+    len = sizeof(info);
+    if (put_user(len, optlen) || copy_to_user(optval, &info, len))
+        return -EFAULT;
+    return 0;
+}
+
 static int brutal_tcp_setsockopt(struct sock *sk, int level, int optname,
                                  sockptr_t optval, unsigned int optlen)
 {
@@ -641,6 +712,8 @@ static int brutal_tcp_getsockopt(struct sock *sk, int level, int optname,
         return brutal_get_params(sk, optval, optlen);
     if (level == IPPROTO_TCP && optname == TCP_BRUTAL_VERSION)
         return brutal_get_version(optval, optlen);
+    if (level == IPPROTO_TCP && optname == TCP_BRUTAL_INFO)
+        return brutal_get_info(optval, optlen);
     return tcp_prot.getsockopt(sk, level, optname, optval, optlen);
 }
 
@@ -660,6 +733,8 @@ static int brutal_tcpv6_getsockopt(struct sock *sk, int level, int optname,
         return brutal_get_params(sk, optval, optlen);
     if (level == IPPROTO_TCP && optname == TCP_BRUTAL_VERSION)
         return brutal_get_version(optval, optlen);
+    if (level == IPPROTO_TCP && optname == TCP_BRUTAL_INFO)
+        return brutal_get_info(optval, optlen);
     return tcpv6_prot.getsockopt(sk, level, optname, optval, optlen);
 }
 #endif

@@ -61,12 +61,20 @@ jobs:
       - name: Build CLI and run user-space tests
         run: |
           make -C tools
+          cc -O2 -Wall -Wextra -Werror -std=c99 -o /tmp/brutal-info-abi tests/info-abi.c
+          /tmp/brutal-info-abi
+          bash -n tests/info-abi.sh tests/peer-budget-netns.sh \
+            tests/peer-budget-race.sh tests/peer-allocation-fault.sh \
+            tests/rule-id-index-netns.sh tests/prefix-index-netns.sh \
+            tests/intermediate-prefix-scale.sh tests/kernel-aggregate-netns.sh \
+            tests/genl-netns.sh
           bash -n tests/p2-regression.sh tests/p2-rule-scale.sh \
             tests/p2-peer-scale.sh tests/p2-peer-dump-scale.sh
           P2_DRY_RUN=1 bash tests/p2-regression.sh
           P2_DRY_RUN=1 bash tests/p2-rule-scale.sh
           P2_DRY_RUN=1 bash tests/p2-peer-scale.sh
           P2_DRY_RUN=1 bash tests/p2-peer-dump-scale.sh
+          P2_DRY_RUN=1 bash tests/pacer-contention.sh
           cc -O2 -Wall -Wextra -Werror -o /tmp/app-group-netns tests/app-group-netns.c
           bash tests/install-manager-test.sh
           bash tests/release-chain-test.sh

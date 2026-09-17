@@ -27,7 +27,7 @@ tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
   -C "$work/package" "TCP-Brutal-Custom-$version"
 cp "$work/source/install.sh" "$out/install.sh"
 chmod 0755 "$out/install.sh"
-make -C "$repo" dkms-tarball
+make -C "$repo" BRUTAL_BUILD_ID="$commit" dkms-tarball
 mv "$repo/dkms.tar.gz" "$out/tcp-brutal.dkms.tar.gz"
 cat >"$out/release-manifest.txt" <<META
 TAG=$tag

@@ -47,18 +47,33 @@ dmesg -C 2>/dev/null || true
 insmod "$module"
 grep -q '^brutal ' /proc/modules
 
+echo "== info ABI and capability discovery =="
+BRUTALCTL="$ctl" bash "$repo/tests/info-abi.sh"
 echo "== netns rule isolation =="
 BRUTALCTL="$ctl" bash "$repo/tests/netns-integration.sh"
 echo "== application-group netns isolation =="
 BRUTALCTL="$ctl" bash "$repo/tests/app-group-netns.sh"
 echo "== peer lifecycle churn =="
 PEERS=${PEERS:-2000} BRUTALCTL="$ctl" bash "$repo/tests/peer-churn.sh"
+echo "== peer resource budget =="
+BRUTALCTL="$ctl" bash "$repo/tests/peer-budget-netns.sh"
+echo "== peer resource budget race =="
+BRUTALCTL="$ctl" bash "$repo/tests/peer-budget-race.sh"
 echo "== same-peer reconnect lifecycle =="
 WORKERS=${RACE_WORKERS:-8} ITERATIONS=${RACE_ITERATIONS:-1000} \
   BRUTALCTL="$ctl" bash "$repo/tests/peer-reconnect-race.sh"
 echo "== active peer pagination =="
 PEERS=$page_peers PEER_WAIT_STEPS=${PEER_WAIT_STEPS:-300} \
   BRUTALCTL="$ctl" bash "$repo/tests/peer-pagination.sh"
+echo "== rule ID index =="
+BRUTALCTL="$ctl" bash "$repo/tests/rule-id-index-netns.sh"
+echo "== intermediate prefix index =="
+BRUTALCTL="$ctl" bash "$repo/tests/prefix-index-netns.sh"
+echo "== kernel aggregate pacing =="
+BRUTALCTL="$ctl" bash "$repo/tests/kernel-aggregate-netns.sh"
+
+echo "== Generic Netlink API =="
+BRUTALCTL="$ctl" bash "$repo/tests/genl-netns.sh"
 echo "== exact-host index growth =="
 RULES=${EXACT_RULES:-1000} BRUTALCTL="$ctl" bash "$repo/tests/exact-host-scale.sh"
 

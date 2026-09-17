@@ -1,9 +1,30 @@
 # TCP-Brutal-Custom P2 implementation specification
 
-Status: development specification  
+Status: implemented; local WSL runtime validation complete, dedicated-hardware
+release evidence pending (see `docs/p2-validation.md`)
 Project: `sagehere/TCP-Brutal-Custom`  
 P2 baseline: `65df326567df1a38dd2f227922723d1040bbacb9`  
 Baseline source version: `2.5.3`
+
+Implementation status:
+
+| Phase | Result |
+| --- | --- |
+| P2-00 | Baseline gates and dry-run scale entry points are present. |
+| P2-01 | Stable vendor/ABI/capability discovery is implemented. |
+| P2-02 | Namespace/rule peer budgets and hashed fallback are implemented. |
+| P2-03 | Monotonic XArray rule IDs and indexed peer iteration are implemented. |
+| P2-04 | Intermediate IPv4/IPv6 CIDRs use the bounded prefix index. |
+| P2-05 | Repeatable perf/lock/c2c/sched and memory measurement is present; no speculative layout change was made. |
+| P2-06A | Hierarchy reservation state fits the enforced private-state bound. |
+| P2-06B | Optional parent/child aggregate pacing is implemented. |
+| P2-07 | Typed, namespace-scoped Generic Netlink control, dumps and events are implemented with procfs fallback. |
+| P2-08 | Architecture, threat model, security policy and audit scope are documented. |
+
+The implementation status does not claim external audit or final release
+acceptance. Local WSL build, runtime, and 8-CPU perf evidence is recorded in
+`docs/p2-validation.md`; debug kernels and dedicated-host hardware evidence
+must still be attached before release promotion.
 
 ## 1. Purpose
 

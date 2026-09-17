@@ -76,6 +76,9 @@ ip -n "$client" link set "$client_dev" up
 ip -n "$client" route add local 10.219.0.0/16 dev lo table local
 ip -n "$server" route add 10.219.0.0/16 via 10.218.0.2 dev "$server_dev"
 ip netns exec "$server" "$ctl" add 10.219.0.0/16 100 noroute perip
+# Keep the budget active while allowing every attempted peer to reach the
+# allocation path. Allocation failures must release their reservations.
+echo "max_peers=$peers" | ip netns exec "$server" tee /proc/net/tcp_brutal/limits >/dev/null
 
 [[ -d $failslab ]] || { echo "failslab debugfs controls are unavailable" >&2; exit 1; }
 [[ -d $cache ]] || { echo "tcp_brutal_peer slab cache is unavailable" >&2; exit 1; }
@@ -138,12 +141,14 @@ PY
 client_pid=$!
 
 active=0
+slots=0
 fallback=0
 alloc_fail=0
 insert_fail=0
 for _ in $(seq 1 "$wait_steps"); do
   stats=$(ip netns exec "$server" cat /proc/net/tcp_brutal/stats)
   active=$(awk -F= '/^active_peer_groups=/{print $2}' <<<"$stats")
+  slots=$(awk -F= '/^peer_slots=/{print $2}' <<<"$stats")
   fallback=$(awk -F= '/^peer_fallback_connections=/{print $2}' <<<"$stats")
   alloc_fail=$(awk -F= '/^peer_alloc_failures=/{print $2}' <<<"$stats")
   insert_fail=$(awk -F= '/^peer_insert_failures=/{print $2}' <<<"$stats")
@@ -160,6 +165,7 @@ printf 'fault stats: peers=%d active=%d alloc_failures=%d fallbacks=%d insert_fa
 (( active > 0 && active < peers )) || { echo "unexpected active peer count under allocation faults" >&2; exit 1; }
 (( active + fallback >= peers )) || { echo "not all peer connections reached Brutal grouping" >&2; exit 1; }
 (( insert_fail == 0 )) || { echo "unexpected peer hash insertion failures" >&2; exit 1; }
+(( slots == active )) || { echo "budget slots leaked under allocation faults: slots=$slots active=$active" >&2; exit 1; }
 
 fault_off
 kill "$client_pid" "$server_pid" 2>/dev/null || true
@@ -169,11 +175,16 @@ client_pid=
 server_pid=
 
 for _ in $(seq 1 "$wait_steps"); do
-  active=$(ip netns exec "$server" awk -F= '/^active_peer_groups=/{print $2}' /proc/net/tcp_brutal/stats)
-  [[ $active -eq 0 ]] && break
+  stats=$(ip netns exec "$server" cat /proc/net/tcp_brutal/stats)
+  active=$(awk -F= '/^active_peer_groups=/{print $2}' <<<"$stats")
+  slots=$(awk -F= '/^peer_slots=/{print $2}' <<<"$stats")
+  [[ $active -eq 0 && $slots -eq 0 ]] && break
   sleep 0.1
 done
-[[ ${active:-0} -eq 0 ]] || { echo "peer groups did not drain after fault test: active=$active" >&2; exit 1; }
+[[ ${active:-0} -eq 0 && ${slots:-0} -eq 0 ]] || {
+  echo "peer budget did not drain after fault test: active=$active slots=$slots" >&2
+  exit 1
+}
 
 ip netns del "$client"
 ip netns del "$server"
