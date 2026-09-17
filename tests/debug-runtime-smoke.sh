@@ -71,6 +71,9 @@ echo "== intermediate prefix index =="
 BRUTALCTL="$ctl" bash "$repo/tests/prefix-index-netns.sh"
 echo "== kernel aggregate pacing =="
 BRUTALCTL="$ctl" bash "$repo/tests/kernel-aggregate-netns.sh"
+
+echo "== Generic Netlink API =="
+BRUTALCTL="$ctl" bash "$repo/tests/genl-netns.sh"
 echo "== exact-host index growth =="
 RULES=${EXACT_RULES:-1000} BRUTALCTL="$ctl" bash "$repo/tests/exact-host-scale.sh"
 

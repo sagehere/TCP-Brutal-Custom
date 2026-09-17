@@ -53,6 +53,7 @@ struct brutal_rule
 
 struct brutal_net
 {
+    struct net *net;
     struct list_head rules;
     struct mutex rules_mutex;
     struct rhashtable exact_hosts;
@@ -77,17 +78,8 @@ struct brutal_net
     struct brutal_rule __rcu *default_v6;
 };
 
-struct brutal_peers_seq
-{
-    struct net *net;
-    struct brutal_group *group;
-    struct rhashtable_iter iter;
-    struct brutal_peer *peer;
-    u64 rule_id;
-    loff_t index;
-    bool iter_entered;
-    bool iter_started;
-};
+static void brutal_rule_info_fill(struct brutal_rule *r,
+                                  struct brutal_rule_info *info);
 
 static const struct rhashtable_params brutal_exact_params = {
     .head_offset = offsetof(struct brutal_rule, exact_node),
@@ -583,6 +575,7 @@ static void brutal_rule_free(struct brutal_rule *r)
 static int brutal_rule_add(struct brutal_net *bn, char *args)
 {
     struct brutal_rule key = {}, *r;
+    struct brutal_rule_info event_rule;
     struct brutal_group *g;
     u64 rate = 0;
     u64 aggregate_rate = 0;
@@ -701,13 +694,19 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         brutal_group_set_rule_config(&g->pacer, rate, gain, lock,
                                      aggregate_rate);
     }
+    brutal_rule_info_fill(r, &event_rule);
     mutex_unlock(&bn->rules_mutex);
+    brutal_genl_rule_event(bn->net,
+                           created ? BRUTAL_EVENT_RULE_ADDED
+                                   : BRUTAL_EVENT_RULE_UPDATED,
+                           &event_rule);
     return 0;
 }
 
 static int brutal_rule_del(struct brutal_net *bn, char *args)
 {
     struct brutal_rule key = {}, *r;
+    struct brutal_rule_info event_rule;
     char *tok = strsep(&args, " ");
     int ret;
 
@@ -717,11 +716,145 @@ static int brutal_rule_del(struct brutal_net *bn, char *args)
     mutex_lock(&bn->rules_mutex);
     r = brutal_rule_find(bn, &key);
     if (r)
+    {
+        brutal_rule_info_fill(r, &event_rule);
         brutal_rule_unpublish(bn, r);
+    }
     mutex_unlock(&bn->rules_mutex);
     if (!r)
         return -ENOENT;
+    brutal_genl_rule_event(bn->net, BRUTAL_EVENT_RULE_DELETED, &event_rule);
     brutal_rule_free(r);
+    return 0;
+}
+
+static void brutal_rule_info_fill(struct brutal_rule *r,
+                                  struct brutal_rule_info *info)
+{
+    struct brutal_group *g = r->group;
+
+    memset(info, 0, sizeof(*info));
+    info->family = r->family;
+    info->plen = r->plen;
+    info->perip = r->perip;
+    if (r->family == AF_INET)
+        info->v4 = r->v4;
+    else
+        info->v6 = r->v6;
+    info->id = g->id;
+    brutal_group_get_config(&g->pacer, &info->rate, &info->cwnd_gain,
+                            &info->locked, NULL);
+    info->aggregate_rate = brutal_group_aggregate_rate(&g->pacer);
+    info->sent_bytes = brutal_group_sent(g);
+    info->members = atomic_read(&g->pacer.members);
+    info->active_peers = atomic_read(&g->ip_groups);
+    if (g->rule_stats)
+        info->max_peers = READ_ONCE(g->rule_stats->max_peers);
+}
+
+bool brutal_rule_info_get(struct net *net, unsigned long id,
+                          struct brutal_rule_info *info)
+{
+    struct brutal_rule *r;
+
+    rcu_read_lock();
+    r = xa_load(&brutal_pernet(net)->rules_by_id, id);
+    if (r)
+        brutal_rule_info_fill(r, info);
+    rcu_read_unlock();
+    return r != NULL;
+}
+
+bool brutal_rule_info_next(struct net *net, unsigned long *id,
+                           struct brutal_rule_info *info)
+{
+    struct brutal_rule *r;
+
+    rcu_read_lock();
+    r = xa_find_after(&brutal_pernet(net)->rules_by_id, id, ULONG_MAX,
+                      XA_PRESENT);
+    if (r)
+        brutal_rule_info_fill(r, info);
+    rcu_read_unlock();
+    return r != NULL;
+}
+
+int brutal_rule_configure(struct net *net, const struct brutal_rule_info *info)
+{
+    char args[RULES_MAX_CMD_LEN];
+    size_t len;
+
+    if (info->family == AF_INET)
+        len = scnprintf(args, sizeof(args),
+                        "%pI4/%u rate=%llu gain=%u %s%s",
+                        &info->v4, info->plen, info->rate, info->cwnd_gain,
+                        info->locked ? "lock" : "nolock",
+                        info->perip ? " perip" : "");
+    else if (info->family == AF_INET6)
+        len = scnprintf(args, sizeof(args),
+                        "%pI6c/%u rate=%llu gain=%u %s%s",
+                        &info->v6, info->plen, info->rate, info->cwnd_gain,
+                        info->locked ? "lock" : "nolock",
+                        info->perip ? " perip" : "");
+    else
+        return -EAFNOSUPPORT;
+    if (info->perip && info->aggregate_set)
+        len += scnprintf(args + len, sizeof(args) - len,
+                         " aggregate=%llu", info->aggregate_rate);
+    if (info->perip && info->max_peers_set)
+        len += scnprintf(args + len, sizeof(args) - len,
+                         " maxpeers=%u", info->max_peers);
+    if (len >= sizeof(args) - 1)
+        return -E2BIG;
+    return brutal_rule_add(brutal_pernet(net), args);
+}
+
+int brutal_rule_delete(struct net *net, const struct brutal_rule_info *info)
+{
+    char args[80];
+
+    if (info->family == AF_INET)
+        scnprintf(args, sizeof(args), "%pI4/%u", &info->v4, info->plen);
+    else if (info->family == AF_INET6)
+        scnprintf(args, sizeof(args), "%pI6c/%u", &info->v6, info->plen);
+    else
+        return -EAFNOSUPPORT;
+    return brutal_rule_del(brutal_pernet(net), args);
+}
+
+void brutal_net_stats_get(struct net *net, struct brutal_net_stats_info *info)
+{
+    struct brutal_net *bn = brutal_pernet(net);
+
+    info->peer_alloc_failures = atomic64_read(&bn->peer_alloc_failures);
+    info->peer_insert_failures = atomic64_read(&bn->peer_insert_failures);
+    info->peer_fallbacks = atomic64_read(&bn->peer_fallback_connections);
+    info->peer_budget_fallbacks = atomic64_read(&bn->peer_budget_fallbacks);
+    info->peer_slots = atomic_read(&bn->peer_slots);
+    info->peak_peer_slots = atomic_read(&bn->peak_peer_slots);
+    info->active_peers = atomic_read(&bn->active_peers);
+    info->peak_peers = atomic_read(&bn->peak_peers);
+    info->max_peers = READ_ONCE(bn->max_peers);
+}
+
+u32 brutal_net_limit_get(struct net *net)
+{
+    return READ_ONCE(brutal_pernet(net)->max_peers);
+}
+
+int brutal_net_limit_set(struct net *net, u32 max_peers)
+{
+    struct brutal_net *bn = brutal_pernet(net);
+    bool changed;
+
+    if (max_peers > INT_MAX)
+        return -ERANGE;
+    mutex_lock(&bn->rules_mutex);
+    changed = bn->max_peers != max_peers;
+    WRITE_ONCE(bn->max_peers, max_peers);
+    mutex_unlock(&bn->rules_mutex);
+    if (changed)
+        brutal_genl_limit_event(net, max_peers);
     return 0;
 }
 
@@ -855,7 +988,7 @@ brutal_peers_next_group(struct brutal_net *bn, u64 after_id)
     return g;
 }
 
-static void brutal_peers_pause(struct brutal_peers_seq *ctx)
+static void brutal_peers_pause(struct brutal_peer_iter *ctx)
 {
     if (ctx->iter_started)
     {
@@ -864,7 +997,7 @@ static void brutal_peers_pause(struct brutal_peers_seq *ctx)
     }
 }
 
-static void brutal_peers_close_group(struct brutal_peers_seq *ctx)
+static void brutal_peers_close_group(struct brutal_peer_iter *ctx)
 {
     brutal_peers_pause(ctx);
     if (ctx->iter_entered)
@@ -879,7 +1012,7 @@ static void brutal_peers_close_group(struct brutal_peers_seq *ctx)
     }
 }
 
-static void brutal_peers_reset(struct brutal_peers_seq *ctx)
+static void brutal_peers_reset(struct brutal_peer_iter *ctx)
 {
     if (ctx->peer)
     {
@@ -891,7 +1024,7 @@ static void brutal_peers_reset(struct brutal_peers_seq *ctx)
     ctx->index = -1;
 }
 
-static bool brutal_peers_open_group(struct brutal_peers_seq *ctx)
+static bool brutal_peers_open_group(struct brutal_peer_iter *ctx)
 {
     struct brutal_net *bn = brutal_pernet(ctx->net);
     struct brutal_rule_stats *stats;
@@ -916,7 +1049,7 @@ static bool brutal_peers_open_group(struct brutal_peers_seq *ctx)
     return true;
 }
 
-static void brutal_peers_resume(struct brutal_peers_seq *ctx)
+static void brutal_peers_resume(struct brutal_peer_iter *ctx)
 {
     if (ctx->iter_entered && !ctx->iter_started)
     {
@@ -925,7 +1058,7 @@ static void brutal_peers_resume(struct brutal_peers_seq *ctx)
     }
 }
 
-static struct brutal_peer *brutal_peers_advance(struct brutal_peers_seq *ctx)
+static struct brutal_peer *brutal_peers_advance(struct brutal_peer_iter *ctx)
 {
     struct brutal_peer *peer;
 
@@ -968,9 +1101,39 @@ static struct brutal_peer *brutal_peers_advance(struct brutal_peers_seq *ctx)
     }
 }
 
+void brutal_peer_iter_init(struct brutal_peer_iter *ctx, struct net *net)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->net = get_net(net);
+    ctx->index = -1;
+}
+
+bool brutal_peer_iter_next(struct brutal_peer_iter *ctx,
+                           struct brutal_peer_info *info)
+{
+    struct brutal_peer *peer = brutal_peers_advance(ctx);
+
+    if (!peer)
+        return false;
+    memset(info, 0, sizeof(*info));
+    info->key = peer->key;
+    info->rule_id = ctx->group->id;
+    brutal_group_get_config(&peer->pacer, &info->rate, &info->cwnd_gain,
+                            NULL, NULL);
+    info->members = atomic_read(&peer->pacer.members);
+    info->sent_bytes = atomic64_read(&peer->pacer.sent_bytes);
+    return true;
+}
+
+void brutal_peer_iter_fini(struct brutal_peer_iter *ctx)
+{
+    brutal_peers_reset(ctx);
+    put_net(ctx->net);
+}
+
 static void *brutal_peers_seq_start(struct seq_file *m, loff_t *pos)
 {
-    struct brutal_peers_seq *ctx = m->private;
+    struct brutal_peer_iter *ctx = m->private;
 
     if (*pos < 0)
         return NULL;
@@ -993,7 +1156,7 @@ static void *brutal_peers_seq_start(struct seq_file *m, loff_t *pos)
 
 static void *brutal_peers_seq_next(struct seq_file *m, void *v, loff_t *pos)
 {
-    struct brutal_peers_seq *ctx = m->private;
+    struct brutal_peer_iter *ctx = m->private;
 
     ++*pos;
     return brutal_peers_advance(ctx);
@@ -1001,14 +1164,14 @@ static void *brutal_peers_seq_next(struct seq_file *m, void *v, loff_t *pos)
 
 static void brutal_peers_seq_stop(struct seq_file *m, void *v)
 {
-    struct brutal_peers_seq *ctx = m->private;
+    struct brutal_peer_iter *ctx = m->private;
 
     brutal_peers_pause(ctx);
 }
 
 static int brutal_peers_seq_show(struct seq_file *m, void *v)
 {
-    struct brutal_peers_seq *ctx = m->private;
+    struct brutal_peer_iter *ctx = m->private;
     struct brutal_peer *peer = v;
     u64 rate;
     u32 gain;
@@ -1035,7 +1198,7 @@ static const struct seq_operations brutal_peers_seq_ops = {
 static int brutal_peers_open(struct inode *inode, struct file *file)
 {
     struct seq_file *m;
-    struct brutal_peers_seq *ctx;
+    struct brutal_peer_iter *ctx;
     int ret;
 
     ret = seq_open_private(file, &brutal_peers_seq_ops, sizeof(*ctx));
@@ -1043,18 +1206,16 @@ static int brutal_peers_open(struct inode *inode, struct file *file)
         return ret;
     m = file->private_data;
     ctx = m->private;
-    ctx->net = get_net(pde_data(inode));
-    ctx->index = -1;
+    brutal_peer_iter_init(ctx, pde_data(inode));
     return 0;
 }
 
 static int brutal_peers_release(struct inode *inode, struct file *file)
 {
     struct seq_file *m = file->private_data;
-    struct brutal_peers_seq *ctx = m->private;
+    struct brutal_peer_iter *ctx = m->private;
 
-    brutal_peers_reset(ctx);
-    put_net(ctx->net);
+    brutal_peer_iter_fini(ctx);
     return seq_release_private(inode, file);
 }
 
@@ -1103,7 +1264,6 @@ static ssize_t brutal_limits_write(struct file *file, const char __user *ubuf,
                                    size_t len, loff_t *off)
 {
     struct net *net = pde_data(file_inode(file));
-    struct brutal_net *bn = brutal_pernet(net);
     char *buf, *value;
     u32 max_peers;
     int ret;
@@ -1123,11 +1283,7 @@ static ssize_t brutal_limits_write(struct file *file, const char __user *ubuf,
     if (!ret && max_peers > INT_MAX)
         ret = -ERANGE;
     if (!ret)
-    {
-        mutex_lock(&bn->rules_mutex);
-        WRITE_ONCE(bn->max_peers, max_peers);
-        mutex_unlock(&bn->rules_mutex);
-    }
+        ret = brutal_net_limit_set(net, max_peers);
     kfree(buf);
     return ret ?: len;
 }
@@ -1158,6 +1314,7 @@ static int __net_init brutal_net_init(struct net *net)
     struct proc_dir_entry *dir;
     int ret;
 
+    bn->net = net;
     INIT_LIST_HEAD(&bn->rules);
     xa_init(&bn->rules_by_id);
     bitmap_zero(bn->v4_prefixes, 33);

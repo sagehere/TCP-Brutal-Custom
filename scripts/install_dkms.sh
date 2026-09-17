@@ -680,6 +680,7 @@ install_libc_headers() {
 brutalctl_install() {
   local _version="$(dkms_get_installed_versions "$DKMS_MODULE_NAME" | head -1)"
   local _source="/usr/src/$DKMS_MODULE_NAME-${_version#v}/tools/brutalctl.c"
+  local _netlink="/usr/src/$DKMS_MODULE_NAME-${_version#v}/tools/brutal_netlink.c"
   local _cc
 
   if [[ ! -f "$_source" ]]; then
@@ -696,7 +697,7 @@ brutalctl_install() {
   fi
   install_libc_headers "$_cc" || true
   echo -n "Installing brutalctl to $BRUTALCTL_PATH ... "
-  if "$_cc" -O2 -Wall -o "$BRUTALCTL_PATH" "$_source"; then
+  if "$_cc" -O2 -Wall -o "$BRUTALCTL_PATH" "$_source" "$_netlink"; then
     echo "ok"
   else
     warning "Failed to build brutalctl, the kernel module is not affected."

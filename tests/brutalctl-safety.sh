@@ -9,7 +9,8 @@ rules="$tmp/rules"
 
 cc -O1 -g -Wall -Wextra -Werror -std=c99 -pedantic \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
-  -DRULES_PATH=\"$rules\" -o "$tmp/brutalctl" "$repo/tools/brutalctl.c"
+  -DRULES_PATH=\"$rules\" -o "$tmp/brutalctl" \
+  "$repo/tools/brutalctl.c" "$repo/tools/brutal_netlink.c"
 
 expect_fail() {
   if "$tmp/brutalctl" "$@" >"$tmp/out" 2>"$tmp/err"; then

@@ -34,8 +34,9 @@ struct proc_ops;
 
 #define BRUTAL_CAPABILITIES                                             \
     (BRUTAL_CAP_PERIP | BRUTAL_CAP_NETNS | BRUTAL_CAP_EXACT_RULE_HASH | \
-     BRUTAL_CAP_PEER_STATS | BRUTAL_CAP_PEER_BUDGET | BRUTAL_CAP_PREFIX_INDEX | \
-     BRUTAL_CAP_KERNEL_AGGREGATE)
+     BRUTAL_CAP_PEER_STATS | BRUTAL_CAP_TC_AGGREGATE_MANAGER | \
+     BRUTAL_CAP_PEER_BUDGET | BRUTAL_CAP_PREFIX_INDEX | \
+     BRUTAL_CAP_KERNEL_AGGREGATE | BRUTAL_CAP_GENL)
 
 #define INIT_PACING_RATE 125000
 #define INIT_CWND_GAIN 20
@@ -170,6 +171,64 @@ struct brutal_params
 
 #define BRUTAL_PARAMS_V1_SIZE offsetof(struct brutal_params, group_id)
 
+struct brutal_rule_info
+{
+    u8 family;
+    u8 plen;
+    bool perip;
+    bool locked;
+    bool aggregate_set;
+    bool max_peers_set;
+    union
+    {
+        __be32 v4;
+        struct in6_addr v6;
+    };
+    u64 id;
+    u64 rate;
+    u64 aggregate_rate;
+    u64 sent_bytes;
+    u32 cwnd_gain;
+    u32 max_peers;
+    u32 members;
+    u32 active_peers;
+};
+
+struct brutal_net_stats_info
+{
+    u64 peer_alloc_failures;
+    u64 peer_insert_failures;
+    u64 peer_fallbacks;
+    u64 peer_budget_fallbacks;
+    u32 peer_slots;
+    u32 peak_peer_slots;
+    u32 active_peers;
+    u32 peak_peers;
+    u32 max_peers;
+};
+
+struct brutal_peer_info
+{
+    struct brutal_peer_key key;
+    u64 rule_id;
+    u64 rate;
+    u64 sent_bytes;
+    u32 cwnd_gain;
+    u32 members;
+};
+
+struct brutal_peer_iter
+{
+    struct net *net;
+    struct brutal_group *group;
+    struct rhashtable_iter iter;
+    struct brutal_peer *peer;
+    u64 rule_id;
+    loff_t index;
+    bool iter_entered;
+    bool iter_started;
+};
+
 extern struct tcp_congestion_ops tcp_brutal_ops;
 void brutal_update_rate(struct sock *sk);
 
@@ -215,7 +274,25 @@ void brutal_net_peer_removed(struct net *net);
 struct brutal_group *brutal_app_group_get(struct sock *sk, u64 id);
 void brutal_app_group_remove(struct brutal_group *g);
 void brutal_apply_rule(struct sock *sk, struct brutal *brutal);
+bool brutal_rule_info_get(struct net *net, unsigned long id,
+                          struct brutal_rule_info *info);
+bool brutal_rule_info_next(struct net *net, unsigned long *id,
+                           struct brutal_rule_info *info);
+int brutal_rule_configure(struct net *net, const struct brutal_rule_info *info);
+int brutal_rule_delete(struct net *net, const struct brutal_rule_info *info);
+void brutal_net_stats_get(struct net *net, struct brutal_net_stats_info *info);
+u32 brutal_net_limit_get(struct net *net);
+int brutal_net_limit_set(struct net *net, u32 max_peers);
+void brutal_peer_iter_init(struct brutal_peer_iter *iter, struct net *net);
+bool brutal_peer_iter_next(struct brutal_peer_iter *iter,
+                           struct brutal_peer_info *info);
+void brutal_peer_iter_fini(struct brutal_peer_iter *iter);
 int brutal_rules_init(void);
 void brutal_rules_exit(void);
+int brutal_genl_init(void);
+void brutal_genl_exit(void);
+void brutal_genl_rule_event(struct net *net, u8 event,
+                            const struct brutal_rule_info *rule);
+void brutal_genl_limit_event(struct net *net, u32 max_peers);
 
 #endif

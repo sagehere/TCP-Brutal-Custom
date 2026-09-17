@@ -37,7 +37,8 @@ EOF
 fi
 
 cc -O2 -Wall -Wextra -Werror -std=c99 -pedantic \
-  -DRULES_PATH=\"$rules\" -o "$tmp/brutalctl" "$repo/tools/brutalctl.c"
+  -DRULES_PATH=\"$rules\" -o "$tmp/brutalctl" \
+  "$repo/tools/brutalctl.c" "$repo/tools/brutal_netlink.c"
 ip netns add "$ns"
 ip -n "$ns" link set lo up
 ip -n "$ns" link add dummy0 type dummy

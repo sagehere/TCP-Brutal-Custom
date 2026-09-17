@@ -540,7 +540,8 @@ if command -v cc >/dev/null; then
   : >"$rules_file"
   cc -O2 -Wall -Wextra \
     -DPEERS_PATH=\"$peers_file\" -DRULES_PATH=\"$rules_file\" \
-    -o "$tmp/brutalctl-test" "$repo/tools/brutalctl.c"
+    -o "$tmp/brutalctl-test" "$repo/tools/brutalctl.c" \
+    "$repo/tools/brutal_netlink.c"
   peers_output=$("$tmp/brutalctl-test" peers)
   grep -q '198.51.100.7.*IPv4.*80.00.*3.*1.2' <<<"$peers_output"
   grep -q '2001:db8::7.*IPv6.*20.00.*1.*0.5' <<<"$peers_output"

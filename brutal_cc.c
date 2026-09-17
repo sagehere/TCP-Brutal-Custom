@@ -374,9 +374,17 @@ static int __init brutal_register(void)
         brutal_sockopt_exit();
         return ret;
     }
+    ret = brutal_genl_init();
+    if (ret)
+    {
+        brutal_rules_exit();
+        brutal_sockopt_exit();
+        return ret;
+    }
     ret = tcp_register_congestion_control(&tcp_brutal_ops);
     if (ret)
     {
+        brutal_genl_exit();
         brutal_rules_exit();
         brutal_sockopt_exit();
     }
@@ -386,6 +394,7 @@ static int __init brutal_register(void)
 static void __exit brutal_unregister(void)
 {
     tcp_unregister_congestion_control(&tcp_brutal_ops);
+    brutal_genl_exit();
     brutal_rules_exit();
     brutal_sockopt_exit();
 }
