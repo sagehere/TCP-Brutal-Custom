@@ -48,13 +48,6 @@ struct proc_ops;
 #define PKT_INFO_SLOTS 4
 #define BRUTAL_FALLBACK_PACERS 16
 
-struct brutal_pkt_info
-{
-    u32 sec;
-    u32 acked;
-    u32 losses;
-};
-
 struct brutal_peer_key
 {
     u8 family;
@@ -156,13 +149,14 @@ struct brutal
     u64 resv_bytes_sent;
     u32 resv_bytes;
     u32 resv_duration_ns;
+    u32 resv_parent_duration_ns;
     u16 last_update_tick;
     u16 seen_generation;
     u8 cwnd_gain;
     u8 ack_rate;
-    u16 padding;
-
-    struct brutal_pkt_info slots[PKT_INFO_SLOTS];
+    u32 slot_acked[PKT_INFO_SLOTS];
+    u32 slot_losses[PKT_INFO_SLOTS];
+    u16 slot_secs[PKT_INFO_SLOTS];
 };
 
 struct brutal_params

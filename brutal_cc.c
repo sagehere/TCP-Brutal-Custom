@@ -17,7 +17,7 @@ static void brutal_update_rate_at(struct sock *sk, u32 sec, u16 now_tick)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct brutal *brutal = inet_csk_ca(sk);
-    u32 min_sec = sec - PKT_INFO_SLOTS;
+    u16 sec_tag = sec;
     u64 acked = 0, losses = 0;
     u32 ack_rate;
     u64 rate, bdp, cwnd;
@@ -27,10 +27,10 @@ static void brutal_update_rate_at(struct sock *sk, u32 sec, u16 now_tick)
 
     for (i = 0; i < PKT_INFO_SLOTS; i++)
     {
-        if (brutal->slots[i].sec >= min_sec)
+        if ((u16)(sec_tag - brutal->slot_secs[i]) <= PKT_INFO_SLOTS)
         {
-            acked += brutal->slots[i].acked;
-            losses += brutal->slots[i].losses;
+            acked += brutal->slot_acked[i];
+            losses += brutal->slot_losses[i];
         }
     }
     if (acked + losses < MIN_PKT_INFO_SAMPLES)
@@ -265,16 +265,16 @@ static void brutal_main(struct sock *sk, const struct rate_sample *rs)
     sec = div_u64(tp->tcp_mstamp, USEC_PER_SEC);
     slot = sec % PKT_INFO_SLOTS;
 
-    if (brutal->slots[slot].sec == sec)
+    if (brutal->slot_secs[slot] == (u16)sec)
     {
-        brutal->slots[slot].acked += rs->acked_sacked;
-        brutal->slots[slot].losses += rs->losses;
+        brutal->slot_acked[slot] += rs->acked_sacked;
+        brutal->slot_losses[slot] += rs->losses;
     }
     else
     {
-        brutal->slots[slot].sec = sec;
-        brutal->slots[slot].acked = rs->acked_sacked;
-        brutal->slots[slot].losses = rs->losses;
+        brutal->slot_secs[slot] = sec;
+        brutal->slot_acked[slot] = rs->acked_sacked;
+        brutal->slot_losses[slot] = rs->losses;
     }
 
     now_tick = (u16)div_u64(tp->tcp_mstamp, RATE_UPDATE_TICK_US);
