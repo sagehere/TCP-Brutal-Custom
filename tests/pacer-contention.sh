@@ -56,15 +56,27 @@ for count in $cpu_counts; do
     cp /proc/softirqs "$prefix-softirqs-after.txt"
     cp /proc/stat "$prefix-proc-stat-after.txt"
     if [[ ${P2_PERF_DEEP:-1} == 1 ]]; then
-      perf lock record -o "$prefix-lock.data" -- "${command[@]}" \
-        >"$prefix-lock-throughput.txt"
-      perf lock report -i "$prefix-lock.data" >"$prefix-lock.txt"
-      perf c2c record -o "$prefix-c2c.data" -a -C "$cpulist" -- \
-        "${command[@]}" >"$prefix-c2c-throughput.txt"
-      perf c2c report -i "$prefix-c2c.data" --stdio >"$prefix-c2c.txt"
-      perf sched record -o "$prefix-sched.data" -- "${command[@]}" \
-        >"$prefix-sched-throughput.txt"
-      perf sched latency -i "$prefix-sched.data" >"$prefix-sched.txt"
+      if perf lock record -o "$prefix-lock.data" -- "${command[@]}" \
+          >"$prefix-lock-throughput.txt"; then
+        perf lock report -i "$prefix-lock.data" >"$prefix-lock.txt" 2>&1 || \
+          echo 'perf lock report unavailable' >"$prefix-lock.txt"
+      else
+        echo 'perf lock unavailable' >"$prefix-lock.txt"
+      fi
+      if perf c2c record -o "$prefix-c2c.data" -a -C "$cpulist" -- \
+          "${command[@]}" >"$prefix-c2c-throughput.txt"; then
+        perf c2c report -i "$prefix-c2c.data" --stdio >"$prefix-c2c.txt" 2>&1 || \
+          echo 'perf c2c report unavailable' >"$prefix-c2c.txt"
+      else
+        echo 'perf c2c unavailable' >"$prefix-c2c.txt"
+      fi
+      if perf sched record -o "$prefix-sched.data" -- "${command[@]}" \
+          >"$prefix-sched-throughput.txt"; then
+        perf sched latency -i "$prefix-sched.data" >"$prefix-sched.txt" 2>&1 || \
+          echo 'perf sched report unavailable' >"$prefix-sched.txt"
+      else
+        echo 'perf sched unavailable' >"$prefix-sched.txt"
+      fi
     fi
   done
 done

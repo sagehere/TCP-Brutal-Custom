@@ -399,6 +399,36 @@ static int brutal_nl_get(uint8_t command, brutal_nl_message_cb callback,
     return ret;
 }
 
+static int brutal_nl_info_reply(const struct nlmsghdr *nlh, void *arg)
+{
+    struct brutal_info_v1 *info = arg;
+
+    memset(info, 0, sizeof(*info));
+    info->size = sizeof(*info);
+    if (brutal_nla_copy(nlh, BRUTAL_A_ABI_VERSION, &info->abi_version,
+                        sizeof(info->abi_version), 1) ||
+        brutal_nla_copy(nlh, BRUTAL_A_VENDOR_ID, &info->vendor_id,
+                        sizeof(info->vendor_id), 1) ||
+        brutal_nla_copy(nlh, BRUTAL_A_VERSION, &info->version,
+                        sizeof(info->version), 1) ||
+        brutal_nla_copy(nlh, BRUTAL_A_FLAGS, &info->flags,
+                        sizeof(info->flags), 1) ||
+        brutal_nla_copy(nlh, BRUTAL_A_CAPABILITIES, &info->capabilities,
+                        sizeof(info->capabilities), 1) ||
+        brutal_nla_copy(nlh, BRUTAL_A_BUILD_ID, info->build_id,
+                        sizeof(info->build_id), 1))
+    {
+        errno = EPROTO;
+        return -1;
+    }
+    return 0;
+}
+
+int brutal_nl_info_get(struct brutal_info_v1 *info)
+{
+    return brutal_nl_get(BRUTAL_CMD_GET_INFO, brutal_nl_info_reply, info);
+}
+
 static int brutal_nl_stats_reply(const struct nlmsghdr *nlh, void *arg)
 {
     struct brutal_nl_stats *stats = arg;

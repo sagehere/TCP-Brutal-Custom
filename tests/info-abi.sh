@@ -26,15 +26,24 @@ grep -q '^abi=1$' <<<"$proc_info"
 [[ $(sed -n 's/^capabilities=//p' <<<"$info") == $(sed -n 's/^capabilities=//p' <<<"$proc_info") ]]
 
 python3 - <<'PY'
-import errno, socket, struct
+import errno, socket, struct, threading
 TCP_BRUTAL_INFO = 23303
 EXPECTED_CAPS = 0x1ff
 for family in (socket.AF_INET, socket.AF_INET6):
     if family == socket.AF_INET6 and not socket.has_ipv6:
         continue
+    address = ("127.0.0.1", 0) if family == socket.AF_INET else ("::1", 0)
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    listener.bind(address)
+    listener.listen(1)
+    accepted = []
+    thread = threading.Thread(target=lambda: accepted.append(listener.accept()[0]))
+    thread.start()
     s = socket.socket(family, socket.SOCK_STREAM)
     try:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, b"brutal")
+        s.connect(listener.getsockname())
+        thread.join()
         try:
             s.getsockopt(socket.IPPROTO_TCP, TCP_BRUTAL_INFO, 63)
         except OSError as e:
@@ -51,6 +60,9 @@ for family in (socket.AF_INET, socket.AF_INET6):
         assert len(build) == 40 and all(c in "0123456789abcdef" for c in build)
     finally:
         s.close()
+        for peer in accepted:
+            peer.close()
+        listener.close()
 PY
 
 ns="brutal-info-$$"

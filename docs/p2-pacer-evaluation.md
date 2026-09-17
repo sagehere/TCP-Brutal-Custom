@@ -16,6 +16,8 @@ available requested CPU count. It records system identity, throughput,
 counters, and projected peer-slab lower bounds for
 1k/10k/100k peers. `P2_PERF_DEEP=0` skips the two expensive profiles, and
 `P2_DRY_RUN=1` validates the matrix without changing networking state.
+Unsupported deep perf facilities are recorded as unavailable while the
+remaining profiles continue.
 
 Compare a layout experiment to the unchanged baseline on the same host and
 kernel. Report throughput, cache misses, LLC misses when supported, pacer-lock

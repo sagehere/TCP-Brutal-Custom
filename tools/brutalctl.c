@@ -704,32 +704,14 @@ static int show_info(void)
         {BRUTAL_CAP_GENL, "genl"},
     };
     struct brutal_info_v1 info;
-    socklen_t len = sizeof(info);
-    const char cc[] = "brutal";
-    int fd, i, first = 1;
+    int i, first = 1;
 
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
+    if (brutal_nl_info_get(&info))
     {
-        perror("brutalctl: socket");
+        perror("brutalctl: Generic Netlink GET_INFO");
         return 1;
     }
-    if (setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, cc, sizeof(cc)) < 0)
-    {
-        perror("brutalctl: cannot select brutal congestion control");
-        close(fd);
-        return 1;
-    }
-    memset(&info, 0, sizeof(info));
-    if (getsockopt(fd, IPPROTO_TCP, TCP_BRUTAL_INFO, &info, &len) < 0)
-    {
-        perror("brutalctl: TCP_BRUTAL_INFO");
-        close(fd);
-        return 1;
-    }
-    close(fd);
-    if (len != sizeof(info) || info.size != sizeof(info) ||
-        info.abi_version != BRUTAL_INFO_ABI_V1)
+    if (info.size != sizeof(info) || info.abi_version != BRUTAL_INFO_ABI_V1)
     {
         fprintf(stderr, "brutalctl: unsupported TCP_BRUTAL_INFO response\n");
         return 1;
@@ -1024,6 +1006,7 @@ static int add_rule(int argc, char **argv)
 
 static int delete_rule_nl(const struct brutal_nl_rule *rule, void *arg)
 {
+    (void)arg;
     return brutal_nl_rule_del(rule);
 }
 

@@ -1,6 +1,7 @@
 # TCP-Brutal-Custom P2 implementation specification
 
-Status: implemented; full hardware/runtime validation pending
+Status: implemented; local WSL runtime validation complete, dedicated-hardware
+release evidence pending (see `docs/p2-validation.md`)
 Project: `sagehere/TCP-Brutal-Custom`  
 P2 baseline: `65df326567df1a38dd2f227922723d1040bbacb9`  
 Baseline source version: `2.5.3`
@@ -21,8 +22,9 @@ Implementation status:
 | P2-08 | Architecture, threat model, security policy and audit scope are documented. |
 
 The implementation status does not claim external audit or final release
-acceptance. The full build matrix, debug kernels, dedicated-host runtime suite
-and P2-05 hardware evidence must be attached before release promotion.
+acceptance. Local WSL build, runtime, and 8-CPU perf evidence is recorded in
+`docs/p2-validation.md`; debug kernels and dedicated-host hardware evidence
+must still be attached before release promotion.
 
 ## 1. Purpose
 

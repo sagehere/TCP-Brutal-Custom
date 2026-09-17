@@ -56,6 +56,7 @@ fi
 
 ip netns exec "$server" python3 - "$port" "$streams" "$seconds" "$cpus" >"$server_output" <<'PY' &
 import multiprocessing as mp, os, socket, sys, time
+mp.set_start_method('fork')
 port, streams, seconds = map(int, sys.argv[1:4])
 cpus = []
 for part in sys.argv[4].split(','):
@@ -86,6 +87,7 @@ sleep 0.2
 
 client_bytes=$(ip netns exec "$client" python3 - "$mode" "$port" "$streams" "$cpus" <<'PY'
 import multiprocessing as mp, os, socket, sys
+mp.set_start_method('fork')
 mode, port, streams = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 cpus = []
 for part in sys.argv[4].split(','):

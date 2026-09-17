@@ -4,6 +4,8 @@
 #include <netinet/in.h>
 #include <stdint.h>
 
+struct brutal_info_v1;
+
 struct brutal_nl_rule
 {
     uint8_t family;
@@ -59,6 +61,7 @@ typedef int (*brutal_nl_rule_cb)(const struct brutal_nl_rule *, void *);
 typedef int (*brutal_nl_peer_cb)(const struct brutal_nl_peer *, void *);
 
 int brutal_nl_available(void);
+int brutal_nl_info_get(struct brutal_info_v1 *info);
 int brutal_nl_rule_dump(brutal_nl_rule_cb callback, void *arg);
 int brutal_nl_peer_dump(brutal_nl_peer_cb callback, void *arg);
 int brutal_nl_rule_add(const struct brutal_nl_rule *rule);
