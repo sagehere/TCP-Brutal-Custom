@@ -43,7 +43,7 @@ extra algorithmic or ABI complexity is justified.
 | Batch credit | Do not enable by default without high-contention data. It can reduce lock frequency but changes burst and fairness behavior. |
 | EWMA ACK estimator | Keep the four-slot estimator until loss/RTT tests demonstrate a stability problem that EWMA solves. |
 | Fixed-point reciprocal | Keep accurate 64-bit division outside the pacer lock unless profiling shows it is a material CPU consumer across the supported rate range. |
-| Generic Netlink | Deferred until there is a real large-dump/event consumer. The namespace-aware pageable proc ABI and bounded CLI remain the supported control/monitoring path. |
+| Generic Netlink | Added in P2 as a typed, namespace-scoped API for info, stats, rules, peers, limits and configuration events. Procfs remains the compatible fallback. |
 | Bandwidth probing or automatic capacity discovery | Excluded. ACK success is a loss signal and does not measure spare path capacity. |
 
 ## Continuous build validation

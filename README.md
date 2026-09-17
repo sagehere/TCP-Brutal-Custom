@@ -191,3 +191,23 @@ sudo tbc uninstall
 安装和改速时可分别设置 IPv4、IPv6 的每 IP 速率，并选择 `auto`、`ipv4`、`ipv6` 或 `dual` 地址族模式。`auto` 只会为同时具备全局地址和默认路由的地址族应用规则；暂时不可用的地址族会保留配置，待下次可用时由 systemd 服务恢复。
 
 菜单提供状态、活跃 IP 快照和实时刷新，输入 `0` 退出。关闭开机启动也会关闭模块自动加载；再次开启时会恢复两者。安装或更新失败时，管理器会清理临时文件并尝试恢复原模块和规则。普通 Custom 更新遇到模块仍被 TCP 连接占用时，会保留现有连接、安装新版文件并提示重启；`status` 会显示待启用版本，重启并成功恢复规则后自动清除该状态。上游 TCP Brutal 迁移仍会安全退出。暂存期间若旧模块没有 `peers` 接口，活跃 IP 视图会直接提示重启。
+
+## P2 控制与观测接口
+
+支持的模块会通过 `TCP_BRUTAL_INFO` 明确公布能力。`brutalctl` 在发现
+Generic Netlink `tcp_brutal` family 后使用类型化接口，否则自动回退到
+`/proc/net/tcp_brutal`，不会根据版本号猜测功能。
+
+```bash
+brutalctl info
+brutalctl stats
+brutalctl limits
+sudo brutalctl limits 10000
+sudo brutalctl add 0.0.0.0/0 100 perip aggregate=1000 maxpeers=10000
+```
+
+`aggregate=Mbps` 是单条 `perip` 规则内所有子 pacer 的可选总上限；不配置时
+保持原有每 IP 语义。`maxpeers` 和 namespace `limits` 达到上限时使用
+`hashed_fallback` 保持连接可用，它不是严格的租户隔离。架构、威胁边界和
+报告方式见 [架构说明](docs/architecture.md)、[威胁模型](docs/threat-model.md)
+和 [安全策略](SECURITY.md)。
