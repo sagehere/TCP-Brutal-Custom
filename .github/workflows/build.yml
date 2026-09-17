@@ -65,7 +65,8 @@ jobs:
           /tmp/brutal-info-abi
           bash -n tests/info-abi.sh tests/peer-budget-netns.sh \
             tests/peer-budget-race.sh tests/peer-allocation-fault.sh \
-            tests/rule-id-index-netns.sh
+            tests/rule-id-index-netns.sh tests/prefix-index-netns.sh \
+            tests/intermediate-prefix-scale.sh
           bash -n tests/p2-regression.sh tests/p2-rule-scale.sh \
             tests/p2-peer-scale.sh tests/p2-peer-dump-scale.sh
           P2_DRY_RUN=1 bash tests/p2-regression.sh

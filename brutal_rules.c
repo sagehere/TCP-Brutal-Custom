@@ -4,6 +4,7 @@
 // application support. The route must select brutal for the prefix
 // ("ip route ... congctl lock brutal"); brutalctl in tools/ does both.
 #include <linux/capability.h>
+#include <linux/bitmap.h>
 #include <linux/inet.h>
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
@@ -19,13 +20,26 @@
 
 #define RULES_MAX_CMD_LEN 256
 
+struct brutal_prefix_key
+{
+    u8 family;
+    u8 plen;
+    u8 padding[2];
+    union
+    {
+        __be32 v4;
+        struct in6_addr v6;
+    };
+};
+
 struct brutal_rule
 {
     struct list_head list;
-    struct list_head prefix_node;
     struct list_head free_list;
     struct rhash_head exact_node;
+    struct rhash_head prefix_node;
     struct brutal_peer_key exact_key;
+    struct brutal_prefix_key prefix_key;
     u8 family;
     u8 plen;
     union
@@ -40,10 +54,14 @@ struct brutal_rule
 struct brutal_net
 {
     struct list_head rules;
-    struct list_head prefix_rules;
     struct mutex rules_mutex;
     struct rhashtable exact_hosts;
+    struct rhashtable prefixes;
     struct rhashtable app_groups;
+    DECLARE_BITMAP(v4_prefixes, 33);
+    DECLARE_BITMAP(v6_prefixes, 129);
+    u32 v4_prefix_counts[33];
+    u32 v6_prefix_counts[129];
     struct xarray rules_by_id;
     unsigned long rule_next_id;
     atomic64_t peer_alloc_failures;
@@ -75,6 +93,13 @@ static const struct rhashtable_params brutal_exact_params = {
     .head_offset = offsetof(struct brutal_rule, exact_node),
     .key_offset = offsetof(struct brutal_rule, exact_key),
     .key_len = sizeof(struct brutal_peer_key),
+    .automatic_shrinking = true,
+};
+
+static const struct rhashtable_params brutal_prefix_params = {
+    .head_offset = offsetof(struct brutal_rule, prefix_node),
+    .key_offset = offsetof(struct brutal_rule, prefix_key),
+    .key_len = sizeof(struct brutal_prefix_key),
     .automatic_shrinking = true,
 };
 
@@ -247,16 +272,22 @@ void brutal_net_peer_removed(struct net *net)
     atomic_dec(&brutal_pernet(net)->active_peers);
 }
 
-static bool brutal_rule_match(const struct brutal_rule *r, const struct sock *sk)
+static void brutal_sock_prefix_key(const struct sock *sk, u8 plen,
+                                   struct brutal_prefix_key *key)
 {
+    memset(key, 0, sizeof(*key));
 #if IS_ENABLED(CONFIG_IPV6)
     if (sk->sk_family == AF_INET6 && !ipv6_addr_v4mapped(&sk->sk_v6_daddr))
-        return r->family == AF_INET6 &&
-               ipv6_prefix_equal(&sk->sk_v6_daddr, &r->v6, r->plen);
+    {
+        key->family = AF_INET6;
+        key->plen = plen;
+        ipv6_addr_prefix(&key->v6, &sk->sk_v6_daddr, plen);
+        return;
+    }
 #endif
-    return r->family == AF_INET &&
-           !((sk->sk_daddr ^ r->v4) &
-             (r->plen ? htonl(~0u << (32 - r->plen)) : 0));
+    key->family = AF_INET;
+    key->plen = plen;
+    key->v4 = sk->sk_daddr & htonl(~0u << (32 - plen));
 }
 
 static void brutal_sock_exact_key(const struct sock *sk,
@@ -286,6 +317,18 @@ static void brutal_rule_exact_key(const struct brutal_rule *r,
         key->v6 = r->v6;
 }
 
+static void brutal_rule_prefix_key(const struct brutal_rule *r,
+                                   struct brutal_prefix_key *key)
+{
+    memset(key, 0, sizeof(*key));
+    key->family = r->family;
+    key->plen = r->plen;
+    if (r->family == AF_INET)
+        key->v4 = r->v4;
+    else
+        key->v6 = r->v6;
+}
+
 static struct brutal_rule *brutal_exact_lookup(struct brutal_net *bn,
                                                const struct sock *sk)
 {
@@ -296,13 +339,50 @@ static struct brutal_rule *brutal_exact_lookup(struct brutal_net *bn,
                                   brutal_exact_params);
 }
 
+static struct brutal_rule *brutal_prefix_lookup(struct brutal_net *bn,
+                                                const struct sock *sk)
+{
+    struct brutal_prefix_key key;
+    unsigned long *active;
+    int plen;
+
+#if IS_ENABLED(CONFIG_IPV6)
+    if (sk->sk_family == AF_INET6 && !ipv6_addr_v4mapped(&sk->sk_v6_daddr))
+    {
+        active = bn->v6_prefixes;
+        plen = 127;
+    }
+    else
+#endif
+    {
+        active = bn->v4_prefixes;
+        plen = 31;
+    }
+    for (; plen > 0; plen--)
+    {
+        struct brutal_rule *r;
+
+        if (!test_bit(plen, active))
+            continue;
+        brutal_sock_prefix_key(sk, plen, &key);
+        r = rhashtable_lookup_fast(&bn->prefixes, &key,
+                                   brutal_prefix_params);
+        if (r)
+            return r;
+    }
+    return NULL;
+}
+
 void brutal_apply_rule(struct sock *sk, struct brutal *brutal)
 {
     struct brutal_net *bn = brutal_pernet(sock_net(sk));
-    struct brutal_rule *r, *best;
+    struct brutal_rule *best;
 
     rcu_read_lock();
     best = brutal_exact_lookup(bn, sk);
+    if (best)
+        goto found;
+    best = brutal_prefix_lookup(bn, sk);
     if (best)
         goto found;
 #if IS_ENABLED(CONFIG_IPV6)
@@ -313,11 +393,6 @@ void brutal_apply_rule(struct sock *sk, struct brutal *brutal)
 #else
     best = rcu_dereference(bn->default_v4);
 #endif
-    list_for_each_entry_rcu(r, &bn->prefix_rules, prefix_node)
-    {
-        if (brutal_rule_match(r, sk) && (!best || r->plen > best->plen))
-            best = r;
-    }
 found:
     if (best)
     {
@@ -384,6 +459,7 @@ static bool brutal_rule_is_exact(const struct brutal_rule *r)
 static struct brutal_rule *brutal_rule_find(struct brutal_net *bn,
                                             const struct brutal_rule *key)
 {
+    struct brutal_prefix_key prefix_key;
     struct brutal_rule *r = NULL;
 
     if (!key->plen)
@@ -404,18 +480,18 @@ static struct brutal_rule *brutal_rule_find(struct brutal_net *bn,
         return r;
     }
 
-    list_for_each_entry(r, &bn->prefix_rules, prefix_node)
-    {
-        if (r->family == key->family && r->plen == key->plen &&
-            (r->family == AF_INET ? r->v4 == key->v4
-                                  : ipv6_addr_equal(&r->v6, &key->v6)))
-            return r;
-    }
-    return NULL;
+    brutal_rule_prefix_key(key, &prefix_key);
+    rcu_read_lock();
+    r = rhashtable_lookup_fast(&bn->prefixes, &prefix_key,
+                               brutal_prefix_params);
+    rcu_read_unlock();
+    return r;
 }
 
 static int brutal_rule_index_add(struct brutal_net *bn, struct brutal_rule *r)
 {
+    int ret;
+
     if (!r->plen)
     {
         if (r->family == AF_INET)
@@ -431,7 +507,18 @@ static int brutal_rule_index_add(struct brutal_net *bn, struct brutal_rule *r)
                                       brutal_exact_params);
     }
 
-    list_add_tail_rcu(&r->prefix_node, &bn->prefix_rules);
+    brutal_rule_prefix_key(r, &r->prefix_key);
+    ret = rhashtable_insert_fast(&bn->prefixes, &r->prefix_node,
+                                 brutal_prefix_params);
+    if (ret)
+        return ret;
+    if (r->family == AF_INET)
+    {
+        if (++bn->v4_prefix_counts[r->plen] == 1)
+            set_bit(r->plen, bn->v4_prefixes);
+    }
+    else if (++bn->v6_prefix_counts[r->plen] == 1)
+        set_bit(r->plen, bn->v6_prefixes);
     return 0;
 }
 
@@ -448,7 +535,17 @@ static void brutal_rule_index_del(struct brutal_net *bn, struct brutal_rule *r)
         rhashtable_remove_fast(&bn->exact_hosts, &r->exact_node,
                                brutal_exact_params);
     else
-        list_del_rcu(&r->prefix_node);
+    {
+        rhashtable_remove_fast(&bn->prefixes, &r->prefix_node,
+                               brutal_prefix_params);
+        if (r->family == AF_INET)
+        {
+            if (!--bn->v4_prefix_counts[r->plen])
+                clear_bit(r->plen, bn->v4_prefixes);
+        }
+        else if (!--bn->v6_prefix_counts[r->plen])
+            clear_bit(r->plen, bn->v6_prefixes);
+    }
 }
 
 static int brutal_rule_publish(struct brutal_net *bn, struct brutal_rule *r)
@@ -563,7 +660,6 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         r->group = g;
         r->perip = perip;
         WRITE_ONCE(g->rule_stats->max_peers, maxpeers);
-        INIT_LIST_HEAD(&r->prefix_node);
         INIT_LIST_HEAD(&r->free_list);
         brutal_group_set_config(&g->pacer, rate, gain, lock);
         ret = brutal_rule_publish(bn, r);
@@ -1044,8 +1140,9 @@ static int __net_init brutal_net_init(struct net *net)
     int ret;
 
     INIT_LIST_HEAD(&bn->rules);
-    INIT_LIST_HEAD(&bn->prefix_rules);
     xa_init(&bn->rules_by_id);
+    bitmap_zero(bn->v4_prefixes, 33);
+    bitmap_zero(bn->v6_prefixes, 129);
     mutex_init(&bn->rules_mutex);
     atomic64_set(&bn->peer_alloc_failures, 0);
     atomic64_set(&bn->peer_insert_failures, 0);
@@ -1059,9 +1156,16 @@ static int __net_init brutal_net_init(struct net *net)
     ret = rhashtable_init(&bn->exact_hosts, &brutal_exact_params);
     if (ret)
         return ret;
+    ret = rhashtable_init(&bn->prefixes, &brutal_prefix_params);
+    if (ret)
+    {
+        rhashtable_destroy(&bn->exact_hosts);
+        return ret;
+    }
     ret = rhashtable_init(&bn->app_groups, &brutal_app_params);
     if (ret)
     {
+        rhashtable_destroy(&bn->prefixes);
         rhashtable_destroy(&bn->exact_hosts);
         return ret;
     }
@@ -1077,6 +1181,7 @@ static int __net_init brutal_net_init(struct net *net)
         remove_proc_subtree("tcp_brutal", net->proc_net);
         xa_destroy(&bn->rules_by_id);
         rhashtable_destroy(&bn->app_groups);
+        rhashtable_destroy(&bn->prefixes);
         rhashtable_destroy(&bn->exact_hosts);
         return -ENOMEM;
     }
@@ -1091,6 +1196,7 @@ static void __net_exit brutal_net_exit(struct net *net)
     xa_destroy(&bn->rules_by_id);
     remove_proc_subtree("tcp_brutal", net->proc_net);
     rhashtable_destroy(&bn->app_groups);
+    rhashtable_destroy(&bn->prefixes);
     rhashtable_destroy(&bn->exact_hosts);
 }
 

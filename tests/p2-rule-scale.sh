@@ -11,15 +11,20 @@ if [[ $dry_run != 1 && $EUID -ne 0 ]]; then
   exit 1
 fi
 
-printf 'rules,elapsed_ms\n'
+printf 'index,rules,elapsed_ms\n'
 for count in $counts; do
   [[ $count =~ ^[1-9][0-9]*$ ]] || { echo "invalid rule count: $count" >&2; exit 1; }
   if [[ $dry_run == 1 ]]; then
-    printf '%s,DRY-RUN\n' "$count"
+    printf 'exact,%s,DRY-RUN\n' "$count"
+    printf 'prefix,%s,DRY-RUN\n' "$count"
     continue
   fi
   start=$(date +%s%N)
   RULES="$count" bash "$repo/tests/exact-host-scale.sh"
   end=$(date +%s%N)
-  printf '%s,%s\n' "$count" "$(( (end - start) / 1000000 ))"
+  printf 'exact,%s,%s\n' "$count" "$(( (end - start) / 1000000 ))"
+  start=$(date +%s%N)
+  RULES="$count" bash "$repo/tests/intermediate-prefix-scale.sh"
+  end=$(date +%s%N)
+  printf 'prefix,%s,%s\n' "$count" "$(( (end - start) / 1000000 ))"
 done
