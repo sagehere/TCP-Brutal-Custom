@@ -26,6 +26,9 @@ RULES=${EXACT_RULES:-1024} bash "$repo/tests/exact-host-scale.sh"
 echo "== paginated peer proc reads =="
 PEERS=${PAGE_PEERS:-256} bash "$repo/tests/peer-pagination.sh"
 
+echo "== rule ID index =="
+bash "$repo/tests/rule-id-index-netns.sh"
+
 echo "== same-IP multi-stream benchmark =="
 RUNS=${RUNS:-3} SECONDS_PER_RUN=${SECONDS_PER_RUN:-20} STREAMS=${STREAMS:-16} \
 RATE_MBPS=${RATE_MBPS:-200} bash "$repo/tests/benchmark.sh" "two-cpu-$(date +%Y%m%d-%H%M%S)" \

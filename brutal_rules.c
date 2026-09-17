@@ -11,6 +11,7 @@
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/xarray.h>
 #include <net/ipv6.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
@@ -43,7 +44,8 @@ struct brutal_net
     struct mutex rules_mutex;
     struct rhashtable exact_hosts;
     struct rhashtable app_groups;
-    u32 rule_next_id;
+    struct xarray rules_by_id;
+    unsigned long rule_next_id;
     atomic64_t peer_alloc_failures;
     atomic64_t peer_insert_failures;
     atomic64_t peer_fallback_connections;
@@ -449,6 +451,30 @@ static void brutal_rule_index_del(struct brutal_net *bn, struct brutal_rule *r)
         list_del_rcu(&r->prefix_node);
 }
 
+static int brutal_rule_publish(struct brutal_net *bn, struct brutal_rule *r)
+{
+    int ret;
+
+    ret = xa_insert(&bn->rules_by_id, r->group->id, r, GFP_KERNEL);
+    if (ret)
+        return ret;
+    ret = brutal_rule_index_add(bn, r);
+    if (ret)
+    {
+        xa_erase(&bn->rules_by_id, r->group->id);
+        return ret;
+    }
+    list_add_tail_rcu(&r->list, &bn->rules);
+    return 0;
+}
+
+static void brutal_rule_unpublish(struct brutal_net *bn, struct brutal_rule *r)
+{
+    brutal_rule_index_del(bn, r);
+    xa_erase(&bn->rules_by_id, r->group->id);
+    list_del_rcu(&r->list);
+}
+
 static void brutal_rule_free(struct brutal_rule *r)
 {
     synchronize_rcu();
@@ -510,8 +536,16 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     r = brutal_rule_find(bn, &key);
     if (!r)
     {
+        unsigned long id;
+
+        if (bn->rule_next_id == ULONG_MAX)
+        {
+            mutex_unlock(&bn->rules_mutex);
+            return -ENOSPC;
+        }
+        id = ++bn->rule_next_id;
         r = kmemdup(&key, sizeof(key), GFP_KERNEL);
-        g = r ? brutal_group_alloc(++bn->rule_next_id, GFP_KERNEL) : NULL;
+        g = r ? brutal_group_alloc(id, GFP_KERNEL) : NULL;
         if (!g)
         {
             mutex_unlock(&bn->rules_mutex);
@@ -532,7 +566,7 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         INIT_LIST_HEAD(&r->prefix_node);
         INIT_LIST_HEAD(&r->free_list);
         brutal_group_set_config(&g->pacer, rate, gain, lock);
-        ret = brutal_rule_index_add(bn, r);
+        ret = brutal_rule_publish(bn, r);
         if (ret)
         {
             brutal_group_release_fallbacks(g);
@@ -541,7 +575,6 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
             kfree(r);
             return ret;
         }
-        list_add_tail_rcu(&r->list, &bn->rules);
         created = true;
     }
     else if (r->perip != perip)
@@ -572,10 +605,7 @@ static int brutal_rule_del(struct brutal_net *bn, char *args)
     mutex_lock(&bn->rules_mutex);
     r = brutal_rule_find(bn, &key);
     if (r)
-    {
-        brutal_rule_index_del(bn, r);
-        list_del_rcu(&r->list);
-    }
+        brutal_rule_unpublish(bn, r);
     mutex_unlock(&bn->rules_mutex);
     if (!r)
         return -ENOENT;
@@ -591,8 +621,7 @@ static void brutal_rules_flush(struct brutal_net *bn)
     mutex_lock(&bn->rules_mutex);
     list_for_each_entry_safe(r, tmp, &bn->rules, list)
     {
-        brutal_rule_index_del(bn, r);
-        list_del_rcu(&r->list);
+        brutal_rule_unpublish(bn, r);
         list_add_tail(&r->free_list, &free_list);
     }
     mutex_unlock(&bn->rules_mutex);
@@ -688,17 +717,24 @@ static const struct proc_ops brutal_rules_proc_ops = {
 static struct brutal_group *
 brutal_peers_next_group(struct brutal_net *bn, u64 after_id)
 {
-    struct brutal_rule *r;
+    unsigned long id;
+    struct brutal_rule *r = NULL;
     struct brutal_group *g = NULL;
 
+    if (after_id >= ULONG_MAX)
+        return NULL;
+    id = after_id;
     rcu_read_lock();
-    list_for_each_entry_rcu(r, &bn->rules, list)
+    for (;;)
     {
-        if (!r->perip || r->group->id <= after_id)
-            continue;
+        r = xa_find_after(&bn->rules_by_id, &id, ULONG_MAX, XA_PRESENT);
+        if (!r || r->perip)
+            break;
+    }
+    if (r)
+    {
         brutal_pacer_get(&r->group->pacer);
         g = r->group;
-        break;
     }
     rcu_read_unlock();
     return g;
@@ -1009,6 +1045,7 @@ static int __net_init brutal_net_init(struct net *net)
 
     INIT_LIST_HEAD(&bn->rules);
     INIT_LIST_HEAD(&bn->prefix_rules);
+    xa_init(&bn->rules_by_id);
     mutex_init(&bn->rules_mutex);
     atomic64_set(&bn->peer_alloc_failures, 0);
     atomic64_set(&bn->peer_insert_failures, 0);
@@ -1038,6 +1075,7 @@ static int __net_init brutal_net_init(struct net *net)
         !proc_create_data("rules", 0644, dir, &brutal_rules_proc_ops, net))
     {
         remove_proc_subtree("tcp_brutal", net->proc_net);
+        xa_destroy(&bn->rules_by_id);
         rhashtable_destroy(&bn->app_groups);
         rhashtable_destroy(&bn->exact_hosts);
         return -ENOMEM;
@@ -1050,6 +1088,7 @@ static void __net_exit brutal_net_exit(struct net *net)
     struct brutal_net *bn = brutal_pernet(net);
 
     brutal_rules_flush(bn);
+    xa_destroy(&bn->rules_by_id);
     remove_proc_subtree("tcp_brutal", net->proc_net);
     rhashtable_destroy(&bn->app_groups);
     rhashtable_destroy(&bn->exact_hosts);

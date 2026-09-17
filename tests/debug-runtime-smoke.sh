@@ -65,6 +65,8 @@ WORKERS=${RACE_WORKERS:-8} ITERATIONS=${RACE_ITERATIONS:-1000} \
 echo "== active peer pagination =="
 PEERS=$page_peers PEER_WAIT_STEPS=${PEER_WAIT_STEPS:-300} \
   BRUTALCTL="$ctl" bash "$repo/tests/peer-pagination.sh"
+echo "== rule ID index =="
+BRUTALCTL="$ctl" bash "$repo/tests/rule-id-index-netns.sh"
 echo "== exact-host index growth =="
 RULES=${EXACT_RULES:-1000} BRUTALCTL="$ctl" bash "$repo/tests/exact-host-scale.sh"
 
