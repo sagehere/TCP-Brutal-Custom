@@ -188,8 +188,12 @@ static u32 brutal_min_tso_segs(struct sock *sk)
                           (old_parent_duration_ns || parent_duration_ns);
 
         if (use_parent)
+        {
             spin_lock_bh(&parent->pacer.lock);
-        spin_lock_bh(&p->lock);
+            spin_lock_nested(&p->lock, SINGLE_DEPTH_NESTING);
+        }
+        else
+            spin_lock_bh(&p->lock);
         if (settle)
             brutal_pacer_correct(p, correction_ns);
         if (old_parent_duration_ns)
@@ -203,7 +207,10 @@ static u32 brutal_min_tso_segs(struct sock *sk)
             if (parent_duration_ns)
                 parent->pacer.next_ns = start + parent_duration_ns;
         }
-        spin_unlock_bh(&p->lock);
+        if (use_parent)
+            spin_unlock(&p->lock);
+        else
+            spin_unlock_bh(&p->lock);
         if (use_parent)
             spin_unlock_bh(&parent->pacer.lock);
     }
@@ -271,12 +278,17 @@ void brutal_settle_reservation(struct sock *sk)
             parent_correction_ns =
                 (s64)used_ns - (s64)brutal->resv_parent_duration_ns;
             spin_lock_bh(&parent->pacer.lock);
+            spin_lock_nested(&p->lock, SINGLE_DEPTH_NESTING);
         }
-        spin_lock_bh(&p->lock);
+        else
+            spin_lock_bh(&p->lock);
         brutal_pacer_correct(p, correction_ns);
         if (brutal->resv_parent_duration_ns)
             brutal_pacer_correct(&parent->pacer, parent_correction_ns);
-        spin_unlock_bh(&p->lock);
+        if (brutal->resv_parent_duration_ns)
+            spin_unlock(&p->lock);
+        else
+            spin_unlock_bh(&p->lock);
         if (brutal->resv_parent_duration_ns)
             spin_unlock_bh(&parent->pacer.lock);
 
