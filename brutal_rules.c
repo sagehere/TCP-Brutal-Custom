@@ -585,10 +585,12 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     struct brutal_rule key = {}, *r;
     struct brutal_group *g;
     u64 rate = 0;
+    u64 aggregate_rate = 0;
     u32 gain = INIT_CWND_GAIN;
     bool lock = true;
     bool perip = false, created = false;
     bool maxpeers_set = false;
+    bool aggregate_set = false;
     u32 maxpeers = 0;
     char *tok = strsep(&args, " ");
     int ret = 0;
@@ -601,6 +603,11 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
             continue;
         if (!strncmp(tok, "rate=", 5))
             ret = kstrtou64(tok + 5, 10, &rate);
+        else if (!strncmp(tok, "aggregate=", 10))
+        {
+            ret = kstrtou64(tok + 10, 10, &aggregate_rate);
+            aggregate_set = true;
+        }
         else if (!strncmp(tok, "gain=", 5))
             ret = kstrtou32(tok + 5, 10, &gain);
         else if (!strcmp(tok, "nolock"))
@@ -627,6 +634,11 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     if (perip && !lock)
         return -EINVAL;
     if (maxpeers_set && !perip)
+        return -EINVAL;
+    if (aggregate_set && !perip)
+        return -EINVAL;
+    if (aggregate_rate &&
+        (aggregate_rate < MIN_PACING_RATE || aggregate_rate > MAX_PACING_RATE))
         return -EINVAL;
 
     mutex_lock(&bn->rules_mutex);
@@ -661,7 +673,8 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
         r->perip = perip;
         WRITE_ONCE(g->rule_stats->max_peers, maxpeers);
         INIT_LIST_HEAD(&r->free_list);
-        brutal_group_set_config(&g->pacer, rate, gain, lock);
+        brutal_group_set_rule_config(&g->pacer, rate, gain, lock,
+                                     aggregate_rate);
         ret = brutal_rule_publish(bn, r);
         if (ret)
         {
@@ -683,7 +696,10 @@ static int brutal_rule_add(struct brutal_net *bn, char *args)
     {
         if (maxpeers_set)
             WRITE_ONCE(g->rule_stats->max_peers, maxpeers);
-        brutal_group_set_config(&g->pacer, rate, gain, lock);
+        if (!aggregate_set)
+            aggregate_rate = brutal_group_aggregate_rate(&g->pacer);
+        brutal_group_set_rule_config(&g->pacer, rate, gain, lock,
+                                     aggregate_rate);
     }
     mutex_unlock(&bn->rules_mutex);
     return 0;
@@ -746,8 +762,10 @@ static int brutal_rules_show(struct seq_file *m, void *v)
         u64 rate;
         u32 gain;
         bool locked;
+        u64 aggregate_rate;
 
         brutal_group_get_config(&g->pacer, &rate, &gain, &locked, NULL);
+        aggregate_rate = brutal_group_aggregate_rate(&g->pacer);
         if (r->family == AF_INET)
             seq_printf(m, "dst=%pI4/%u", &r->v4, r->plen);
         else
@@ -757,7 +775,8 @@ static int brutal_rules_show(struct seq_file *m, void *v)
                    atomic_read(&g->pacer.members), atomic_read(&g->ip_groups),
                    brutal_group_sent(g));
         if (r->perip && g->rule_stats)
-            seq_printf(m, " maxpeers=%u peer_slots=%d peak_peer_slots=%d budget_fallbacks=%lld",
+            seq_printf(m, " aggregate=%llu maxpeers=%u peer_slots=%d peak_peer_slots=%d budget_fallbacks=%lld",
+                       aggregate_rate,
                        READ_ONCE(g->rule_stats->max_peers),
                        atomic_read(&g->rule_stats->peer_slots),
                        atomic_read(&g->rule_stats->peak_peer_slots),

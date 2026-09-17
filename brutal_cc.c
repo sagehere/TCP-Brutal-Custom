@@ -108,15 +108,25 @@ static u32 brutal_burst_estimate(const struct sock *sk, u64 rate, u32 unsent)
     return min_t(u32, segs * tp->mss_cache, unsent);
 }
 
+static void brutal_pacer_correct(struct brutal_pacer *p, s64 correction_ns)
+{
+    if (correction_ns >= 0)
+        p->next_ns += correction_ns;
+    else
+        p->next_ns -= min_t(u64, p->next_ns, -correction_ns);
+}
+
 static u32 brutal_min_tso_segs(struct sock *sk)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct brutal *brutal = inet_csk_ca(sk);
     struct brutal_pacer *p = brutal->group;
+    struct brutal_group *parent;
     u64 now = tp->tcp_clock_cache;
-    u64 rate, start = 0, sent = 0;
-    s64 correction_ns = 0;
-    u32 unsent, burst = 0, duration_ns = 0;
+    u64 aggregate_rate, rate, start = 0, sent = 0;
+    s64 correction_ns = 0, parent_correction_ns = 0;
+    u32 old_parent_duration_ns = 0;
+    u32 unsent, burst = 0, duration_ns = 0, parent_duration_ns = 0;
     bool settle = false;
 
     if (!p)
@@ -124,11 +134,15 @@ static u32 brutal_min_tso_segs(struct sock *sk)
 
     brutal_maybe_update_rate(sk);
     rate = brutal->effective_rate;
+    parent = p->parent;
+    aggregate_rate = parent ? brutal_group_aggregate_rate(&parent->pacer) : 0;
 
     if (brutal->resv_bytes)
     {
         u64 used_ns;
-        u32 stale_ns = clamp_t(u32, brutal->resv_duration_ns / 2,
+        u32 stale_ns = clamp_t(u32,
+                               max(brutal->resv_duration_ns,
+                                   brutal->resv_parent_duration_ns) / 2,
                                RESV_STALE_MIN_NS, RESV_STALE_MAX_NS);
 
         sent = tp->bytes_sent - brutal->resv_bytes_sent;
@@ -141,8 +155,17 @@ static u32 brutal_min_tso_segs(struct sock *sk)
         used_ns = div64_u64((u64)brutal->resv_duration_ns * sent,
                             brutal->resv_bytes);
         correction_ns = (s64)used_ns - (s64)brutal->resv_duration_ns;
+        old_parent_duration_ns = brutal->resv_parent_duration_ns;
+        if (old_parent_duration_ns)
+        {
+            used_ns = div64_u64((u64)old_parent_duration_ns * sent,
+                                brutal->resv_bytes);
+            parent_correction_ns =
+                (s64)used_ns - (s64)old_parent_duration_ns;
+        }
         settle = true;
         brutal->resv_bytes = 0;
+        brutal->resv_parent_duration_ns = 0;
     }
 
     unsent = tp->write_seq - tp->snd_nxt;
@@ -153,21 +176,35 @@ static u32 brutal_min_tso_segs(struct sock *sk)
     {
         burst = brutal_burst_estimate(sk, rate, unsent);
         duration_ns = div64_u64((u64)burst * NSEC_PER_SEC, rate);
+        if (aggregate_rate)
+            parent_duration_ns =
+                div64_u64((u64)burst * NSEC_PER_SEC, aggregate_rate);
     }
 
     if (settle || burst)
     {
+        bool use_parent = parent &&
+                          (old_parent_duration_ns || parent_duration_ns);
+
+        if (use_parent)
+            spin_lock_bh(&parent->pacer.lock);
         spin_lock_bh(&p->lock);
-        if (correction_ns >= 0)
-            p->next_ns += correction_ns;
-        else
-            p->next_ns -= min_t(u64, p->next_ns, -correction_ns);
+        if (settle)
+            brutal_pacer_correct(p, correction_ns);
+        if (old_parent_duration_ns)
+            brutal_pacer_correct(&parent->pacer, parent_correction_ns);
         if (burst)
         {
             start = max(p->next_ns, now - GROUP_MAX_LAG_NS);
+            if (parent_duration_ns)
+                start = max(start, parent->pacer.next_ns);
             p->next_ns = start + duration_ns;
+            if (parent_duration_ns)
+                parent->pacer.next_ns = start + parent_duration_ns;
         }
         spin_unlock_bh(&p->lock);
+        if (use_parent)
+            spin_unlock_bh(&parent->pacer.lock);
     }
     if (settle)
     {
@@ -185,6 +222,7 @@ static u32 brutal_min_tso_segs(struct sock *sk)
     brutal->resv_start_ns = start;
     brutal->resv_bytes = burst;
     brutal->resv_duration_ns = duration_ns;
+    brutal->resv_parent_duration_ns = parent_duration_ns;
     brutal->resv_bytes_sent = tp->bytes_sent;
     if (tp->tcp_wstamp_ns < start)
         tp->tcp_wstamp_ns = start;
@@ -218,17 +256,28 @@ void brutal_settle_reservation(struct sock *sk)
 
     if (p && brutal->resv_bytes)
     {
+        struct brutal_group *parent = p->parent;
         u64 sent = tcp_sk(sk)->bytes_sent - brutal->resv_bytes_sent;
         u64 used_ns = div64_u64((u64)brutal->resv_duration_ns * sent,
                                 brutal->resv_bytes);
         s64 correction_ns = (s64)used_ns - (s64)brutal->resv_duration_ns;
+        s64 parent_correction_ns = 0;
 
+        if (brutal->resv_parent_duration_ns)
+        {
+            used_ns = div64_u64((u64)brutal->resv_parent_duration_ns * sent,
+                                brutal->resv_bytes);
+            parent_correction_ns =
+                (s64)used_ns - (s64)brutal->resv_parent_duration_ns;
+            spin_lock_bh(&parent->pacer.lock);
+        }
         spin_lock_bh(&p->lock);
-        if (correction_ns >= 0)
-            p->next_ns += correction_ns;
-        else
-            p->next_ns -= min_t(u64, p->next_ns, -correction_ns);
+        brutal_pacer_correct(p, correction_ns);
+        if (brutal->resv_parent_duration_ns)
+            brutal_pacer_correct(&parent->pacer, parent_correction_ns);
         spin_unlock_bh(&p->lock);
+        if (brutal->resv_parent_duration_ns)
+            spin_unlock_bh(&parent->pacer.lock);
 
         if (p->parent)
         {
@@ -238,6 +287,7 @@ void brutal_settle_reservation(struct sock *sk)
         else
             brutal_group_account_sent(container_of(p, struct brutal_group, pacer), sent);
         brutal->resv_bytes = 0;
+        brutal->resv_parent_duration_ns = 0;
     }
 }
 

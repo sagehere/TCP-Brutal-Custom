@@ -34,7 +34,8 @@ struct proc_ops;
 
 #define BRUTAL_CAPABILITIES                                             \
     (BRUTAL_CAP_PERIP | BRUTAL_CAP_NETNS | BRUTAL_CAP_EXACT_RULE_HASH | \
-     BRUTAL_CAP_PEER_STATS | BRUTAL_CAP_PEER_BUDGET | BRUTAL_CAP_PREFIX_INDEX)
+     BRUTAL_CAP_PEER_STATS | BRUTAL_CAP_PEER_BUDGET | BRUTAL_CAP_PREFIX_INDEX | \
+     BRUTAL_CAP_KERNEL_AGGREGATE)
 
 #define INIT_PACING_RATE 125000
 #define INIT_CWND_GAIN 20
@@ -81,6 +82,7 @@ struct brutal_rate_cfg
     spinlock_t lock;
     seqcount_t seq;
     u64 rate;
+    u64 aggregate_rate;
     u32 cwnd_gain;
     atomic_t generation;
     u8 locked;
@@ -182,6 +184,7 @@ void brutal_group_leave(struct sock *sk);
 void brutal_settle_reservation(struct sock *sk);
 struct brutal_pacer *brutal_perip_group_get(struct sock *sk, struct brutal_group *parent);
 u64 brutal_group_rate(struct brutal_pacer *p);
+u64 brutal_group_aggregate_rate(struct brutal_pacer *p);
 u32 brutal_group_cwnd_gain(struct brutal_pacer *p);
 u16 brutal_group_generation(struct brutal_pacer *p);
 bool brutal_group_locked(struct brutal_pacer *p);
@@ -189,6 +192,8 @@ void brutal_group_get_config(struct brutal_pacer *p, u64 *rate, u32 *gain,
                              bool *locked, u16 *generation);
 void brutal_group_set_config(struct brutal_pacer *p, u64 rate, u32 gain,
                              bool locked);
+void brutal_group_set_rule_config(struct brutal_pacer *p, u64 rate, u32 gain,
+                                  bool locked, u64 aggregate_rate);
 int brutal_group_enable_rule_stats(struct brutal_group *g, bool perip);
 void brutal_group_release_fallbacks(struct brutal_group *g);
 void brutal_group_account_sent(struct brutal_group *g, u64 bytes);

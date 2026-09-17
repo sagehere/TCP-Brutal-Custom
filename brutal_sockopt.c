@@ -113,6 +113,20 @@ u64 brutal_group_rate(struct brutal_pacer *p)
     return rate;
 }
 
+u64 brutal_group_aggregate_rate(struct brutal_pacer *p)
+{
+    struct brutal_rate_cfg *cfg = &brutal_pacer_config_group(p)->cfg;
+    unsigned int seq;
+    u64 rate;
+
+    do
+    {
+        seq = read_seqcount_begin(&cfg->seq);
+        rate = READ_ONCE(cfg->aggregate_rate);
+    } while (read_seqcount_retry(&cfg->seq, seq));
+    return rate;
+}
+
 u32 brutal_group_cwnd_gain(struct brutal_pacer *p)
 {
     u32 gain;
@@ -241,6 +255,22 @@ void brutal_group_set_config(struct brutal_pacer *p, u64 rate, u32 gain,
     spin_lock_bh(&cfg->lock);
     write_seqcount_begin(&cfg->seq);
     WRITE_ONCE(cfg->rate, rate);
+    WRITE_ONCE(cfg->cwnd_gain, gain);
+    WRITE_ONCE(cfg->locked, locked);
+    atomic_inc(&cfg->generation);
+    write_seqcount_end(&cfg->seq);
+    spin_unlock_bh(&cfg->lock);
+}
+
+void brutal_group_set_rule_config(struct brutal_pacer *p, u64 rate, u32 gain,
+                                  bool locked, u64 aggregate_rate)
+{
+    struct brutal_rate_cfg *cfg = &brutal_pacer_config_group(p)->cfg;
+
+    spin_lock_bh(&cfg->lock);
+    write_seqcount_begin(&cfg->seq);
+    WRITE_ONCE(cfg->rate, rate);
+    WRITE_ONCE(cfg->aggregate_rate, aggregate_rate);
     WRITE_ONCE(cfg->cwnd_gain, gain);
     WRITE_ONCE(cfg->locked, locked);
     atomic_inc(&cfg->generation);

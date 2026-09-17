@@ -43,7 +43,7 @@ static int usage(void)
     fputs("usage: brutalctl info\n"
           "       brutalctl list\n"
           "       brutalctl peers [--rule ID] [--ip ADDRESS] [--family 4|6] [--limit N]\n"
-          "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute] [perip] [maxpeers=N]\n"
+          "       brutalctl add <prefix>[/<len>] <rate_mbps> [gain=<tenths>] [nolock] [noroute] [perip] [aggregate=Mbps] [maxpeers=N]\n"
           "       brutalctl del <prefix>[/<len>]\n"
           "       brutalctl flush\n"
           "\n"
@@ -51,6 +51,7 @@ static int usage(void)
           "a dedicated proto " ROUTE_PROTO " route when no foreign exact route exists;\n"
           "del and flush remove only routes owned by brutalctl.\n"
           "perip gives each peer IP its own shared rate (and requires the default lock).\n"
+          "aggregate=Mbps optionally caps all children of a perip rule; 0 disables it.\n"
           "maxpeers=N bounds per-IP peer groups for that rule; 0 means unlimited.\n"
           "nolock lets applications set their own params on these connections.\n",
           stderr);
@@ -359,7 +360,7 @@ static char *field(const char *line, const char *key, char *out, size_t size)
 
 static int list_rules(void)
 {
-    char line[512], dst[64], rate[32], gain[16], lock[8], group[16], id[24], members[16], ips[16], sent[32];
+    char line[512], dst[64], rate[32], aggregate[32], gain[16], lock[8], group[16], id[24], members[16], ips[16], sent[32];
     char routes[8192], routes6[4096];
     char *v4[] = {"ip", "-4", "route", "show", "proto", ROUTE_PROTO, NULL};
     char *v6[] = {"ip", "-6", "route", "show", "proto", ROUTE_PROTO, NULL};
@@ -372,14 +373,16 @@ static int list_rules(void)
     run(v4, routes, sizeof(routes) - sizeof(routes6), 1);
     run(v6, routes6, sizeof(routes6), 1);
     strcat(routes, routes6);
-    printf("%-30s %11s %5s %5s %7s %6s %4s %8s %5s %10s\n",
-           "DESTINATION", "RATE(Mbps)", "GAIN", "LOCK", "GROUP", "ROUTE", "ID", "MEMBERS", "IPS", "SENT(MB)");
+    printf("%-30s %11s %11s %5s %5s %7s %6s %4s %8s %5s %10s\n",
+           "DESTINATION", "RATE(Mbps)", "AGGR(Mbps)", "GAIN", "LOCK",
+           "GROUP", "ROUTE", "ID", "MEMBERS", "IPS", "SENT(MB)");
     while (fgets(line, sizeof(line), f))
     {
         char copy[sizeof(routes)];
 
         field(line, "dst", dst, sizeof(dst));
         field(line, "rate", rate, sizeof(rate));
+        field(line, "aggregate", aggregate, sizeof(aggregate));
         field(line, "gain", gain, sizeof(gain));
         field(line, "lock", lock, sizeof(lock));
         field(line, "group", group, sizeof(group));
@@ -388,8 +391,9 @@ static int list_rules(void)
         field(line, "ips", ips, sizeof(ips));
         field(line, "sent", sent, sizeof(sent));
         memcpy(copy, routes, sizeof(copy));
-        printf("%-30s %11.2f %5s %5s %7s %6s %4s %8s %5s %10.1f\n",
-               dst, strtoull(rate, NULL, 10) * 8 / 1e6, gain,
+        printf("%-30s %11.2f %11.2f %5s %5s %7s %6s %4s %8s %5s %10.1f\n",
+               dst, strtoull(rate, NULL, 10) * 8 / 1e6,
+               strtoull(aggregate, NULL, 10) * 8 / 1e6, gain,
                strcmp(lock, "1") ? "no" : "yes", group[0] ? group : "shared",
                route_present(dst, copy) ? "yes" : "no", id, members,
                ips[0] ? ips : "0", strtoull(sent, NULL, 10) / 1e6);
@@ -578,7 +582,8 @@ static int add_rule(int argc, char **argv)
     char *end;
     double mbps;
     size_t used = 0;
-    int i, lock = 1, route = 1, perip = 0, maxpeers_set = 0, ret;
+    int i, lock = 1, route = 1, perip = 0, aggregate_set = 0;
+    int maxpeers_set = 0, ret;
 
     if (argc < 4)
         return usage();
@@ -633,6 +638,30 @@ static int add_rule(int argc, char **argv)
             }
             maxpeers_set = 1;
         }
+        else if (!strncmp(argv[i], "aggregate=", 10))
+        {
+            double aggregate;
+
+            if (aggregate_set)
+                return usage();
+            errno = 0;
+            aggregate = strtod(argv[i] + 10, &end);
+            if (errno || *end || !isfinite(aggregate) || aggregate < 0 ||
+                aggregate > 1000000.0)
+            {
+                fprintf(stderr, "brutalctl: invalid aggregate rate '%s' (Mbps)\n",
+                        argv[i] + 10);
+                return 1;
+            }
+            if (appendf(cmd, sizeof(cmd), &used, " aggregate=%llu",
+                        (unsigned long long)(aggregate * 1e6 / 8 + 0.5)))
+            {
+                fprintf(stderr, "brutalctl: command is too long\n");
+                return 1;
+            }
+            aggregate_set = 1;
+            continue;
+        }
         else if (strncmp(argv[i], "gain=", 5))
             return usage();
         if (appendf(cmd, sizeof(cmd), &used, " %s", argv[i]))
@@ -646,6 +675,11 @@ static int add_rule(int argc, char **argv)
     if (maxpeers_set && !perip)
     {
         fprintf(stderr, "brutalctl: maxpeers requires perip\n");
+        return 1;
+    }
+    if (aggregate_set && !perip)
+    {
+        fprintf(stderr, "brutalctl: aggregate requires perip\n");
         return 1;
     }
     if (route)
