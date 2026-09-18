@@ -118,38 +118,16 @@ static struct brutal_net *brutal_pernet(struct net *net)
     return net_generic(net, brutal_net_id);
 }
 
-void brutal_port_stats_track(struct sock *sk, struct brutal *brutal)
+void brutal_port_stats_account(struct sock *sk, u32 acked, u32 losses)
 {
     struct brutal_net *bn = brutal_pernet(sock_net(sk));
     struct brutal_port_stats *stats;
-    u16 port = ntohs(inet_sk(sk)->inet_sport);
 
     rcu_read_lock();
-    stats = xa_load(&bn->port_stats, port);
+    stats = xa_load(&bn->port_stats, ntohs(inet_sk(sk)->inet_sport));
     if (stats && READ_ONCE(stats->selected))
-        brutal->stats_port = port;
-    rcu_read_unlock();
-    brutal->stats_bytes_sent = lower_32_bits(tcp_sk(sk)->bytes_sent);
-}
-
-void brutal_port_stats_account(struct sock *sk, struct brutal *brutal,
-                               u32 losses)
-{
-    struct brutal_net *bn;
-    struct brutal_port_stats *stats;
-    u32 now, sent;
-
-    if (!brutal->stats_port)
-        return;
-    bn = brutal_pernet(sock_net(sk));
-    now = lower_32_bits(tcp_sk(sk)->bytes_sent);
-    sent = now - brutal->stats_bytes_sent;
-    brutal->stats_bytes_sent = now;
-    rcu_read_lock();
-    stats = xa_load(&bn->port_stats, brutal->stats_port);
-    if (stats)
     {
-        atomic64_add(sent, &stats->sent_bytes);
+        atomic64_add((u64)acked * tcp_sk(sk)->mss_cache, &stats->sent_bytes);
         if (losses)
             atomic64_add((u64)losses * tcp_sk(sk)->mss_cache,
                          &stats->retrans_bytes);
@@ -1301,11 +1279,10 @@ static int brutal_port_stats_show(struct seq_file *m, void *v)
     unsigned long port;
 
     rcu_read_lock();
-    xa_for_each(&bn->port_stats, port, stats)
-        if (READ_ONCE(stats->selected))
-            seq_printf(m, "port=%lu sent=%lld retrans=%lld\n", port,
-                       atomic64_read(&stats->sent_bytes),
-                       atomic64_read(&stats->retrans_bytes));
+    xa_for_each(&bn->port_stats, port, stats) if (READ_ONCE(stats->selected))
+        seq_printf(m, "port=%lu sent=%lld retrans=%lld\n", port,
+                   atomic64_read(&stats->sent_bytes),
+                   atomic64_read(&stats->retrans_bytes));
     rcu_read_unlock();
     return 0;
 }
