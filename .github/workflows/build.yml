@@ -81,8 +81,8 @@ jobs:
           bash tests/release-chain-test.sh
           release_test_dir=$(mktemp -d)
           release_test_dir_2=$(mktemp -d)
-          ./scripts/build-release-assets.sh v2.5.3 2.5.3 "$(git rev-parse HEAD)" "$release_test_dir"
-          ./scripts/build-release-assets.sh v2.5.3 2.5.3 "$(git rev-parse HEAD)" "$release_test_dir_2"
+          ./scripts/build-release-assets.sh v2.5.4 2.5.4 "$(git rev-parse HEAD)" "$release_test_dir"
+          ./scripts/build-release-assets.sh v2.5.4 2.5.4 "$(git rev-parse HEAD)" "$release_test_dir_2"
           test -x "$release_test_dir/install.sh"
           grep -Eq '  install[.]sh$' "$release_test_dir/SHA256SUMS"
           (cd "$release_test_dir" && sha256sum -c SHA256SUMS)
