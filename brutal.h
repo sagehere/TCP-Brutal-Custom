@@ -160,9 +160,6 @@ struct brutal
     u32 slot_acked[PKT_INFO_SLOTS];
     u32 slot_losses[PKT_INFO_SLOTS];
     u16 slot_secs[PKT_INFO_SLOTS];
-    u16 stats_port;
-    /* Fits in the existing ICSK private-state tail padding on supported kernels. */
-    u32 stats_bytes_sent;
 };
 
 struct brutal_params
@@ -273,9 +270,7 @@ bool brutal_peer_budget_try_reserve(struct net *net, struct brutal_group *parent
 void brutal_peer_budget_release(struct net *net, struct brutal_group *parent);
 void brutal_net_peer_added(struct net *net);
 void brutal_net_peer_removed(struct net *net);
-void brutal_port_stats_track(struct sock *sk, struct brutal *brutal);
-void brutal_port_stats_account(struct sock *sk, struct brutal *brutal,
-                               u32 losses);
+void brutal_port_stats_account(struct sock *sk, u32 acked, u32 losses);
 
 struct brutal_group *brutal_app_group_get(struct sock *sk, u64 id);
 void brutal_app_group_remove(struct brutal_group *g);

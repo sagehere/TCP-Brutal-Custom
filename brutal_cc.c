@@ -251,7 +251,6 @@ static void brutal_init(struct sock *sk)
     brutal->ack_rate = 100;
 
     brutal_apply_rule(sk, brutal);
-    brutal_port_stats_track(sk, brutal);
     if (brutal->group)
         brutal_update_rate(sk);
 
@@ -307,7 +306,6 @@ void brutal_settle_reservation(struct sock *sk)
 
 static void brutal_release(struct sock *sk)
 {
-    brutal_port_stats_account(sk, inet_csk_ca(sk), 0);
     brutal_group_leave(sk);
     brutal_sockopt_uninstall(sk);
 }
@@ -327,7 +325,7 @@ static void brutal_main(struct sock *sk, const struct rate_sample *rs)
     if (rs->delivered < 0 || rs->interval_us <= 0)
         return;
 
-    brutal_port_stats_account(sk, brutal, rs->losses);
+    brutal_port_stats_account(sk, rs->acked_sacked, rs->losses);
 
     sec = div_u64(tp->tcp_mstamp, USEC_PER_SEC);
     slot = sec % PKT_INFO_SLOTS;
