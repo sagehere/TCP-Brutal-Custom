@@ -41,6 +41,9 @@
 #ifndef STATS_PATH
 #define STATS_PATH "/proc/net/tcp_brutal/stats"
 #endif
+#ifndef PORT_STATS_PATH
+#define PORT_STATS_PATH "/proc/net/tcp_brutal/port_stats"
+#endif
 #ifndef LIMITS_PATH
 #define LIMITS_PATH "/proc/net/tcp_brutal/limits"
 #endif
@@ -50,6 +53,7 @@ static int usage(void)
 {
     fputs("usage: brutalctl info\n"
           "       brutalctl stats\n"
+          "       brutalctl port-stats [ports]\n"
           "       brutalctl limits [max_peers]\n"
           "       brutalctl list\n"
           "       brutalctl peers [--rule ID] [--ip ADDRESS] [--family 4|6] [--limit N]\n"
@@ -702,6 +706,7 @@ static int show_info(void)
         {BRUTAL_CAP_PREFIX_INDEX, "prefix-index"},
         {BRUTAL_CAP_KERNEL_AGGREGATE, "kernel-aggregate"},
         {BRUTAL_CAP_GENL, "genl"},
+        {BRUTAL_CAP_PORT_STATS, "port-stats"},
     };
     struct brutal_info_v1 info;
     int i, first = 1;
@@ -764,6 +769,29 @@ static int show_stats(void)
            stats.peer_slots, stats.peak_peer_slots, stats.max_peers,
            stats.active_peers, stats.peak_peers);
     return 0;
+}
+
+static int show_port_stats(int argc, char **argv)
+{
+    int fd, length;
+    char command[4096];
+
+    if (argc == 2)
+        return print_proc(PORT_STATS_PATH);
+    if (argc != 3 || strlen(argv[2]) > 4000)
+        return usage();
+    fd = open_proc(PORT_STATS_PATH, O_WRONLY);
+    if (fd < 0)
+        return 1;
+    length = snprintf(command, sizeof(command), "ports=%s\n", argv[2]);
+    if (write(fd, command, length) != length)
+    {
+        close(fd);
+        perror("brutalctl: port-stats");
+        return 1;
+    }
+    close(fd);
+    return print_proc(PORT_STATS_PATH);
 }
 
 static int show_limits(int argc, char **argv)
@@ -1021,6 +1049,8 @@ int main(int argc, char **argv)
         return argc == 2 ? show_info() : usage();
     if (!strcmp(argv[1], "stats"))
         return argc == 2 ? show_stats() : usage();
+    if (!strcmp(argv[1], "port-stats"))
+        return argc == 2 || argc == 3 ? show_port_stats(argc, argv) : usage();
     if (!strcmp(argv[1], "limits"))
         return argc == 2 || argc == 3 ? show_limits(argc, argv) : usage();
     if (!strcmp(argv[1], "list") || !strcmp(argv[1], "ls"))

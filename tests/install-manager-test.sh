@@ -193,13 +193,91 @@ IPV6_RATE=60
 MODE=dual
 TCP_PORTS=443,8443,10000-10100
 AGGREGATE_RATE=500
+HOTPLUG_SERVICES=sing-box.service,nginx.service
 COMMIT=abcdef0123456789abcdef0123456789abcdef01
 VERSION=2.1.0.custom.abcdef0
 MANAGED=1
 UNTRUSTED=$(false)
 EOF
 load_config
-[[ $IPV4_RATE == 120 && $IPV6_RATE == 60 && $MODE == dual && $TCP_PORTS == 443,8443,10000-10100 && $AGGREGATE_RATE == 500 && $MANAGED == 1 ]]
+[[ $IPV4_RATE == 120 && $IPV6_RATE == 60 && $MODE == dual && $TCP_PORTS == 443,8443,10000-10100 && $AGGREGATE_RATE == 500 && $HOTPLUG_SERVICES == sing-box.service,nginx.service && $MANAGED == 1 ]]
+
+valid_hotplug_service sing-box.service
+valid_hotplug_service nginx@edge.service
+! valid_hotplug_service '*.service'
+! valid_hotplug_service tcp-brutal-custom.service
+[[ $(normalize_hotplug_services 'nginx.service,sing-box.service') == nginx.service,sing-box.service ]]
+! normalize_hotplug_services 'nginx.service,nginx.service' >/dev/null 2>&1
+
+(
+  HOTPLUG_SERVICES=proxy.service
+  TCP_PORTS=""
+  hotplug_log="$tmp/hotplug.log"
+  rmmod_calls=0
+  module_loaded() { return 0; }
+  rmmod() { ((++rmmod_calls > 1)); }
+  systemctl() {
+    printf '%s\n' "$*" >>"$hotplug_log"
+    case $1 in
+      is-active) return 0 ;;
+      show) printf 'proxy.socket\n' ;;
+    esac
+  }
+  hotplug_unload_module
+  [[ $HOTPLUG_PAUSED == 1 ]]
+  grep -q '^stop proxy.socket$' "$hotplug_log"
+  grep -q '^stop proxy.service$' "$hotplug_log"
+  hotplug_resume_services 0
+  grep -q '^start proxy.socket$' "$hotplug_log"
+  grep -q '^start proxy.service$' "$hotplug_log"
+)
+
+(
+  HOTPLUG_SERVICES=proxy.service
+  TCP_PORTS=""
+  hotplug_log="$tmp/hotplug-stop-failure.log"
+  systemctl() {
+    printf '%s\n' "$*" >>"$hotplug_log"
+    case $1 in
+      is-active) return 0 ;;
+      show) printf 'proxy.socket\n' ;;
+      stop) [[ $2 != proxy.service ]] ;;
+    esac
+  }
+  ! hotplug_pause_services
+  grep -q '^start proxy.socket$' "$hotplug_log"
+  grep -q '^start proxy.service$' "$hotplug_log"
+)
+
+(
+  need_root() { return 0; }
+  load_config() { HOTPLUG_SERVICES=""; }
+  save_config() { saved_services=$HOTPLUG_SERVICES; }
+  systemctl() { [[ $1 == show ]] && printf 'loaded\n'; }
+  set_hotplug_services nginx@edge.service sing-box.service
+  [[ $saved_services == nginx@edge.service,sing-box.service ]]
+  set_hotplug_services --clear
+  [[ -z $saved_services ]]
+)
+
+(
+  HOTPLUG_SERVICES=proxy.service
+  TCP_PORTS=""
+  hotplug_log="$tmp/hotplug-busy.log"
+  module_loaded() { return 0; }
+  rmmod() { return 1; }
+  sleep() { SECONDS=$((SECONDS + 16)); }
+  systemctl() {
+    printf '%s\n' "$*" >>"$hotplug_log"
+    case $1 in
+      is-active) return 0 ;;
+      show) printf 'proxy.socket\n' ;;
+    esac
+  }
+  ! hotplug_unload_module
+  grep -q '^start proxy.socket$' "$hotplug_log"
+  grep -q '^start proxy.service$' "$hotplug_log"
+)
 
 sed 's/^VERSION=.*/VERSION=2.4.0/' "$CONFIG" >"$tmp/current-config"
 CONFIG="$tmp/current-config"
@@ -323,18 +401,25 @@ unset -f rm dkms
   MANAGER="$tmp/manager-install/tbc"
   LEGACY_MANAGER="$tmp/manager-install/brutal-manager"
   BRUTALCTL="$tmp/manager-install/brutalctl"
+  WEB_DIR="$tmp/manager-install/web"
+  WEB_SERVICE="$tmp/manager-install/tcp-brutal-custom-web.service"
+  STATS_SERVICE="$tmp/manager-install/tcp-brutal-custom-stats.service"
+  STATS_TIMER="$tmp/manager-install/tcp-brutal-custom-stats.timer"
   STATE_DIR="$tmp/manager-state"
   VERSION=2.4.0
-  mkdir -p "$source/tools"
+  systemctl() { return 0; }
+  mkdir -p "$source/tools" "$source/web"
   cp "$repo/install.sh" "$source/install.sh"
   printf '#!/usr/bin/env bash\n' >"$source/tools/brutalctl"
+  for file in tbc_web.py tbc_stats.py tcp-brutal-custom-web.service tcp-brutal-custom-stats.service tcp-brutal-custom-stats.timer; do
+    printf 'test\n' >"$source/web/$file"
+  done
   chmod +x "$source/tools/brutalctl"
   install_manager "$source"
   [[ -x $MANAGER && -x $BRUTALCTL && -e $LEGACY_MANAGER ]]
   cmp "$MANAGER" "$LEGACY_MANAGER"
   [[ ! -L $LEGACY_MANAGER ]] || [[ $(readlink "$LEGACY_MANAGER") == "$MANAGER" ]]
   SERVICE="$tmp/manager-install/service"
-  systemctl() { return 0; }
   write_service
   grep -qx "ExecStart=$MANAGER apply" "$SERVICE"
 )
@@ -351,6 +436,7 @@ unset -f rm dkms
   mkdir -p "$STATE_DIR"
   touch "$MANAGER" "$LEGACY_MANAGER" "$BRUTALCTL" "$SERVICE" "$MODULES_LOAD" "$CONFIG"
   need_root() { return 0; }
+  acquire_hotplug_lock() { return 0; }
   load_config() { MANAGED=1; VERSION=2.4.0; AGGREGATE_RATE=0; }
   confirm() { return 0; }
   module_loaded() { return 1; }
@@ -375,13 +461,14 @@ PEERS_PROC="$tmp/peers-proc"
 printf 'old tbc\n' >"$MANAGER"
 printf 'old brutal-manager\n' >"$LEGACY_MANAGER"
 load_config() {
-  IPV4_RATE=80; IPV6_RATE=80; MODE=auto; TCP_PORTS=""; AGGREGATE_RATE=0
+  IPV4_RATE=80; IPV6_RATE=80; MODE=auto; TCP_PORTS=""; AGGREGATE_RATE=0; HOTPLUG_SERVICES=""
   COMMIT=1111111111111111111111111111111111111111
   VERSION=2.1.0.custom.1111111
   MANAGED=1
 }
 need_root() { return 0; }
 check_platform() { return 0; }
+acquire_hotplug_lock() { return 0; }
 confirm() { return 0; }
 install_dependencies() { return 0; }
 make() { return 0; }
@@ -406,6 +493,7 @@ depmod() { return 0; }
 modprobe() { return 0; }
 install_manager() { echo install-manager >>"$failure_log"; }
 write_service() { echo write-service >>"$failure_log"; }
+systemctl() { echo "systemctl $*" >>"$failure_log"; return 0; }
 enable_boot() { echo enable >>"$failure_log"; return "${ENABLE_FAILURE:-0}"; }
 enable_boot_deferred() { echo enable-deferred >>"$failure_log"; return "${DEFER_FAILURE:-0}"; }
 mark_pending_reboot() {
@@ -451,31 +539,30 @@ set +e
 install_or_update
 rc=$?
 set -e
-[[ $rc == 19 ]]
-grep -q '^enable-deferred$' "$failure_log"
-grep -q '^dkms install -m tcp-brutal-custom -v 2.1.0.custom.1111111 .* --force$' "$failure_log"
+[[ $rc == 1 ]]
+! grep -q '^enable-deferred$' "$failure_log"
 ! grep -q '^mark-pending$' "$failure_log"
 [[ ! -e $PENDING_REBOOT ]]
 grep -qx 'old tbc' "$MANAGER"
 grep -qx 'old brutal-manager' "$LEGACY_MANAGER"
 
 : >"$failure_log"
-DEFER_FAILURE=0
+RMMOD_FAILURE=0 DEFER_FAILURE=0
 set +e
 install_or_update
 rc=$?
 set -e
 [[ $rc == 0 ]]
 [[ $(grep -c '^rmmod$' "$failure_log") == 1 ]]
-[[ $(grep -E '^(build|dkms install|install-manager|write-service|rmmod|save|mark-pending|enable-deferred)' "$failure_log" | paste -sd' ') == 'build dkms install -m tcp-brutal-custom -v 2.5.3.custom.2222222 install-manager write-service rmmod save enable-deferred mark-pending' ]]
-[[ $(cat "$PENDING_REBOOT") == 2.5.3.custom.2222222 ]]
+[[ $(grep -E '^(build|dkms install|install-manager|write-service|rmmod|apply|aggregate|save|enable)' "$failure_log" | paste -sd' ') == 'build dkms install -m tcp-brutal-custom -v 2.5.3.custom.2222222 install-manager write-service rmmod apply aggregate save enable' ]]
+[[ ! -e $PENDING_REBOOT ]]
 grep -q '^dkms install -m tcp-brutal-custom -v 2.5.3.custom.2222222$' "$failure_log"
-! grep -q '^apply$' "$failure_log"
-! grep -q '^enable$' "$failure_log"
+grep -q '^apply$' "$failure_log"
+grep -q '^enable$' "$failure_log"
 
 : >"$failure_log"
 rm -f "$PENDING_REBOOT"
-UPSTREAM_PRESENT=1
+UPSTREAM_PRESENT=1 RMMOD_FAILURE=15
 set +e
 install_or_update
 rc=$?

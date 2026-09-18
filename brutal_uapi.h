@@ -21,6 +21,7 @@
 #define BRUTAL_CAP_PREFIX_INDEX (1ULL << 6)
 #define BRUTAL_CAP_KERNEL_AGGREGATE (1ULL << 7)
 #define BRUTAL_CAP_GENL (1ULL << 8)
+#define BRUTAL_CAP_PORT_STATS (1ULL << 9)
 
 struct brutal_info_v1
 {

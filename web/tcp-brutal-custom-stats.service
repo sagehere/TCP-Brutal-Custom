@@ -1,0 +1,6 @@
+[Unit]
+Description=TCP Brutal Custom traffic statistics collector
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/tcp-brutal-custom/tbc_stats.py

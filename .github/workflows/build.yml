@@ -77,6 +77,7 @@ jobs:
           P2_DRY_RUN=1 bash tests/pacer-contention.sh
           cc -O2 -Wall -Wextra -Werror -o /tmp/app-group-netns tests/app-group-netns.c
           bash tests/install-manager-test.sh
+          bash tests/web-panel-test.sh
           bash tests/release-chain-test.sh
           release_test_dir=$(mktemp -d)
           release_test_dir_2=$(mktemp -d)

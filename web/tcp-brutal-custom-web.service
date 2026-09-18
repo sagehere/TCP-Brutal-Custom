@@ -1,0 +1,14 @@
+[Unit]
+Description=TCP Brutal Custom local web panel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/tcp-brutal-custom/tbc_web.py
+Restart=on-failure
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

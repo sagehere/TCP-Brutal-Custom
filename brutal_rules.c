@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/xarray.h>
 #include <net/ipv6.h>
+#include <net/inet_sock.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 #include "brutal.h"
@@ -51,6 +52,13 @@ struct brutal_rule
     bool perip;
 };
 
+struct brutal_port_stats
+{
+    atomic64_t sent_bytes;
+    atomic64_t retrans_bytes;
+    bool selected;
+};
+
 struct brutal_net
 {
     struct net *net;
@@ -64,6 +72,7 @@ struct brutal_net
     u32 v4_prefix_counts[33];
     u32 v6_prefix_counts[129];
     struct xarray rules_by_id;
+    struct xarray port_stats;
     unsigned long rule_next_id;
     atomic64_t peer_alloc_failures;
     atomic64_t peer_insert_failures;
@@ -107,6 +116,45 @@ static unsigned int brutal_net_id;
 static struct brutal_net *brutal_pernet(struct net *net)
 {
     return net_generic(net, brutal_net_id);
+}
+
+void brutal_port_stats_track(struct sock *sk, struct brutal *brutal)
+{
+    struct brutal_net *bn = brutal_pernet(sock_net(sk));
+    struct brutal_port_stats *stats;
+    u16 port = ntohs(inet_sk(sk)->inet_sport);
+
+    rcu_read_lock();
+    stats = xa_load(&bn->port_stats, port);
+    if (stats && READ_ONCE(stats->selected))
+        brutal->stats_port = port;
+    rcu_read_unlock();
+    brutal->stats_bytes_sent = lower_32_bits(tcp_sk(sk)->bytes_sent);
+}
+
+void brutal_port_stats_account(struct sock *sk, struct brutal *brutal,
+                               u32 losses)
+{
+    struct brutal_net *bn;
+    struct brutal_port_stats *stats;
+    u32 now, sent;
+
+    if (!brutal->stats_port)
+        return;
+    bn = brutal_pernet(sock_net(sk));
+    now = lower_32_bits(tcp_sk(sk)->bytes_sent);
+    sent = now - brutal->stats_bytes_sent;
+    brutal->stats_bytes_sent = now;
+    rcu_read_lock();
+    stats = xa_load(&bn->port_stats, brutal->stats_port);
+    if (stats)
+    {
+        atomic64_add(sent, &stats->sent_bytes);
+        if (losses)
+            atomic64_add((u64)losses * tcp_sk(sk)->mss_cache,
+                         &stats->retrans_bytes);
+    }
+    rcu_read_unlock();
 }
 
 static void brutal_app_group_free_rcu(struct rcu_head *rcu)
@@ -1246,6 +1294,125 @@ static int brutal_stats_show(struct seq_file *m, void *v)
     return 0;
 }
 
+static int brutal_port_stats_show(struct seq_file *m, void *v)
+{
+    struct brutal_net *bn = brutal_pernet(m->private);
+    struct brutal_port_stats *stats;
+    unsigned long port;
+
+    rcu_read_lock();
+    xa_for_each(&bn->port_stats, port, stats)
+        if (READ_ONCE(stats->selected))
+            seq_printf(m, "port=%lu sent=%lld retrans=%lld\n", port,
+                       atomic64_read(&stats->sent_bytes),
+                       atomic64_read(&stats->retrans_bytes));
+    rcu_read_unlock();
+    return 0;
+}
+
+static int brutal_port_stats_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, brutal_port_stats_show, pde_data(inode));
+}
+
+static int brutal_port_stats_select(struct brutal_net *bn, unsigned long port)
+{
+    struct brutal_port_stats *stats;
+    int ret;
+
+    rcu_read_lock();
+    stats = xa_load(&bn->port_stats, port);
+    rcu_read_unlock();
+    if (!stats)
+    {
+        stats = kzalloc(sizeof(*stats), GFP_KERNEL);
+        if (!stats)
+            return -ENOMEM;
+        ret = xa_err(xa_store(&bn->port_stats, port, stats, GFP_KERNEL));
+        if (ret)
+        {
+            kfree(stats);
+            return ret;
+        }
+    }
+    WRITE_ONCE(stats->selected, true);
+    return 0;
+}
+
+static ssize_t brutal_port_stats_write(struct file *file,
+                                       const char __user *ubuf, size_t len,
+                                       loff_t *off)
+{
+    struct brutal_net *bn = brutal_pernet(pde_data(file_inode(file)));
+    char *buf, *item, *cursor;
+    struct brutal_port_stats *stats;
+    unsigned long index, lo, hi, port;
+    int ret = 0;
+
+    if (!ns_capable(bn->net->user_ns, CAP_NET_ADMIN))
+        return -EPERM;
+    if (!len || len > 4096)
+        return -EINVAL;
+    buf = memdup_user_nul(ubuf, len);
+    if (IS_ERR(buf))
+        return PTR_ERR(buf);
+    cursor = strim(buf);
+    if (!strncmp(cursor, "ports=", 6))
+        cursor += 6;
+    else
+        ret = -EINVAL;
+    mutex_lock(&bn->rules_mutex);
+    if (!ret)
+        xa_for_each(&bn->port_stats, index, stats)
+            WRITE_ONCE(stats->selected, false);
+    if (!ret && !*cursor)
+        goto done;
+    while (!ret && (item = strsep(&cursor, ",")) != NULL)
+    {
+        char *dash = strchr(item, '-');
+
+        if (!*item)
+        {
+            ret = -EINVAL;
+            break;
+        }
+        if (dash)
+        {
+            *dash++ = 0;
+            ret = kstrtoul(dash, 10, &hi);
+        }
+        else
+            hi = 0;
+        if (!ret)
+            ret = kstrtoul(item, 10, &lo);
+        if (ret || !lo || lo > 65535 || (hi && (hi < lo || hi > 65535)))
+        {
+            ret = -EINVAL;
+            break;
+        }
+        if (!hi)
+            hi = lo;
+        for (port = lo; port <= hi; port++)
+        {
+            ret = brutal_port_stats_select(bn, port);
+            if (ret)
+                break;
+        }
+    }
+done:
+    mutex_unlock(&bn->rules_mutex);
+    kfree(buf);
+    return ret ? ret : len;
+}
+
+static const struct proc_ops brutal_port_stats_proc_ops = {
+    .proc_open = brutal_port_stats_open,
+    .proc_read = seq_read,
+    .proc_write = brutal_port_stats_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
 static int brutal_limits_show(struct seq_file *m, void *v)
 {
     struct brutal_net *bn = brutal_pernet(m->private);
@@ -1317,6 +1484,7 @@ static int __net_init brutal_net_init(struct net *net)
     bn->net = net;
     INIT_LIST_HEAD(&bn->rules);
     xa_init(&bn->rules_by_id);
+    xa_init(&bn->port_stats);
     bitmap_zero(bn->v4_prefixes, 33);
     bitmap_zero(bn->v6_prefixes, 129);
     mutex_init(&bn->rules_mutex);
@@ -1350,12 +1518,14 @@ static int __net_init brutal_net_init(struct net *net)
     if (!dir ||
         !proc_create_data("peers", 0444, dir, &brutal_peers_proc_ops, net) ||
         !proc_create_net_single("stats", 0444, dir, brutal_stats_show, NULL) ||
+        !proc_create_data("port_stats", 0644, dir, &brutal_port_stats_proc_ops, net) ||
         !proc_create_data("limits", 0644, dir, &brutal_limits_proc_ops, net) ||
         !proc_create_net_single("version", 0444, dir, brutal_version_show, NULL) ||
         !proc_create_data("rules", 0644, dir, &brutal_rules_proc_ops, net))
     {
         remove_proc_subtree("tcp_brutal", net->proc_net);
         xa_destroy(&bn->rules_by_id);
+        xa_destroy(&bn->port_stats);
         rhashtable_destroy(&bn->app_groups);
         rhashtable_destroy(&bn->prefixes);
         rhashtable_destroy(&bn->exact_hosts);
@@ -1369,6 +1539,14 @@ static void __net_exit brutal_net_exit(struct net *net)
     struct brutal_net *bn = brutal_pernet(net);
 
     brutal_rules_flush(bn);
+    {
+        struct brutal_port_stats *stats;
+        unsigned long port;
+
+        xa_for_each(&bn->port_stats, port, stats)
+            kfree(stats);
+    }
+    xa_destroy(&bn->port_stats);
     xa_destroy(&bn->rules_by_id);
     remove_proc_subtree("tcp_brutal", net->proc_net);
     rhashtable_destroy(&bn->app_groups);

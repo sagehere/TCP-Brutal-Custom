@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect TCP Brutal traffic statistics every five seconds
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
