@@ -4,9 +4,9 @@ TCP Brutal 的独立自定义版，提供按对端 IP 分组的速率控制、�
 
 本项目基于 [HyNetworks/tcp-brutal](https://github.com/HyNetworks/tcp-brutal)，将 Hysteria 的 Brutal 拥塞控制算法实现为 Linux TCP 内核模块，并新增 `perip` 规则模式：每个对端 IP 独立拥有一份带宽，而同一 IP 建立的多条 TCP 连接仍共享该带宽。
 
-## Hot module replacement
+## 2.5.4
 
-Configure the systemd services that own Brutal connections with `sudo tbc hotplug-services sing-box.service nginx.service`. On a busy module, update, migration, and uninstall temporarily stop only configured active services and their active socket units, wait up to 15 seconds, then restore their previous state. Connections reconnect briefly, but a server reboot is not required. `tbc hotplug-services` shows the list and `--clear` removes it.
+2.5.4 adds hot module replacement and the local Web management panel. Configure the systemd services that own Brutal connections with `sudo tbc hotplug-services sing-box.service nginx.service`. On a busy module, update, migration, and uninstall temporarily stop only configured active services and their active socket units, wait up to 15 seconds, then restore their previous state. Connections reconnect briefly, but a server reboot is not required. `tbc hotplug-services` shows the list and `--clear` removes it.
 
 ## 2.4.0
 

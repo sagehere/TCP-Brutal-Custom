@@ -22,6 +22,8 @@ bash <(curl -fsSL https://tcp.hy2.sh/)
 curl -fsSL https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh | sudo -E bash
 ```
 
+当前 `2.5.4` 版包含模块热插拔和本机 Web 管理面板；安装后运行 `sudo tbc`，菜单中可直接配置两项功能。
+
 脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo tbc` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status`、`view [--watch]`、`hotplug-services` 和 `uninstall` 子命令。旧命令 `sudo brutal-manager` 仍作为兼容入口。菜单输入 `0` 退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块与规则。配置热插拔服务后，普通 Custom 更新及上游迁移遇到连接占用会短暂停止这些服务、重载模块并恢复服务，无需重启。
 
 该脚本会通过 DKMS 安装内核模块，并将 `brutalctl` 工具安装到 `/usr/local/bin`。需要 Linux 5.10 或更高版本。
