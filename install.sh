@@ -15,8 +15,14 @@ MANAGER="/usr/local/bin/tbc"
 LEGACY_MANAGER="/usr/local/bin/brutal-manager"
 BRUTALCTL="/usr/local/bin/brutalctl"
 SERVICE="/etc/systemd/system/tcp-brutal-custom.service"
+WEB_SERVICE="/etc/systemd/system/tcp-brutal-custom-web.service"
+STATS_SERVICE="/etc/systemd/system/tcp-brutal-custom-stats.service"
+STATS_TIMER="/etc/systemd/system/tcp-brutal-custom-stats.timer"
+WEB_CONFIG="/etc/tcp-brutal-custom-web.conf"
+WEB_DIR="/usr/local/lib/tcp-brutal-custom"
 MODULES_LOAD="/etc/modules-load.d/brutal.conf"
 STATE_DIR="/var/lib/tcp-brutal-custom"
+HOTPLUG_LOCK="/run/lock/tcp-brutal-custom.lock"
 DKMS_SOURCE_ROOT=${DKMS_SOURCE_ROOT:-/usr/src}
 PENDING_REBOOT="$STATE_DIR/reboot-required"
 CLEANUP_REQUIRED="$STATE_DIR/cleanup-required"
@@ -34,6 +40,7 @@ IPV6_RATE=80
 MODE=auto
 TCP_PORTS=""
 AGGREGATE_RATE=0
+HOTPLUG_SERVICES=""
 COMMIT=""
 VERSION=""
 MANAGED=0
@@ -66,18 +73,19 @@ check_platform() {
 }
 
 load_config() {
-  IPV4_RATE=80; IPV6_RATE=80; MODE=auto; TCP_PORTS=""; AGGREGATE_RATE=0; COMMIT=""; VERSION=""; MANAGED=0
+  IPV4_RATE=80; IPV6_RATE=80; MODE=auto; TCP_PORTS=""; AGGREGATE_RATE=0; HOTPLUG_SERVICES=""; COMMIT=""; VERSION=""; MANAGED=0
   [[ -f $CONFIG ]] || return 0
   local key value
   while IFS='=' read -r key value; do
     case $key in
-      IPV4_RATE|IPV6_RATE|MODE|TCP_PORTS|AGGREGATE_RATE|COMMIT|VERSION|MANAGED) printf -v "$key" '%s' "$value" ;;
+      IPV4_RATE|IPV6_RATE|MODE|TCP_PORTS|AGGREGATE_RATE|HOTPLUG_SERVICES|COMMIT|VERSION|MANAGED) printf -v "$key" '%s' "$value" ;;
     esac
   done <"$CONFIG"
   valid_rate "$IPV4_RATE" && valid_rate "$IPV6_RATE" || die "配置文件中的速率无效：$CONFIG"
   [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "配置文件中的地址族模式无效：$CONFIG"
   TCP_PORTS=$(normalize_ports "$TCP_PORTS") || die "配置文件中的 TCP 端口无效：$CONFIG"
   [[ $AGGREGATE_RATE == 0 ]] || valid_rate "$AGGREGATE_RATE" || die "配置文件中的总出口速率无效：$CONFIG"
+  HOTPLUG_SERVICES=$(normalize_hotplug_services "$HOTPLUG_SERVICES") || die "配置文件中的热插拔服务列表无效：$CONFIG"
   [[ $MANAGED == 1 ]] || die "配置文件中的管理标记无效：$CONFIG"
   [[ -z $COMMIT || $COMMIT =~ ^[0-9a-f]{40}$ ]] || die "配置文件中的提交号无效：$CONFIG"
   [[ -z $VERSION ]] || valid_custom_version "$VERSION" || die "配置文件中的版本号无效：$CONFIG"
@@ -92,6 +100,7 @@ IPV6_RATE=$IPV6_RATE
 MODE=$MODE
 TCP_PORTS=$TCP_PORTS
 AGGREGATE_RATE=$AGGREGATE_RATE
+HOTPLUG_SERVICES=$HOTPLUG_SERVICES
 COMMIT=$COMMIT
 VERSION=$VERSION
 MANAGED=1
@@ -127,6 +136,79 @@ normalize_ports() {
     }
     print out
   }'
+}
+
+valid_hotplug_service() {
+  [[ $1 =~ ^[A-Za-z0-9_.:@-]+\.service$ ]] || return 1
+  [[ $1 != tcp-brutal-custom.service && $1 != tcp-brutal-custom-web.service && $1 != tcp-brutal-custom-stats.service ]]
+}
+
+normalize_hotplug_services() {
+  local raw=$1 service
+  local -a services=()
+  local -A seen=()
+  [[ -n $raw ]] || { printf '\n'; return 0; }
+  [[ $raw != ,* && $raw != *, && $raw != *,,* ]] || return 1
+  IFS=, read -r -a services <<<"$raw"
+  for service in "${services[@]}"; do
+    valid_hotplug_service "$service" || return 1
+    [[ ${seen[$service]+yes} ]] && return 1
+    seen[$service]=1
+  done
+  (IFS=,; printf '%s\n' "${services[*]}")
+}
+
+hotplug_service_list() {
+  local service
+  local -a services=()
+  IFS=, read -r -a services <<<"${HOTPLUG_SERVICES:-}"
+  for service in "${services[@]}"; do
+    [[ -n $service ]] && printf '%s\n' "$service"
+  done
+}
+
+set_hotplug_services() {
+  need_root; load_config
+  case ${1:-} in
+    "")
+      if [[ -z $HOTPLUG_SERVICES ]]; then
+        echo "热插拔服务: 未配置"
+      else
+        echo "热插拔服务:"
+        hotplug_service_list
+      fi
+      return 0
+      ;;
+    --clear)
+      [[ $# == 1 ]] || die "用法: tbc hotplug-services [服务名...] | --clear"
+      HOTPLUG_SERVICES=""
+      save_config
+      note "热插拔服务已清空。"
+      return 0
+      ;;
+  esac
+  local raw state service
+  raw=$(IFS=,; printf '%s' "$*")
+  HOTPLUG_SERVICES=$(normalize_hotplug_services "$raw") || die "服务名无效、重复，或不允许停止管理器自身服务。"
+  while IFS= read -r service; do
+    state=$(systemctl show -p LoadState --value "$service" 2>/dev/null || true)
+    [[ -n $state && $state != not-found ]] || die "找不到 systemd 服务：$service"
+  done < <(hotplug_service_list)
+  save_config
+  note "热插拔服务已更新：$HOTPLUG_SERVICES"
+}
+
+configure_hotplug_services() {
+  local answer
+  need_root; load_config
+  read_tty "热插拔时临时停止的 systemd 服务（空格分隔；none 清空）[$HOTPLUG_SERVICES]: " answer
+  answer=${answer:-$HOTPLUG_SERVICES}
+  case ${answer,,} in none|off|clear|0) set_hotplug_services --clear ;; *)
+    local -a services=()
+    read -r -a services <<<"$answer"
+    set_hotplug_services "${services[@]}"
+    ;;
+  esac
 }
 
 valid_custom_version() {
@@ -205,8 +287,10 @@ install_dependencies() {
   ca_certificates_installed || packages+=(ca-certificates)
   have ip || packages+=(iproute2)
   have tc || packages+=(iproute2)
+  have flock || packages+=(util-linux)
   have make || packages+=(make)
   have tar || packages+=(tar)
+  have python3 || packages+=(python3)
   if clang_kernel; then
     have clang || packages+=(clang)
     have ld.lld || packages+=(lld)
@@ -231,7 +315,7 @@ install_dependencies() {
     note "所需依赖已安装，跳过软件包安装"
   fi
 
-  have dkms && have curl && have ip && have tc && have make && have tar || die "必要工具安装不完整。"
+  have dkms && have curl && have ip && have tc && have flock && have make && have tar && have python3 || die "必要工具安装不完整。"
   if clang_kernel; then
     have clang && have ld.lld && have llvm-objcopy || die "当前内核需要完整的 LLVM 工具链。"
   else
@@ -243,6 +327,20 @@ install_dependencies() {
 
 module_loaded() { lsmod | awk '$1 == "brutal" { found=1 } END { exit !found }'; }
 module_supports_peers() { [[ -r $PEERS_PROC ]]; }
+module_supports_port_stats() { [[ -w /proc/net/tcp_brutal/port_stats ]]; }
+
+sync_port_stats() {
+  module_supports_port_stats || return 0
+  "$BRUTALCTL" port-stats "$TCP_PORTS" >/dev/null
+}
+
+read_password() {
+  local prompt=$1 variable=$2
+  [[ -r /dev/tty ]] || die "当前没有可用的交互终端。"
+  printf '%s' "$prompt" >&2
+  IFS= read -rs "$variable" </dev/tty || die "无法从交互终端读取密码。"
+  printf '\n' >&2
+}
 
 mark_pending_reboot() {
   local cleanup_upstream=${1:-0}
@@ -402,8 +500,14 @@ install_manager() {
   install -Dm755 "$source/install.sh" "$MANAGER"
   ln -sfn "$MANAGER" "$LEGACY_MANAGER"
   install -Dm755 "$source/tools/brutalctl" "$BRUTALCTL"
+  install -Dm755 "$source/web/tbc_web.py" "$WEB_DIR/tbc_web.py"
+  install -Dm755 "$source/web/tbc_stats.py" "$WEB_DIR/tbc_stats.py"
+  install -Dm644 "$source/web/tcp-brutal-custom-web.service" "$WEB_SERVICE"
+  install -Dm644 "$source/web/tcp-brutal-custom-stats.service" "$STATS_SERVICE"
+  install -Dm644 "$source/web/tcp-brutal-custom-stats.timer" "$STATS_TIMER"
   install -d -m 0755 "$STATE_DIR"
   cp -a "$source/." "$STATE_DIR/source-$VERSION"
+  systemctl daemon-reload
 }
 
 build_dkms() {
@@ -774,6 +878,119 @@ reset_port_policy() {
   ip -6 route flush table "$PORT_TABLE" >/dev/null 2>&1 || true
 }
 
+HOTPLUG_PAUSED=0
+HOTPLUG_PORT_SNAPSHOT=""
+HOTPLUG_PORT_POLICY_PAUSED=0
+HOTPLUG_SERVICES_STARTED=()
+HOTPLUG_SOCKETS_STARTED=()
+
+acquire_hotplug_lock() {
+  install -d -m 0755 "${HOTPLUG_LOCK%/*}"
+  have flock || die "缺少 flock，无法安全执行模块热插拔。"
+  exec {HOTPLUG_LOCK_FD}>"$HOTPLUG_LOCK"
+  flock -n "$HOTPLUG_LOCK_FD" || die "已有安装、更新或卸载操作正在进行。"
+}
+
+hotplug_report_busy() {
+  local refs
+  refs=$(awk '$1 == "brutal" { print $3; exit }' /proc/modules 2>/dev/null || true)
+  echo "错误: brutal 模块仍被占用（引用计数：${refs:-未知}）。" >&2
+  [[ -n ${HOTPLUG_SERVICES:-} ]] && echo "已尝试暂停: $HOTPLUG_SERVICES" >&2
+  if have ss; then
+    ss -tinp 2>/dev/null | awk '/brutal/ { print "占用连接: " $0 }' >&2 || true
+  fi
+  echo "请将持有 Brutal 连接的 systemd 服务加入 tbc hotplug-services 后重试；不会强制卸载或终止其他进程。" >&2
+}
+
+hotplug_remember_socket() {
+  local socket=$1 known
+  [[ $socket =~ ^[A-Za-z0-9_.:@-]+\.socket$ ]] || return 0
+  for known in "${HOTPLUG_SOCKETS_STARTED[@]}"; do
+    [[ $known == "$socket" ]] && return 0
+  done
+  systemctl is-active --quiet "$socket" && HOTPLUG_SOCKETS_STARTED+=("$socket")
+}
+
+hotplug_pause_services() {
+  local service socket
+  (( HOTPLUG_PAUSED )) && return 0
+  [[ -n ${HOTPLUG_SERVICES:-} ]] || { hotplug_report_busy; return 1; }
+  HOTPLUG_SERVICES_STARTED=()
+  HOTPLUG_SOCKETS_STARTED=()
+  HOTPLUG_PORT_POLICY_PAUSED=0
+  while IFS= read -r service; do
+    systemctl is-active --quiet "$service" && HOTPLUG_SERVICES_STARTED+=("$service")
+    while IFS= read -r socket; do
+      hotplug_remember_socket "$socket"
+    done < <(systemctl show -p TriggeredBy --value "$service" 2>/dev/null | tr ' ' '\n')
+  done < <(hotplug_service_list)
+  HOTPLUG_PORT_SNAPSHOT=$(mktemp -d)
+  if [[ -n $TCP_PORTS ]] && ! snapshot_port_policy "$HOTPLUG_PORT_SNAPSHOT"; then
+    rm -rf "$HOTPLUG_PORT_SNAPSHOT"
+    HOTPLUG_PORT_SNAPSHOT=""
+    echo "错误: 无法备份端口策略，拒绝中断业务服务。" >&2
+    return 1
+  fi
+  HOTPLUG_PAUSED=1
+  for socket in "${HOTPLUG_SOCKETS_STARTED[@]}"; do
+    if ! systemctl stop "$socket"; then
+      echo "错误: 无法停止 socket 激活单元：$socket" >&2
+      hotplug_resume_services 1 || true
+      return 1
+    fi
+  done
+  for service in "${HOTPLUG_SERVICES_STARTED[@]}"; do
+    if ! systemctl stop "$service"; then
+      echo "错误: 无法停止服务：$service" >&2
+      hotplug_resume_services 1 || true
+      return 1
+    fi
+  done
+  if [[ -n $TCP_PORTS ]] && ! reset_port_policy; then
+    echo "错误: 无法暂停受管端口策略。" >&2
+    hotplug_resume_services 1 || true
+    return 1
+  fi
+  [[ -z $TCP_PORTS ]] || HOTPLUG_PORT_POLICY_PAUSED=1
+}
+
+hotplug_resume_services() {
+  local restore_policy=${1:-0} service socket failed=0
+  (( HOTPLUG_PAUSED )) || return 0
+  if (( restore_policy && HOTPLUG_PORT_POLICY_PAUSED )) && [[ -n $HOTPLUG_PORT_SNAPSHOT ]]; then
+    restore_port_policy "$HOTPLUG_PORT_SNAPSHOT" || { echo "警告: 无法恢复热插拔前的端口策略。" >&2; failed=1; }
+  fi
+  for socket in "${HOTPLUG_SOCKETS_STARTED[@]}"; do
+    systemctl start "$socket" || { echo "警告: 无法恢复 socket 激活单元：$socket" >&2; failed=1; }
+  done
+  for service in "${HOTPLUG_SERVICES_STARTED[@]}"; do
+    systemctl start "$service" || { echo "警告: 无法恢复服务：$service" >&2; failed=1; }
+  done
+  [[ -z $HOTPLUG_PORT_SNAPSHOT ]] || rm -rf "$HOTPLUG_PORT_SNAPSHOT"
+  HOTPLUG_PORT_SNAPSHOT=""
+  HOTPLUG_PORT_POLICY_PAUSED=0
+  HOTPLUG_PAUSED=0
+  HOTPLUG_SERVICES_STARTED=()
+  HOTPLUG_SOCKETS_STARTED=()
+  return "$failed"
+}
+
+hotplug_unload_module() {
+  local deadline
+  module_loaded || return 0
+  rmmod brutal && return 0
+  hotplug_pause_services || return 1
+  deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    rmmod brutal && return 0
+    sleep 1
+  done
+  rmmod brutal && return 0
+  hotplug_report_busy
+  hotplug_resume_services 1 || true
+  return 1
+}
+
 apply_port_rules() {
   local dry_run=${1:-0} normalized applied=0 family pref spec snapshot="" current_fingerprint
   local -a specs=()
@@ -808,6 +1025,7 @@ apply_port_rules() {
     return 1
   fi
   if [[ -z $TCP_PORTS ]]; then
+    sync_port_stats || return 1
     rm -rf "$snapshot"
     return 0
   fi
@@ -850,6 +1068,7 @@ apply_port_rules() {
     return 1
   fi
   rm -rf "$snapshot"
+  sync_port_stats || return 1
 }
 
 ports_check() {
@@ -1017,8 +1236,12 @@ set_aggregate() {
   need_root; load_config
   [[ $MANAGED == 1 ]] || die "请先安装。"
   local answer old=$AGGREGATE_RATE
-  read_tty "总出口上限 Mbps [$AGGREGATE_RATE]（输入 none/off/0 关闭）: " answer
-  answer=${answer:-$AGGREGATE_RATE}
+  if [[ -n ${1:-} ]]; then
+    answer=$1
+  else
+    read_tty "总出口上限 Mbps [$AGGREGATE_RATE]（输入 none/off/0 关闭）: " answer
+    answer=${answer:-$AGGREGATE_RATE}
+  fi
   case ${answer,,} in none|off|clear|0) answer=0 ;; esac
   [[ $answer == 0 ]] || valid_rate "$answer" || die "速率必须为 0（关闭）或 0.5 到 1000000 Mbps。"
   [[ $answer != "$AGGREGATE_RATE" ]] || { note "总出口配置未变化。"; return 0; }
@@ -1058,6 +1281,64 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+}
+
+web_password_hash() {
+  WEB_PASSWORD="$1" python3 - <<'PY'
+import base64, hashlib, os
+password = os.environ['WEB_PASSWORD'].encode()
+salt = os.urandom(16)
+digest = hashlib.pbkdf2_hmac('sha256', password, salt, 200000)
+print('200000$%s$%s' % (base64.b64encode(salt).decode(), base64.b64encode(digest).decode()))
+PY
+}
+
+save_web_config() {
+  local port=$1 user=$2 password=$3 hash
+  [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "Web 面板端口无效。"
+  [[ $user =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || die "管理员账户只能使用字母、数字、点、下划线和短横线。"
+  (( ${#password} >= 12 )) || die "管理员密码至少需要 12 个字符。"
+  hash=$(web_password_hash "$password") || die "无法生成管理员密码摘要。"
+  umask 077
+  printf 'PORT=%s\nUSER=%s\nPASSWORD_HASH=%s\n' "$port" "$user" "$hash" >"$WEB_CONFIG.tmp"
+  mv "$WEB_CONFIG.tmp" "$WEB_CONFIG"
+  chmod 600 "$WEB_CONFIG"
+}
+
+web_setup() {
+  need_root
+  local port=8080 user=admin password password2
+  [[ -r $WEB_CONFIG ]] && {
+    port=$(sed -n 's/^PORT=//p' "$WEB_CONFIG" | head -n1)
+    user=$(sed -n 's/^USER=//p' "$WEB_CONFIG" | head -n1)
+  }
+  read_tty "Web 面板本机端口 [$port]: " port
+  port=${port:-8080}
+  read_tty "Web 管理员账户 [$user]: " user
+  user=${user:-admin}
+  read_password "Web 管理员密码（至少 12 位）: " password
+  read_password "再次输入密码: " password2
+  [[ $password == "$password2" ]] || die "两次输入的密码不一致。"
+  save_web_config "$port" "$user" "$password"
+  systemctl enable --now tcp-brutal-custom-stats.timer
+  systemctl enable --now tcp-brutal-custom-web.service
+  note "Web 面板已开启：http://127.0.0.1:$port/（请通过反向代理或 SSH 隧道访问）"
+}
+
+web_disable() {
+  need_root
+  systemctl disable --now tcp-brutal-custom-web.service 2>/dev/null || true
+  note "Web 面板已关闭；管理员配置和统计数据仍会保留。"
+}
+
+web_status() {
+  local port=8080 user=admin
+  [[ -r $WEB_CONFIG ]] && {
+    port=$(sed -n 's/^PORT=//p' "$WEB_CONFIG" | head -n1)
+    user=$(sed -n 's/^USER=//p' "$WEB_CONFIG" | head -n1)
+  }
+  systemctl is-active --quiet tcp-brutal-custom-web.service && echo "Web 面板: 已开启（127.0.0.1:$port，账户 $user）" || echo "Web 面板: 未开启"
+  systemctl is-active --quiet tcp-brutal-custom-stats.timer && echo "流量采集: 已开启" || echo "流量采集: 未开启"
 }
 
 enable_boot() {
@@ -1145,6 +1426,9 @@ install_or_update() (
         systemctl disable --now tcp-brutal-custom.service >/dev/null 2>&1 || true
       fi
     fi
+    if (( HOTPLUG_PAUSED )); then
+      hotplug_resume_services 1 || echo "警告: 热插拔回滚后仍有服务未能恢复。" >&2
+    fi
     [[ -z $temp ]] || rm -rf "$temp"
     exit "$rc"
   }
@@ -1159,6 +1443,7 @@ install_or_update() (
     confirm "检测到旧 TCP Brutal 安装，将在新模块构建成功后迁移，是否继续？" || return 0
   fi
   install_dependencies
+  acquire_hotplug_lock
   temp=$(mktemp -d)
   if [[ -f $CONFIG ]]; then cp -a "$CONFIG" "$temp/old-config"; had_config=1; fi
   if [[ -f $MANAGER ]]; then cp -a "$MANAGER" "$temp/old-manager"; had_manager=1; fi
@@ -1196,7 +1481,7 @@ install_or_update() (
   write_service
   if (( needs_migration )); then
     if module_loaded; then
-      rmmod brutal || die "上游 Brutal 模块正在使用，无法安全迁移；请结束使用该模块的连接后重试。"
+      hotplug_unload_module || die "上游 Brutal 模块仍被占用，无法安全迁移。"
     fi
     switch_needed=1
     if (( has_upstream )) && ! remove_upstream_dkms; then
@@ -1205,14 +1490,7 @@ install_or_update() (
   fi
   if (( ! needs_migration )); then
     if module_loaded && { [[ $VERSION != "$old_version" ]] || [[ -f $PENDING_REBOOT ]]; }; then
-      if ! rmmod brutal; then
-        save_config
-        enable_boot_deferred
-        mark_pending_reboot "$has_upstream"
-        switch_complete=1
-        note "更新已暂存，现有连接继续使用旧模块；请重启服务器完成更新。"
-        return 0
-      fi
+      hotplug_unload_module || die "Brutal 模块仍被占用，无法完成热更新。"
       switch_needed=1
     elif ! module_loaded; then
       switch_needed=1
@@ -1230,8 +1508,10 @@ install_or_update() (
   fi
   module_supports_peers || die "新模块缺少活跃 IP 视图接口。"
   save_config
+  systemctl enable --now tcp-brutal-custom-stats.timer
   enable_boot
   rm -f "$PENDING_REBOOT"
+  hotplug_resume_services 0 || echo "警告: 模块已更新，但部分热插拔服务未能恢复。" >&2
   switch_complete=1
   remove_old_custom_dkms "$VERSION" || echo "警告: 旧版 Custom DKMS 清理失败，可稍后重新执行更新。" >&2
   note "TCP Brutal Custom 安装完成。"
@@ -1241,11 +1521,20 @@ set_rate() {
   need_root; load_config
   [[ $MANAGED == 1 ]] || die "请先安装。"
   local answer old_mode=$MODE old_ipv4=$IPV4_RATE old_ipv6=$IPV6_RATE
-  read_tty "地址族模式 [auto/ipv4/ipv6/dual] [$MODE]: " answer
-  MODE=${answer:-$MODE}
+  if [[ -n ${1:-} || -n ${2:-} ]]; then
+    IPV4_RATE=${1:-$IPV4_RATE}
+    IPV6_RATE=${2:-$IPV6_RATE}
+    MODE=${3:-$MODE}
+  else
+    read_tty "地址族模式 [auto/ipv4/ipv6/dual] [$MODE]: " answer
+    MODE=${answer:-$MODE}
+  fi
   [[ $MODE =~ ^(auto|ipv4|ipv6|dual)$ ]] || die "无效模式。"
-  IPV4_RATE=$(ask_rate IPv4 "$IPV4_RATE")
-  IPV6_RATE=$(ask_rate IPv6 "$IPV6_RATE")
+  if [[ -z ${1:-} && -z ${2:-} ]]; then
+    IPV4_RATE=$(ask_rate IPv4 "$IPV4_RATE")
+    IPV6_RATE=$(ask_rate IPv6 "$IPV6_RATE")
+  fi
+  valid_rate "$IPV4_RATE" && valid_rate "$IPV6_RATE" || die "速率无效。"
   if ! apply_configured_rules || ! apply_port_rules || ! apply_aggregate_cap; then
     MODE=$old_mode; IPV4_RATE=$old_ipv4; IPV6_RATE=$old_ipv6
     apply_configured_rules || true
@@ -1261,8 +1550,12 @@ set_ports() {
   need_root; load_config
   [[ $MANAGED == 1 ]] || die "请先安装。"
   local answer normalized old_ports=$TCP_PORTS
-  read_tty "Brutal TCP 端口 [$TCP_PORTS]（如 443,8443,10000-10100；输入 none 清除）: " answer
-  answer=${answer:-$TCP_PORTS}
+  if [[ -n ${1:-} ]]; then
+    answer=$1
+  else
+    read_tty "Brutal TCP 端口 [$TCP_PORTS]（如 443,8443,10000-10100；输入 none 清除）: " answer
+    answer=${answer:-$TCP_PORTS}
+  fi
   case ${answer,,} in none|off|clear|0) answer="" ;; esac
   normalized=$(normalize_ports "$answer") || die "端口格式无效；支持单端口、逗号分隔和端口范围。"
   [[ $normalized != "$TCP_PORTS" ]] || { note "端口配置未变化。"; return 0; }
@@ -1290,6 +1583,8 @@ status() {
   echo "配置速率: IPv4 ${IPV4_RATE} Mbps，IPv6 ${IPV6_RATE} Mbps"
   echo "Brutal TCP 端口: ${TCP_PORTS:-未配置}"
   echo "总出口保护: $([[ $AGGREGATE_RATE == 0 ]] && echo 已关闭 || echo "${AGGREGATE_RATE} Mbps")"
+  echo "热插拔服务: ${HOTPLUG_SERVICES:-未配置}"
+  web_status
   show_stack
   systemctl is-enabled --quiet tcp-brutal-custom.service && echo "开机启动: 已启用" || echo "开机启动: 未启用"
   module_loaded && echo "模块: 已加载" || echo "模块: 未加载"
@@ -1332,6 +1627,7 @@ uninstall() (
   set -Eeuo pipefail
   need_root; load_config
   [[ $MANAGED == 1 ]] || die "未找到本项目安装记录。"
+  acquire_hotplug_lock
   local complete=0 changed=0 old_aggregate=$AGGREGATE_RATE
   cleanup_uninstall() {
     local rc=$?
@@ -1344,6 +1640,9 @@ uninstall() (
       AGGREGATE_RATE=$old_aggregate
       apply_aggregate_cap >/dev/null 2>&1 || echo "警告: 无法恢复卸载前的总出口保护。" >&2
     fi
+    if (( HOTPLUG_PAUSED )); then
+      hotplug_resume_services 1 || echo "警告: 热插拔回滚后仍有服务未能恢复。" >&2
+    fi
     exit "$rc"
   }
   trap cleanup_uninstall EXIT
@@ -1353,19 +1652,20 @@ uninstall() (
   if [[ -n $TCP_PORTS ]]; then
     check_port_policy_conflicts_family 4 || die "端口策略存在冲突，拒绝卸载。"
     check_port_policy_conflicts_family 6 || die "端口策略存在冲突，拒绝卸载。"
-    reset_port_policy || die "清理端口策略失败。"
   fi
+  hotplug_unload_module || die "Brutal 模块仍被占用，无法安全卸载。"
+  [[ -z $TCP_PORTS ]] || reset_port_policy || die "清理端口策略失败。"
   AGGREGATE_RATE=0
   apply_aggregate_cap || die "清理总出口保护失败。"
-  if module_loaded && ! rmmod brutal; then
-    die "Brutal 模块正在使用，无法安全卸载；请结束使用该模块的连接后重试。"
-  fi
   remove_custom_dkms || die "DKMS 移除失败，已保留安装记录。"
   disable_boot
-  rm -f "$SERVICE" "$MODULES_LOAD" "$BRUTALCTL"
+  systemctl disable --now tcp-brutal-custom-web.service tcp-brutal-custom-stats.timer 2>/dev/null || true
+  rm -f "$SERVICE" "$WEB_SERVICE" "$STATS_SERVICE" "$STATS_TIMER" "$MODULES_LOAD" "$BRUTALCTL" "$WEB_CONFIG"
+  rm -rf "$WEB_DIR"
   rm -rf "$STATE_DIR" "$CONFIG"
   systemctl daemon-reload
   rm -f "$MANAGER" "$LEGACY_MANAGER"
+  hotplug_resume_services 0 || echo "警告: 卸载完成，但部分热插拔服务未能恢复。" >&2
   complete=1
   note "卸载完成。系统编译依赖和上游 TCP Brutal 安装未删除。"
 )
@@ -1398,6 +1698,9 @@ TCP Brutal Custom 管理器 v$MANAGER_VERSION
 10. 卸载
 11. 端口策略安全预检（不修改系统）
 12. 总出口保护安全预检（不修改系统）
+13. 开启或重置 Web 面板
+14. 关闭 Web 面板
+15. 设置热插拔服务
 0. 退出
 EOF
     local choice
@@ -1415,6 +1718,9 @@ EOF
       10) run_menu_action uninstall ;;
       11) run_menu_action ports_check ;;
       12) run_menu_action aggregate_check ;;
+      13) run_menu_action web_setup ;;
+      14) run_menu_action web_disable ;;
+      15) run_menu_action configure_hotplug_services ;;
       0) return ;;
       *) echo "无效选择。" ;;
     esac
@@ -1428,16 +1734,18 @@ fi
 case ${1:-menu} in
   menu) menu ;;
   install|update) install_or_update ;;
-  rate) set_rate ;;
-  ports) set_ports ;;
+  rate) set_rate "${2:-}" "${3:-}" "${4:-}" ;;
+  ports) set_ports "${2:-}" ;;
   ports-check) ports_check ;;
-  aggregate) set_aggregate ;;
+  aggregate) set_aggregate "${2:-}" ;;
   aggregate-check) aggregate_check ;;
   apply) apply_rules ;;
   enable) enable_boot ;;
   disable) disable_boot ;;
   status) status ;;
   view) shift; view "$@" ;;
+  hotplug-services) shift; set_hotplug_services "$@" ;;
+  web) case ${2:-status} in setup|on|enable) web_setup ;; off|disable) web_disable ;; status) web_status ;; *) die "用法: tbc web {setup|on|off|status}" ;; esac ;;
   uninstall) uninstall ;;
-  *) echo "用法: $0 {install|update|rate|ports|ports-check|aggregate|aggregate-check|apply|enable|disable|status|view [--watch]|uninstall}" >&2; exit 2 ;;
+  *) echo "用法: $0 {install|update|rate [IPv4 Mbps] [IPv6 Mbps]|ports [端口]|ports-check|aggregate [Mbps]|aggregate-check|apply|enable|disable|status|view [--watch]|hotplug-services [服务名...]|web {setup|on|off|status}|uninstall}" >&2; exit 2 ;;
 esac

@@ -4,6 +4,10 @@ TCP Brutal 的独立自定义版，提供按对端 IP 分组的速率控制、�
 
 本项目基于 [HyNetworks/tcp-brutal](https://github.com/HyNetworks/tcp-brutal)，将 Hysteria 的 Brutal 拥塞控制算法实现为 Linux TCP 内核模块，并新增 `perip` 规则模式：每个对端 IP 独立拥有一份带宽，而同一 IP 建立的多条 TCP 连接仍共享该带宽。
 
+## Hot module replacement
+
+Configure the systemd services that own Brutal connections with `sudo tbc hotplug-services sing-box.service nginx.service`. On a busy module, update, migration, and uninstall temporarily stop only configured active services and their active socket units, wait up to 15 seconds, then restore their previous state. Connections reconnect briefly, but a server reboot is not required. `tbc hotplug-services` shows the list and `--clear` removes it.
+
 ## 2.4.0
 
 2.4.0 新增按本地 TCP 监听端口自动启用 Brutal 的模式。管理器可通过 `tbc ports` 配置单端口、多端口或端口范围，并自动为 IPv4/IPv6 建立策略路由；未命中的端口继续使用系统默认拥塞控制算法。该模式适合 VLESS Reality、Xray、sing-box、nginx 等普通 TCP 服务，无需应用层适配。
@@ -157,6 +161,12 @@ brutalctl list
 
 仅支持 Debian/Ubuntu、systemd、Linux 5.10+ 的 x86_64/ARM64 服务器。以下命令会从最新的不可变 Release 下载安装器；安装器随后验证 Release 元数据、摘要与源码身份，再通过 DKMS 构建模块、设置每 IP 速率并启用开机恢复：
 
+### Web panel and traffic statistics
+
+After installation, run `sudo tbc` and select the Web-panel entry to choose a local port and administrator credentials. The panel listens only on `127.0.0.1`; publish it through an existing reverse proxy or SSH tunnel rather than exposing it directly.
+
+The panel manages the same settings as the terminal menu and shows active peers. The module accumulates sent and retransmitted bytes for configured TCP source ports, while a five-second collector retains daily history. Retransmission rate is retransmitted data bytes divided by total sent data bytes; retransmitted bytes are MSS-based estimates and exclude TCP/IP headers. Run `sudo brutalctl port-stats` for the current counters.
+
 ```bash
 curl -fsSL https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh | sudo -E bash
 ```
@@ -182,15 +192,18 @@ sudo tbc
 sudo tbc install
 sudo tbc rate
 sudo tbc ports
+sudo tbc hotplug-services sing-box.service nginx.service
 sudo tbc enable
 sudo tbc disable
 sudo tbc status
 sudo tbc uninstall
 ```
 
+`hotplug-services` configures the systemd services that may be restarted to release Brutal connections during an update, migration, or uninstall. Use `sudo tbc hotplug-services` to inspect the configured list, or `sudo tbc hotplug-services --clear` to remove it. Only services that were running before the operation, plus their active socket units, are restored afterward.
+
 安装和改速时可分别设置 IPv4、IPv6 的每 IP 速率，并选择 `auto`、`ipv4`、`ipv6` 或 `dual` 地址族模式。`auto` 只会为同时具备全局地址和默认路由的地址族应用规则；暂时不可用的地址族会保留配置，待下次可用时由 systemd 服务恢复。
 
-菜单提供状态、活跃 IP 快照和实时刷新，输入 `0` 退出。关闭开机启动也会关闭模块自动加载；再次开启时会恢复两者。安装或更新失败时，管理器会清理临时文件并尝试恢复原模块和规则。普通 Custom 更新遇到模块仍被 TCP 连接占用时，会保留现有连接、安装新版文件并提示重启；`status` 会显示待启用版本，重启并成功恢复规则后自动清除该状态。上游 TCP Brutal 迁移仍会安全退出。暂存期间若旧模块没有 `peers` 接口，活跃 IP 视图会直接提示重启。
+菜单提供状态、活跃 IP 快照和实时刷新，输入 `0` 退出。关闭开机启动也会关闭模块自动加载；再次开启时会恢复两者。安装或更新失败时，管理器会清理临时文件并尝试恢复原模块和规则。配置热插拔服务后，模块被 TCP 连接占用时，更新、上游迁移和卸载会短暂停止这些服务、重载模块并恢复服务，无需重启。名单外占用会安全退出并报告问题。
 
 ## P2 控制与观测接口
 

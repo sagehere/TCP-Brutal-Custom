@@ -22,9 +22,25 @@ bash <(curl -fsSL https://tcp.hy2.sh/)
 curl -fsSL https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh | sudo -E bash
 ```
 
-脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo tbc` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status`、`view [--watch]` 和 `uninstall` 子命令。旧命令 `sudo brutal-manager` 仍作为兼容入口。菜单输入 `0` 退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块与规则。普通 Custom 更新遇到模块被连接占用时，会保留现有连接并暂存新版，随后提示重启；`status` 会显示待启用版本，重启并成功恢复规则后自动清除该状态。迁移上游 TCP Brutal 时仍会安全退出，不进入暂存流程。
+脚本会直接从终端读取菜单输入。没有交互终端时，请先执行 `curl -fsSLo install.sh https://github.com/sagehere/TCP-Brutal-Custom/releases/latest/download/install.sh`，再运行 `sudo -E bash install.sh`。安装后可运行 `sudo tbc` 打开菜单，也可使用 `install`、`rate`、`enable`、`disable`、`status`、`view [--watch]`、`hotplug-services` 和 `uninstall` 子命令。旧命令 `sudo brutal-manager` 仍作为兼容入口。菜单输入 `0` 退出；关闭开机启动也会关闭模块自动加载。安装或更新失败时，脚本会尝试恢复原模块与规则。配置热插拔服务后，普通 Custom 更新及上游迁移遇到连接占用会短暂停止这些服务、重载模块并恢复服务，无需重启。
 
 该脚本会通过 DKMS 安装内核模块，并将 `brutalctl` 工具安装到 `/usr/local/bin`。需要 Linux 5.10 或更高版本。
+
+### 模块热插拔
+
+更新、迁移和卸载会先尝试直接卸载模块。若仍有 Brutal 连接占用模块，可先配置持有这些连接的 systemd 服务：
+
+```bash
+sudo tbc hotplug-services sing-box.service nginx.service
+```
+
+热替换时管理器只会临时停止名单中原本正在运行的服务及其已激活的 socket 单元，等待最多 15 秒释放连接后加载或卸载模块，再恢复原来的运行状态；因此连接会短暂重连，但无需重启服务器。用 `sudo tbc hotplug-services` 查看名单，`sudo tbc hotplug-services --clear` 清空。未列出的进程、容器和其他网络命名空间不会被终止；它们仍占用模块时，操作会报告引用计数并安全退出。
+
+### Web 管理面板与流量统计
+
+安装后运行 `sudo tbc`，选择“开启或重置 Web 面板”，设置仅本机监听端口、管理员账户和密码。面板默认监听 `127.0.0.1`，因此请通过现有的 Nginx/Caddy 反向代理或 SSH 隧道访问 `http://127.0.0.1:端口/`；不要将该端口直接暴露到公网。
+
+面板提供与菜单相同的速率、端口、出口保护、开机启动、预检、更新和卸载操作，并展示活跃 IP。内核按已配置的业务源端口累计 Brutal 连接的发送字节与重传字节，采集服务每 5 秒保存每日历史。平均重传率为“重传数据字节 ÷ 总发送数据字节”；这是按 MSS 估算的重传字节，不包含 TCP/IP 头部。可用 `sudo brutalctl port-stats` 查看当前内核累计值。
 
 如果使用带 flakes 的 NixOS，可以在 `flake.nix` 中加入该模块，同时也会提供 `brutalctl`：
 
@@ -95,7 +111,7 @@ network namespace 隔离，因此容器需要在自己的 namespace 中配置规
 
 所有连接关闭后，对应 IP 行立即消失；这里不保存历史统计。
 
-如果更新已暂存且内存中的旧模块尚无 `peers` 接口，`view` 会明确提示重启，不会调用 `PATH` 中可能残留的旧版 `brutalctl`。重启后 systemd 会加载新版模块、恢复规则，并启用活跃 IP 视图。
+若机器保留了旧版本创建的待重启状态且内存中的旧模块尚无 `peers` 接口，`view` 会明确提示重启，不会调用 `PATH` 中可能残留的旧版 `brutalctl`。执行一次热更新并成功加载新版模块后，该状态会自动清除。
 
 ### 检查是否正常工作
 
